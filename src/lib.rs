@@ -2225,6 +2225,188 @@ pub mod rdsk_defaults {
     pub const AUTO_PARK_SECONDS: u32 = 0;
 }
 
+/// The values this crate writes into a new `FSHD` block when the caller
+/// does not override them — same provenance as [`envec_defaults`] and
+/// [`rdsk_defaults`]: observed in `rdbtool` 0.8.1's output, by creating
+/// an image, running `rdbtool <img> fsadd <driver>` and reading the raw
+/// `FSHD` block back, not assumed from the NDK.
+///
+/// What `rdbtool` writes, in full: `fhb_HostID` **0**, `fhb_Flags` 0,
+/// `fhb_Version` 0 unless asked (`version=43.4` packs to `0x002B0004`),
+/// `fhb_PatchFlags` **0x180** — and *only* 0x180, i.e.
+/// [`SEG_LIST`](fshd_patch::SEG_LIST) and
+/// [`GLOBAL_VEC`](fshd_patch::GLOBAL_VEC) — with `fhb_GlobalVec`
+/// **-1** ("not BCPL") and every other patched longword left zero *and
+/// unpatched*. `fhb_Type`, `Task`, `Lock`, `Handler`, `StackSize`,
+/// `Priority` and `Startup` are therefore absent rather than zero, which
+/// is exactly the distinction [`FileSysHeader`]'s [`Option`]s preserve on
+/// the read side, so the defaults here are `None` and setting one is what
+/// turns its bit on.
+pub mod fshd_defaults {
+    /// `fhb_HostID` — **0**, which is what `rdbtool` writes into an
+    /// `FSHD` even while writing 7 into the `RDSK` and every `PART` on
+    /// the same disk. Matched rather than "corrected" to 7: the field is
+    /// as meaningless on an image as the other two, and byte-identity
+    /// with the differential oracle is worth more than tidiness.
+    /// [`FileSystemSpec::host_id`](super::FileSystemSpec::host_id) is the
+    /// override for a caller reproducing a real controller's image.
+    pub const HOST_ID: u32 = 0;
+
+    /// `fhb_Flags` — zero. The NDK defines no bits in it.
+    pub const FLAGS: u32 = 0;
+
+    /// `fhb_GlobalVec` — **-1**, the value that means "this handler is
+    /// not BCPL and wants no global vector". Written by `rdbtool` for
+    /// every filesystem it adds, and gated on by
+    /// [`fshd_patch::GLOBAL_VEC`](super::fshd_patch::GLOBAL_VEC), which
+    /// is why it is one of only two bits `rdbtool` sets.
+    pub const GLOBAL_VEC: i32 = -1;
+}
+
+/// One loadable filesystem driver to write: which partitions it serves,
+/// what version it is, its binary, and whichever device-node fields it
+/// wants patched.
+///
+/// This is the `DOS\x07` shipping story — put the filesystem *inside*
+/// the image and a ROM that never heard of the dostype can still mount
+/// the partition, because the RDB carries the handler it needs.
+///
+/// **The binary is not parsed.** It is AmigaDOS hunk-format data as
+/// `LoadSeg` would consume it, and this crate splits it into `LSEG`
+/// blocks and chains them without looking inside — hunk parsing and
+/// relocation are a founding non-goal, the loader's job wherever the
+/// driver ends up running. Any bytes are accepted, including bytes that
+/// are not hunks at all; `rdbtool` accepts them too, which is how the
+/// defaults here were observed.
+///
+/// The eight patchable fields are [`Option`]s for the reason
+/// [`FileSysHeader`]'s are: unset means "this filesystem does not
+/// override that device-node field", which is not the same as
+/// overriding it with zero. Setting one sets its
+/// [`fshd_patch`] bit; leaving it `None` leaves the longword zero and
+/// the bit clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSystemSpec {
+    /// `fhb_DosType` — the dostype whose partitions this driver serves,
+    /// matched against a [`PartitionSpec::dos_type`].
+    pub dos_type: u32,
+    /// The driver binary, hunk-format, unparsed — see the type's docs.
+    pub binary: Vec<u8>,
+    /// `fhb_Version`'s high half.
+    pub version_major: u16,
+    /// `fhb_Version`'s low half.
+    pub version_minor: u16,
+    /// `fhb_HostID`, defaulting to [`fshd_defaults::HOST_ID`].
+    pub host_id: u32,
+    /// `fhb_Flags`, defaulting to [`fshd_defaults::FLAGS`].
+    pub flags: u32,
+    /// `fhb_PatchFlags` written verbatim, or `None` to derive it from
+    /// which fields below are `Some` — plus
+    /// [`fshd_patch::SEG_LIST`] whenever there is an `LSEG` chain to
+    /// point at, which is what `rdbtool` does.
+    ///
+    /// The override exists for a caller reproducing an existing image
+    /// bit-for-bit, including bits this crate does not model. It changes
+    /// only the mask: the longwords themselves are still written from
+    /// the fields, so a bit set here over a `None` field patches a zero.
+    pub patch_flags: Option<u32>,
+    /// `fhb_Type`, gated by [`fshd_patch::TYPE`].
+    pub node_type: Option<u32>,
+    /// `fhb_Task`, gated by [`fshd_patch::TASK`].
+    pub task: Option<u32>,
+    /// `fhb_Lock`, gated by [`fshd_patch::LOCK`].
+    pub lock: Option<u32>,
+    /// `fhb_Handler`, gated by [`fshd_patch::HANDLER`].
+    pub handler: Option<u32>,
+    /// `fhb_StackSize`, gated by [`fshd_patch::STACK_SIZE`].
+    pub stack_size: Option<u32>,
+    /// `fhb_Priority`, gated by [`fshd_patch::PRIORITY`].
+    pub priority: Option<i32>,
+    /// `fhb_Startup`, gated by [`fshd_patch::STARTUP`].
+    pub startup: Option<i32>,
+    /// `fhb_GlobalVec`, gated by [`fshd_patch::GLOBAL_VEC`]. Defaults to
+    /// `Some(`[`fshd_defaults::GLOBAL_VEC`]`)` — the one patched field
+    /// `rdbtool` fills in — rather than `None`, since a non-BCPL handler
+    /// is what every driver written since the 1980s is.
+    pub global_vec: Option<i32>,
+}
+
+impl FileSystemSpec {
+    /// A driver for `dos_type` carrying `binary`, with every patchable
+    /// field at its [`fshd_defaults`] value.
+    pub fn new(dos_type: u32, binary: Vec<u8>) -> Self {
+        Self {
+            dos_type,
+            binary,
+            version_major: 0,
+            version_minor: 0,
+            host_id: fshd_defaults::HOST_ID,
+            flags: fshd_defaults::FLAGS,
+            patch_flags: None,
+            node_type: None,
+            task: None,
+            lock: None,
+            handler: None,
+            stack_size: None,
+            priority: None,
+            startup: None,
+            global_vec: Some(fshd_defaults::GLOBAL_VEC),
+        }
+    }
+
+    /// Set `fhb_Version` from its two halves.
+    pub fn version(mut self, major: u16, minor: u16) -> Self {
+        self.version_major = major;
+        self.version_minor = minor;
+        self
+    }
+
+    /// Patch `fhb_StackSize` into the device node.
+    pub fn stack_size(mut self, bytes: u32) -> Self {
+        self.stack_size = Some(bytes);
+        self
+    }
+
+    /// Patch `fhb_Priority` into the device node.
+    pub fn priority(mut self, priority: i32) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    /// Patch `fhb_GlobalVec`, overriding the default of
+    /// [`fshd_defaults::GLOBAL_VEC`].
+    pub fn global_vec(mut self, global_vec: i32) -> Self {
+        self.global_vec = Some(global_vec);
+        self
+    }
+
+    /// `fhb_Version` as the format packs it: major in the high half.
+    fn packed_version(&self) -> u32 {
+        ((self.version_major as u32) << 16) | self.version_minor as u32
+    }
+
+    /// The nine patched longwords, in block order, as
+    /// `(value, patched)` — `patched` deciding the
+    /// [`fshd_patch`] bit. Index 7 is `fhb_SegListBlocks`, which the
+    /// caller fills in from the layout because only the layout knows
+    /// where the chain starts.
+    fn patched_fields(&self) -> [(u32, bool); 9] {
+        let opt32 = |v: Option<u32>| (v.unwrap_or(0), v.is_some());
+        let opti32 = |v: Option<i32>| (v.unwrap_or(0) as u32, v.is_some());
+        [
+            opt32(self.node_type),
+            opt32(self.task),
+            opt32(self.lock),
+            opt32(self.handler),
+            opt32(self.stack_size),
+            opti32(self.priority),
+            opti32(self.startup),
+            (CHAIN_END, false), // SegListBlocks: the layout's business
+            opti32(self.global_vec),
+        ]
+    }
+}
+
 /// Where a partition goes: a size the builder turns into cylinders, or
 /// the cylinders themselves.
 ///
@@ -2489,9 +2671,11 @@ pub enum BuildError<E> {
         high_cyl: u32,
     },
     /// The reserved RDB area cannot hold the blocks the layout needs —
-    /// one `RDSK` plus one `PART` per partition. Either too many
-    /// partitions, or a [`RdbBuilder::reserved_blocks`] override too
-    /// small for them.
+    /// one `RDSK`, one `PART` per partition, and one `FSHD` plus its
+    /// `LSEG` chain per filesystem. Either too many of them, or a
+    /// [`RdbBuilder::reserved_blocks`] override too small; a driver
+    /// binary is by far the most likely cause, being hundreds of blocks
+    /// where a partition is one.
     RdbAreaTooSmall {
         /// Blocks the layout needs, `RDSK` included.
         needed: u32,
@@ -2638,6 +2822,25 @@ pub struct PlacedPartition {
     pub block_len: u64,
 }
 
+/// Where one loadable filesystem landed: its `FSHD` block and the
+/// `LSEG` chain carrying its binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedFileSystem {
+    /// LBA of the `FSHD` block written for it.
+    pub fshd_block: u64,
+    /// `fhb_DosType` as written, so a caller can match it to a partition
+    /// without re-parsing.
+    pub dos_type: u32,
+    /// `fhb_SegListBlocks` as written — the first `LSEG` block, or
+    /// [`CHAIN_END`] for a header carrying no binary.
+    pub seg_list_blocks: u32,
+    /// How many `LSEG` blocks the chain has. Zero exactly when
+    /// [`seg_list_blocks`](Self::seg_list_blocks) is [`CHAIN_END`]; the
+    /// blocks are consecutive from it, which is how this crate (and
+    /// `rdbtool`) allocate them.
+    pub lseg_block_count: u32,
+}
+
 /// The complete block layout [`RdbBuilder::build`] computed and wrote.
 ///
 /// Returned rather than nothing so a caller need not re-parse the disk
@@ -2664,6 +2867,9 @@ pub struct RdbLayout {
     pub geometry: Geometry,
     /// The partitions, in the order they were added and chained.
     pub partitions: Vec<PlacedPartition>,
+    /// The loadable filesystems, in the order they were added and
+    /// chained — the `FSHD` chain `rdb_FileSysHeaderList` heads.
+    pub filesystems: Vec<PlacedFileSystem>,
 }
 
 /// Build a fresh RDB — an `RDSK` block and its `PART` chain — on an
@@ -2742,6 +2948,7 @@ pub struct RdbBuilder {
     flags: u32,
     host_id: u32,
     specs: Vec<PartitionSpec>,
+    filesystems: Vec<FileSystemSpec>,
 }
 
 /// Longest `pb_DriveName` the 32-byte BCPL field holds: one length byte
@@ -2751,6 +2958,20 @@ const MAX_DRIVE_NAME: usize = 31;
 /// How many longwords an `RDSK`, `PART` or `FSHD` block sums over — 64,
 /// i.e. the first 256 bytes, whatever the device block size.
 const HEADER_SUMMED_LONGS: u32 = 64;
+
+/// Longwords of `LSEG` header before `lsb_LoadData` — five: ID,
+/// SummedLongs, ChkSum, HostID, Next.
+const LSEG_HEADER_LONGS: u32 = (lseg::LOAD_DATA / 4) as u32;
+
+/// Driver payload one `LSEG` block of `block_size` bytes carries: the
+/// whole block past `lsb_LoadData`.
+///
+/// The format records no byte count anywhere, which is why
+/// [`Rdb::load_filesystem`] returns a block-granular length — and why
+/// this is the only number the split needs.
+const fn lseg_payload_bytes(block_size: usize) -> usize {
+    block_size - lseg::LOAD_DATA
+}
 
 impl RdbBuilder {
     /// A builder for a disk of exactly this [`Geometry`] — the entry
@@ -2764,6 +2985,7 @@ impl RdbBuilder {
             flags: rdsk_defaults::FLAGS,
             host_id: rdsk_defaults::HOST_ID,
             specs: Vec::new(),
+            filesystems: Vec::new(),
         }
     }
 
@@ -2779,6 +3001,25 @@ impl RdbBuilder {
     /// laid out in the order added, and the `PART` chain follows it.
     pub fn partition(mut self, spec: PartitionSpec) -> Self {
         self.specs.push(spec);
+        self
+    }
+
+    /// Add a loadable filesystem driver. Order matters the same way
+    /// [`partition`](Self::partition)'s does: the `FSHD` chain follows
+    /// the order added, and each driver's `LSEG` blocks are allocated
+    /// straight after its own `FSHD`.
+    ///
+    /// The blocks live in the RDB area alongside the `RDSK` and `PART`
+    /// blocks, and a driver is *large* next to them — hundreds of
+    /// blocks where a partition takes one — so this is the feature that
+    /// makes the area-sizing policy earn its keep: the default area
+    /// grows past `rdbtool`'s first cylinder to fit the payload, and an
+    /// explicit [`reserved_blocks`](Self::reserved_blocks) too small for
+    /// it is [`BuildError::RdbAreaTooSmall`] before a byte is written.
+    /// (`rdbtool` 0.8.1 refuses outright here — "no space in RDB left" —
+    /// having fixed the area at one cylinder when the disk was created.)
+    pub fn filesystem(mut self, spec: FileSystemSpec) -> Self {
+        self.filesystems.push(spec);
         self
     }
 
@@ -2830,9 +3071,15 @@ impl RdbBuilder {
     /// consecutively, chained in the order the partitions were added and
     /// terminated with [`CHAIN_END`]. `rdb_HighRDSKBlock` records the
     /// last block used; `rdb_RDBBlocksHi` records the reserved ceiling,
-    /// which is normally higher — see below. The `FSHD` and `BADB` chain
-    /// heads are `CHAIN_END`: a fresh RDB carries no loadable filesystem
-    /// (that is the next milestone) and no bad blocks.
+    /// which is normally higher — see below.
+    ///
+    /// Any [`filesystem`](Self::filesystem) follows the `PART` blocks:
+    /// one `FSHD` block, then its driver split across `ceil(len /
+    /// (block_size - 20))` consecutive `LSEG` blocks, then the next
+    /// filesystem's pair, chained through `rdb_FileSysHeaderList` in the
+    /// order added. The `BADB` chain head is [`CHAIN_END`] — a fresh RDB
+    /// has no bad blocks, and inventing a list for a medium that has not
+    /// failed yet would be a lie.
     ///
     /// # Names
     ///
@@ -2889,6 +3136,38 @@ impl RdbBuilder {
                 .map_err(BuildError::Io)?;
         }
 
+        // Each filesystem's LSEG chain before its FSHD, and every FSHD
+        // before the RDSK: a block is written only after everything it
+        // points at, so an interruption leaves dangling blocks that
+        // nothing references rather than a chain into blocks that do not
+        // exist.
+        for (i, placed) in layout.filesystems.iter().enumerate() {
+            let spec = &self.filesystems[i];
+            let payload = lseg_payload_bytes(block_size);
+            for chunk in 0..placed.lseg_block_count as usize {
+                let lba = placed.seg_list_blocks as u64 + chunk as u64;
+                let next = if chunk + 1 == placed.lseg_block_count as usize {
+                    CHAIN_END
+                } else {
+                    (lba + 1) as u32
+                };
+                let start = chunk * payload;
+                let data = &spec.binary[start..(start + payload).min(spec.binary.len())];
+                buf.iter_mut().for_each(|b| *b = 0);
+                self.fill_lseg(&mut buf, spec, data, next)?;
+                sink.write_block(lba, &buf).map_err(BuildError::Io)?;
+            }
+
+            let next = match layout.filesystems.get(i + 1) {
+                Some(f) => f.fshd_block as u32,
+                None => CHAIN_END,
+            };
+            buf.iter_mut().for_each(|b| *b = 0);
+            self.fill_fshd(&mut buf, spec, placed, next)?;
+            sink.write_block(placed.fshd_block, &buf)
+                .map_err(BuildError::Io)?;
+        }
+
         // The RDSK last: until it lands the disk has no partition table
         // at all, which is a better outcome for an interrupted build
         // than a table pointing at blocks that were never written.
@@ -2919,7 +3198,24 @@ impl RdbBuilder {
         // The RDB area. `rdb_RDBBlocksLo` is 0 rather than the RDSK's own
         // block: the area is what a repartitioner owns, and that includes
         // any block before the RDSK it might move the RDSK into.
-        let needed = 1u64 + self.specs.len() as u64;
+        //
+        // The budget is known up front for every chain the builder
+        // writes: one RDSK, one PART per partition, and — the item this
+        // arithmetic was waiting for — one FSHD plus its LSEG blocks per
+        // filesystem, the LSEG count being `ceil(len / (block_size -
+        // 20))` because the payload area is all of the block past
+        // `lsb_LoadData`.
+        let payload_bytes = lseg_payload_bytes(g.block_size) as u64;
+        let lseg_counts: Vec<u64> = self
+            .filesystems
+            .iter()
+            .map(|f| {
+                let len = f.binary.len() as u64;
+                (len + payload_bytes - 1) / payload_bytes
+            })
+            .collect();
+        let fs_blocks: u64 = lseg_counts.iter().map(|n| n + 1).sum();
+        let needed = 1u64 + self.specs.len() as u64 + fs_blocks;
         let reserved = match self.reserved_blocks {
             Some(n) => n as u64,
             None => self.default_reserved_blocks(cyl_blocks, needed),
@@ -3047,6 +3343,29 @@ impl RdbBuilder {
             }
         }
 
+        // The FSHD blocks and their LSEG chains, packed consecutively
+        // after the PART blocks — each FSHD immediately followed by its
+        // own chain, which is both what `rdbtool` writes and what keeps
+        // `lseg_block_count` meaningful as a run rather than a set.
+        let mut next_block = self.rdsk_block as u64 + 1 + self.specs.len() as u64;
+        let mut filesystems = Vec::with_capacity(self.filesystems.len());
+        for (spec, &lsegs) in self.filesystems.iter().zip(&lseg_counts) {
+            let fshd_block = next_block;
+            next_block += 1;
+            let seg_list_blocks = if lsegs == 0 {
+                CHAIN_END
+            } else {
+                next_block as u32
+            };
+            next_block += lsegs;
+            filesystems.push(PlacedFileSystem {
+                fshd_block,
+                dos_type: spec.dos_type,
+                seg_list_blocks,
+                lseg_block_count: lsegs as u32,
+            });
+        }
+
         // The target has to actually hold what the layout describes: the
         // RDB area, and every partition's last block.
         let mut needed_blocks = reserved;
@@ -3071,6 +3390,7 @@ impl RdbBuilder {
             hi_cylinder: last_cylinder,
             geometry: g,
             partitions,
+            filesystems,
         })
     }
 
@@ -3160,7 +3480,14 @@ impl RdbBuilder {
                 None => CHAIN_END,
             },
         );
-        put_be32(buf, rdsk::FILESYS_HEADER_LIST, CHAIN_END);
+        put_be32(
+            buf,
+            rdsk::FILESYS_HEADER_LIST,
+            match layout.filesystems.first() {
+                Some(f) => f.fshd_block as u32,
+                None => CHAIN_END,
+            },
+        );
         put_be32(buf, rdsk::DRIVE_INIT, CHAIN_END);
         put_be32(buf, rdsk::CYLINDERS, g.cylinders);
         put_be32(buf, rdsk::SECTORS, g.sectors);
@@ -3240,6 +3567,89 @@ impl RdbBuilder {
         env(de::DOS_TYPE, spec.dos_type);
 
         seal_checksum(buf, HEADER_SUMMED_LONGS).map_err(BuildError::Seal)
+    }
+
+    /// Fill a zeroed buffer with one `FSHD` block and seal it.
+    ///
+    /// `fhb_PatchFlags` is derived from which of the spec's optional
+    /// fields are set — plus [`fshd_patch::SEG_LIST`] whenever there is
+    /// a chain to point at, which is what `rdbtool` does — unless the
+    /// spec overrides the mask outright. Either way every one of the
+    /// nine longwords is written: an unpatched field is a zero behind a
+    /// clear bit, which is exactly how the read side distinguishes
+    /// "absent" from "zero".
+    fn fill_fshd<E>(
+        &self,
+        buf: &mut [u8],
+        spec: &FileSystemSpec,
+        placed: &PlacedFileSystem,
+        next: u32,
+    ) -> Result<(), BuildError<E>> {
+        put_be32(buf, hdr::ID, id::FSHD);
+        put_be32(buf, fshd::HOST_ID, spec.host_id);
+        put_be32(buf, chain::NEXT, next);
+        put_be32(buf, fshd::FLAGS, spec.flags);
+        put_be32(buf, fshd::DOS_TYPE, spec.dos_type);
+        put_be32(buf, fshd::VERSION, spec.packed_version());
+
+        let mut fields = spec.patched_fields();
+        fields[fshd::SEG_LIST_INDEX] =
+            (placed.seg_list_blocks, placed.seg_list_blocks != CHAIN_END);
+
+        let mut derived = 0u32;
+        for (i, &(value, patched)) in fields.iter().enumerate() {
+            put_be32(buf, fshd::PATCHED + i * 4, value);
+            if patched {
+                derived |= 1 << i;
+            }
+        }
+        put_be32(buf, fshd::PATCH_FLAGS, spec.patch_flags.unwrap_or(derived));
+
+        seal_checksum(buf, HEADER_SUMMED_LONGS).map_err(BuildError::Seal)
+    }
+
+    /// Fill a zeroed buffer with one `LSEG` block carrying `data` and
+    /// seal it.
+    ///
+    /// **`SummedLongs` is the number of longwords actually summed**, not
+    /// the whole block: five header longwords plus `data.len() / 4`,
+    /// *floored*. A full block therefore sums `block_size / 4` and the
+    /// final partial one sums only as far as its payload reaches, with
+    /// any trailing one to three bytes outside the sum. That is what
+    /// `rdbtool` 0.8.1 writes — observed across payload lengths either
+    /// side of every boundary (a 493-byte driver at 512-byte blocks
+    /// gives `[128, 5]`, 496 bytes gives `[128, 6]`) — and it is not
+    /// merely cosmetic: `rdbtool`'s `fsget` recovers the driver's byte
+    /// length from these counts, so a block-sized `SummedLongs` on the
+    /// last block would hand a reader a driver padded out with slack.
+    ///
+    /// **One deliberate deviation, and it is a bug on the other side.**
+    /// `rdbtool` 0.8.1 writes that reduced count but computes `ChkSum`
+    /// over the *whole block* regardless. The two agree only while the
+    /// bytes past the declared count are zero — which they are for a
+    /// driver whose length is a multiple of four, and are not for any
+    /// other, whose trailing one to three bytes then sit outside the sum
+    /// `rdbtool` actually took. Such a block does not check out over the
+    /// longwords it says it summed —
+    /// [`checksum_ok`] rejects it, as would any reader that follows
+    /// `SummedLongs`, this crate's parser and a 68k ROM alike. Matching
+    /// the count is interoperability; matching the checksum would be
+    /// writing a block that fails its own header, which is the one thing
+    /// a writer must never do. The count is matched, the sum is correct,
+    /// and the two agree.
+    fn fill_lseg<E>(
+        &self,
+        buf: &mut [u8],
+        spec: &FileSystemSpec,
+        data: &[u8],
+        next: u32,
+    ) -> Result<(), BuildError<E>> {
+        put_be32(buf, hdr::ID, id::LSEG);
+        put_be32(buf, hdr::HOST_ID, spec.host_id);
+        put_be32(buf, chain::NEXT, next);
+        buf[lseg::LOAD_DATA..lseg::LOAD_DATA + data.len()].copy_from_slice(data);
+        let summed = LSEG_HEADER_LONGS + (data.len() / 4) as u32;
+        seal_checksum(buf, summed).map_err(BuildError::Seal)
     }
 }
 
@@ -5457,6 +5867,411 @@ mod tests {
         }
     }
 
+    // ---- the write path: FSHD + LSEG -------------------------------
+
+    /// A driver binary of `len` bytes — not hunk format, and
+    /// deliberately so: this crate does not parse hunks (a founding
+    /// non-goal) and `rdbtool` does not either, which is how the FSHD
+    /// defaults were observed in the first place.
+    fn fake_driver(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// One filesystem in, an image out, and the driver read back off the
+    /// disk — the `DOS\x07` shipping path end to end.
+    #[test]
+    fn builder_round_trips_a_filesystem() {
+        // 1000 bytes over a 492-byte payload is three blocks, the last
+        // of them partial — the case the SummedLongs rule is about.
+        let driver = fake_driver(1000);
+        let (mut disk, layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_size(4 * 1024 * 1024).dos_type(0x444F_5307))
+                .filesystem(
+                    FileSystemSpec::new(0x444F_5307, driver.clone())
+                        .version(43, 4)
+                        .stack_size(8192)
+                        .priority(10),
+                ),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+
+        // The FSHD follows the single PART block, its LSEG chain follows
+        // it, and the RDSK points at the head.
+        assert_eq!(layout.filesystems.len(), 1);
+        let placed = &layout.filesystems[0];
+        assert_eq!(placed.fshd_block, 2);
+        assert_eq!(placed.seg_list_blocks, 3);
+        assert_eq!(placed.lseg_block_count, 3);
+        assert_eq!(rdb.filesys_header_list, 2);
+        assert_eq!(rdb.high_rdsk_block, 5);
+
+        assert_eq!(rdb.filesystems.len(), 1);
+        let f = &rdb.filesystems[0];
+        assert_eq!(f.fshd_block, 2);
+        assert_eq!(f.dos_type, 0x444F_5307);
+        assert_eq!((f.version_major(), f.version_minor()), (43, 4));
+        assert_eq!(f.host_id, fshd_defaults::HOST_ID);
+        assert_eq!(f.flags, 0);
+        assert_eq!(f.seg_list_blocks, 3);
+        // Only the fields that were set are patched — and SegList, which
+        // has a chain to point at. Everything else is absent, not zero.
+        assert_eq!(
+            f.patch_flags,
+            fshd_patch::STACK_SIZE
+                | fshd_patch::PRIORITY
+                | fshd_patch::SEG_LIST
+                | fshd_patch::GLOBAL_VEC
+        );
+        assert_eq!(f.stack_size, Some(8192));
+        assert_eq!(f.priority, Some(10));
+        assert_eq!(f.global_vec, Some(-1));
+        assert_eq!(
+            (f.node_type, f.task, f.lock, f.handler, f.startup),
+            (None, None, None, None, None)
+        );
+
+        // The reassembled binary is the payload padded out to a whole
+        // block: LSEG records no byte count, so the slack is unavoidable
+        // and documented rather than trimmed by a guess.
+        let loaded = rdb.load_filesystem(f, &mut disk).unwrap();
+        assert_eq!(loaded.len(), 3 * LSEG_PAYLOAD);
+        assert_eq!(&loaded[..driver.len()], &driver[..]);
+        assert!(loaded[driver.len()..].iter().all(|&b| b == 0));
+
+        assert_eq!(rdb.validate_seg_lists(&mut disk).unwrap(), Vec::new());
+    }
+
+    /// `SummedLongs` on the final, partial `LSEG` block is the number of
+    /// longwords **actually summed** — five header longwords plus the
+    /// payload's whole longwords, floored — not the whole block.
+    ///
+    /// The expectations are `rdbtool` 0.8.1's own output, read out of
+    /// images it wrote at each of these lengths. It matters beyond
+    /// cosmetics: `rdbtool fsget` recovers the driver's byte length from
+    /// these counts, so a block-sized count on the last block would hand
+    /// a reader a driver with slack glued to the end of it.
+    #[test]
+    fn lseg_summed_longs_match_rdbtool_0_8_1() {
+        for (len, expected) in [
+            (1usize, &[5u32][..]),
+            (4, &[6][..]),
+            (5, &[6][..]),
+            (492, &[128][..]),
+            (493, &[128, 5][..]),
+            (495, &[128, 5][..]),
+            (496, &[128, 6][..]),
+            (984, &[128, 128][..]),
+            (985, &[128, 128, 5][..]),
+            (2560, &[128, 128, 128, 128, 128, 30][..]),
+            (2563, &[128, 128, 128, 128, 128, 30][..]),
+        ] {
+            let (disk, layout, _rdb) = build_on(
+                RdbBuilder::for_size(TEN_MIB, 512)
+                    .unwrap()
+                    .filesystem(FileSystemSpec::new(
+                        envec_defaults::DOS_TYPE,
+                        fake_driver(len),
+                    )),
+                TEN_MIB_BLOCKS,
+                512,
+            );
+            let placed = &layout.filesystems[0];
+            assert_eq!(
+                placed.lseg_block_count as usize,
+                expected.len(),
+                "len {len}"
+            );
+            let summed: Vec<u32> = (0..placed.lseg_block_count as usize)
+                .map(|i| {
+                    let base = (placed.seg_list_blocks as usize + i) * 512;
+                    be32(&disk.data, base + hdr::SUMMED_LONGS)
+                })
+                .collect();
+            assert_eq!(summed, expected, "len {len}");
+        }
+    }
+
+    /// The AROS case in full: a `DOS\x07` partition and the `DOS\x07`
+    /// handler that lets a 3.1-era ROM mount it, beside the `DOS\x03`
+    /// filesystem the other partition wants. Two FSHDs, chained in the
+    /// order added, each with its own LSEG run.
+    #[test]
+    fn builder_writes_two_filesystems() {
+        let dos3 = fake_driver(600);
+        let dos7 = fake_driver(1500);
+        let (mut disk, layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_size(1024 * 1024).dos_type(0x444F_5307))
+                .partition(PartitionSpec::by_size(1024 * 1024))
+                .filesystem(FileSystemSpec::new(0x444F_5307, dos7.clone()).version(45, 13))
+                .filesystem(FileSystemSpec::new(0x444F_5303, dos3.clone())),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+
+        // PARTs at 1..=2; then FSHD 3 with LSEG 4..=7, FSHD 8 with
+        // LSEG 9..=10.
+        let places: Vec<(u64, u32, u32)> = layout
+            .filesystems
+            .iter()
+            .map(|f| (f.fshd_block, f.seg_list_blocks, f.lseg_block_count))
+            .collect();
+        assert_eq!(places, [(3, 4, 4), (8, 9, 2)]);
+        assert_eq!(rdb.high_rdsk_block, 10);
+
+        let dos_types: Vec<u32> = rdb.filesystems.iter().map(|f| f.dos_type).collect();
+        assert_eq!(dos_types, [0x444F_5307, 0x444F_5303]);
+        assert_eq!(
+            (
+                rdb.filesystems[0].version_major(),
+                rdb.filesystems[0].version_minor()
+            ),
+            (45, 13)
+        );
+
+        // Each partition's dostype has a handler in the image to match.
+        for p in &rdb.partitions {
+            assert!(rdb.filesystems.iter().any(|f| f.dos_type == p.dos_type));
+        }
+        for (f, want) in rdb.filesystems.iter().zip([&dos7, &dos3]) {
+            let loaded = rdb.load_filesystem(f, &mut disk).unwrap();
+            assert_eq!(&loaded[..want.len()], &want[..]);
+        }
+        assert_eq!(rdb.validate_seg_lists(&mut disk).unwrap(), Vec::new());
+    }
+
+    /// A filesystem with no binary at all: legal, and the header that
+    /// only patches device-node fields for a ROM filesystem. One block,
+    /// `fhb_SegListBlocks` [`CHAIN_END`], and the `SegList` bit clear
+    /// because there is nothing to patch in.
+    #[test]
+    fn builder_writes_a_filesystem_with_no_seglist() {
+        let (mut disk, layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .filesystem(FileSystemSpec::new(0x444F_5307, Vec::new())),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        assert_eq!(layout.filesystems[0].lseg_block_count, 0);
+        assert_eq!(layout.filesystems[0].seg_list_blocks, CHAIN_END);
+        assert_eq!(rdb.high_rdsk_block, 1);
+        let f = &rdb.filesystems[0];
+        assert_eq!(f.seg_list_blocks, CHAIN_END);
+        assert_eq!(f.patch_flags & fshd_patch::SEG_LIST, 0);
+        assert!(rdb.load_filesystem(f, &mut disk).unwrap().is_empty());
+    }
+
+    /// 4 KB device blocks: the payload per `LSEG` block is `block_size -
+    /// 20` there too, so the same driver needs a tenth of the blocks and
+    /// a full block sums 1024 longwords.
+    #[test]
+    fn builder_round_trips_a_filesystem_at_4k_blocks() {
+        let driver = fake_driver(9000);
+        let (mut disk, layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 4096)
+                .unwrap()
+                .partition(PartitionSpec::by_size(4 * 1024 * 1024).dos_type(0x444F_5307))
+                .filesystem(FileSystemSpec::new(0x444F_5307, driver.clone())),
+            (TEN_MIB / 4096) as usize,
+            4096,
+        );
+
+        // 4076 bytes a block: 9000 bytes is three of them.
+        let placed = &layout.filesystems[0];
+        assert_eq!(placed.lseg_block_count, 3);
+        assert_eq!((placed.fshd_block, placed.seg_list_blocks), (2, 3));
+        let summed: Vec<u32> = (0..3)
+            .map(|i| be32(&disk.data, (3 + i) * 4096 + hdr::SUMMED_LONGS))
+            .collect();
+        // Two full blocks, then 9000 - 2 * 4076 = 848 payload bytes.
+        assert_eq!(summed, [1024, 1024, 5 + 848 / 4]);
+
+        let f = &rdb.filesystems[0];
+        let loaded = rdb.load_filesystem(f, &mut disk).unwrap();
+        assert_eq!(loaded.len(), 3 * lseg_payload_bytes(4096));
+        assert_eq!(&loaded[..driver.len()], &driver[..]);
+        assert_eq!(rdb.validate_seg_lists(&mut disk).unwrap(), Vec::new());
+    }
+
+    /// The RDB area grows to fit a driver rather than spilling into the
+    /// first partition — the growth path the FSHD payload is the first
+    /// realistic reason to take. (`rdbtool` 0.8.1 refuses this case
+    /// outright: "ERROR adding filesystem! (no space in RDB left)",
+    /// having fixed the area at one cylinder when the disk was created.)
+    #[test]
+    fn reserved_area_grows_to_fit_a_filesystem() {
+        let (_disk, layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_size(1024 * 1024))
+                .filesystem(FileSystemSpec::new(0x444F_5307, fake_driver(50_000))),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        // 50 000 bytes over a 492-byte payload is 102 LSEG blocks, plus
+        // the FSHD, the PART and the RDSK: 105 blocks, well past the
+        // 32-block first cylinder.
+        assert_eq!(layout.filesystems[0].lseg_block_count, 102);
+        assert_eq!(rdb.high_rdsk_block, 104);
+        assert_eq!(rdb.rdb_blocks_hi, 105 + RDB_HEADROOM_BLOCKS as u32 - 1);
+        // The area now spans four 32-block cylinders, so partitions
+        // start on cylinder 4 rather than 1.
+        assert_eq!(rdb.lo_cylinder, 4);
+        assert_eq!(rdb.partitions[0].low_cyl, 4);
+    }
+
+    /// A filesystem that does not fit is refused **before a byte is
+    /// written**, exactly as an over-large partition is — whether the
+    /// ceiling is the caller's own reserved area or the target's size.
+    #[test]
+    fn build_refuses_a_filesystem_that_does_not_fit() {
+        // An explicit area with no room for the LSEG chain.
+        assert_refused(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .reserved_blocks(32)
+                .partition(PartitionSpec::by_size(1024 * 1024))
+                .filesystem(FileSystemSpec::new(0x444F_5307, fake_driver(50_000))),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::RdbAreaTooSmall {
+                needed: 105,
+                available: 32,
+            },
+        );
+
+        // A target smaller than the RDB area the driver forces.
+        assert_refused(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .filesystem(FileSystemSpec::new(0x444F_5307, fake_driver(50_000))),
+            64,
+            512,
+            BuildError::SinkTooSmall {
+                // RDSK + FSHD + 102 LSEG blocks, plus the headroom the
+                // default area adds; no partition reaches beyond it.
+                needed: 104 + RDB_HEADROOM_BLOCKS,
+                available: 64,
+            },
+        );
+    }
+
+    /// The round-trip property at its strongest: build an image, parse
+    /// it, rebuild from nothing but the parsed values, and get the same
+    /// bytes back.
+    ///
+    /// Everything the builder writes has to be reachable from the read
+    /// API for this to pass — the geometry, the reserved area, each
+    /// partition's cylinders and envec, each FSHD's patch flags and
+    /// gated fields, and every driver binary — so it is a coverage
+    /// assertion about the *read* surface as much as a fidelity one
+    /// about the write surface.
+    ///
+    /// **The driver payload is a whole number of `LSEG` payloads on
+    /// purpose.** `LSEG` records no byte count, so
+    /// [`Rdb::load_filesystem`] returns the binary padded to a block
+    /// boundary; feeding that back in reproduces the same *blocks*, but
+    /// a driver that did not fill its last block would come back padded
+    /// and the rebuilt final `LSEG` would sum the whole block where the
+    /// original summed only as far as the driver reached. Byte-identity
+    /// is therefore a property of block-aligned drivers, and the
+    /// difference for any other is exactly two longwords in one block —
+    /// which is the honest statement of what the format can round-trip,
+    /// not a defect in the rebuild.
+    #[test]
+    fn rebuilding_from_the_parsed_values_reproduces_the_image() {
+        let driver = fake_driver(2 * LSEG_PAYLOAD);
+        let mut original = blank_disk(TEN_MIB_BLOCKS, 512);
+        RdbBuilder::for_size(TEN_MIB, 512)
+            .unwrap()
+            .partition(
+                PartitionSpec::by_size(4 * 1024 * 1024)
+                    .bootable(5)
+                    .dos_type(0x444F_5307),
+            )
+            .partition(
+                PartitionSpec::by_size(2 * 1024 * 1024)
+                    .named("WORK")
+                    .size_block_longs(256),
+            )
+            .filesystem(
+                FileSystemSpec::new(0x444F_5307, driver)
+                    .version(45, 13)
+                    .stack_size(8192)
+                    .priority(10),
+            )
+            .build(&mut original)
+            .expect("build");
+
+        let rdb = Rdb::parse(&mut original).expect("parse");
+
+        // Rebuild using only what the parse handed back.
+        let mut builder = RdbBuilder::new(Geometry {
+            cylinders: rdb.cylinders,
+            heads: rdb.heads,
+            sectors: rdb.sectors,
+            block_size: rdb.block_bytes as usize,
+        })
+        .rdsk_block(rdb.rdsk_block as u32)
+        .reserved_blocks(rdb.rdb_blocks_hi + 1)
+        .flags(rdb.flags)
+        .host_id(rdb.host_id);
+
+        for p in &rdb.partitions {
+            let mut spec = PartitionSpec::by_cylinders(p.low_cyl, p.high_cyl).named(&p.name);
+            spec.bootable = p.bootable;
+            spec.no_automount = p.no_automount;
+            spec.boot_pri = p.boot_pri;
+            spec.dos_type = p.dos_type;
+            spec.size_block_longs = Some(p.size_block_longs);
+            spec.num_buffers = p.num_buffers;
+            spec.buf_mem_type = p.buf_mem_type;
+            spec.max_transfer = p.max_transfer;
+            spec.mask = p.mask;
+            // The envec fields with no named accessor come off the raw
+            // longwords, which is what they are there for.
+            spec.sec_org = p.envec_raw[de::SEC_ORG];
+            spec.sectors_per_block = p.envec_raw[de::SECTORS_PER_BLOCK];
+            spec.reserved = p.envec_raw[de::RESERVED];
+            spec.pre_alloc = p.envec_raw[de::PRE_ALLOC];
+            spec.interleave = p.envec_raw[de::INTERLEAVE];
+            builder = builder.partition(spec);
+        }
+
+        for f in &rdb.filesystems {
+            let binary = rdb.load_filesystem(f, &mut original).expect("load driver");
+            let mut spec = FileSystemSpec::new(f.dos_type, binary)
+                .version(f.version_major(), f.version_minor());
+            spec.host_id = f.host_id;
+            spec.flags = f.flags;
+            // Verbatim rather than derived: a rebuild must reproduce
+            // bits this crate does not model, not re-decide them.
+            spec.patch_flags = Some(f.patch_flags);
+            spec.node_type = f.node_type;
+            spec.task = f.task;
+            spec.lock = f.lock;
+            spec.handler = f.handler;
+            spec.stack_size = f.stack_size;
+            spec.priority = f.priority;
+            spec.startup = f.startup;
+            spec.global_vec = f.global_vec;
+            builder = builder.filesystem(spec);
+        }
+
+        let mut rebuilt = blank_disk(TEN_MIB_BLOCKS, 512);
+        builder.build(&mut rebuilt).expect("rebuild");
+        assert_eq!(
+            rebuilt.data, original.data,
+            "a rebuild from the parsed values is not the same image"
+        );
+        assert_eq!(Rdb::parse(&mut rebuilt).unwrap(), rdb);
+    }
+
     /// The differential smoke test: build an image here, and let
     /// `rdbtool` — the tool whose conventions every default in
     /// [`envec_defaults`] was read out of — say what it sees. Agreement
@@ -5464,12 +6279,13 @@ mod tests {
     /// round-trip suite's job.
     ///
     /// Gated on `AMIGA_RDB_DIFFERENTIAL=1` because it shells out to a
-    /// tool that is not a build dependency of this crate. It is not
-    /// wired into CI yet; that is the next plan item.
+    /// tool that is not a build dependency of this crate; CI installs
+    /// `amitools==0.8.1` — the pinned version every default here was
+    /// observed against — and runs the gate in its own job.
     #[cfg(feature = "std")]
     #[test]
     fn rdbtool_reads_an_image_this_crate_built() {
-        if std::env::var_os("AMIGA_RDB_DIFFERENTIAL").is_none() {
+        if !differential_enabled() {
             return;
         }
 
@@ -5514,5 +6330,235 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Is the differential suite switched on? `rdbtool` is not a build
+    /// dependency, so these tests are opt-in.
+    #[cfg(feature = "std")]
+    fn differential_enabled() -> bool {
+        std::env::var_os("AMIGA_RDB_DIFFERENTIAL").is_some()
+    }
+
+    /// A scratch path in the temp directory, named per test so the
+    /// differential tests can run in parallel without fighting.
+    #[cfg(feature = "std")]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(alloc::format!("amiga-rdb-differential-{name}"))
+    }
+
+    /// Run `rdbtool` over `image` with the given commands, and hand back
+    /// its stdout.
+    #[cfg(feature = "std")]
+    fn rdbtool(image: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("rdbtool")
+            .arg(image)
+            .args(args)
+            .output()
+            .expect("run rdbtool");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "rdbtool {args:?} failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    }
+
+    /// The FSHD half of the differential, in this crate's direction:
+    /// build an image carrying a driver and let `rdbtool` extract it.
+    ///
+    /// `fsget` is the sharp end of the comparison, because `rdbtool`
+    /// recovers the driver's *byte length* from the `LSEG` blocks'
+    /// `SummedLongs` — so a byte-for-byte match proves the chain, the
+    /// split, the block order and the SummedLongs rule all at once, in a
+    /// way no field-by-field assertion of ours could. `info` is checked
+    /// alongside it for the FSHD fields themselves.
+    #[cfg(feature = "std")]
+    #[test]
+    fn rdbtool_reads_a_filesystem_this_crate_built() {
+        if !differential_enabled() {
+            return;
+        }
+
+        // A length that is not a multiple of the 492-byte payload, so
+        // the final partial block — the one the SummedLongs rule is
+        // about — is what `fsget` has to get right. A multiple of four,
+        // because SummedLongs counts longwords and cannot describe the
+        // trailing one to three bytes of anything else.
+        let driver = fake_driver(2564);
+        let mut disk = blank_disk(TEN_MIB_BLOCKS, 512);
+        RdbBuilder::for_size(TEN_MIB, 512)
+            .unwrap()
+            .partition(PartitionSpec::by_size(4 * 1024 * 1024).dos_type(0x444F_5307))
+            .filesystem(
+                FileSystemSpec::new(0x444F_5307, driver.clone())
+                    .version(45, 13)
+                    .stack_size(8192),
+            )
+            .build(&mut disk)
+            .expect("build");
+
+        let path = scratch("fshd.hdf");
+        std::fs::write(&path, &disk.data).expect("write image");
+
+        // `FileSystem #0 DOS7/0x444f5307 version=45.13 size=2564
+        //  seg_list_blk=0x3 global_vec=0xffffffff`
+        let info = rdbtool(&path, &["info"]);
+        let line = info
+            .lines()
+            .find(|l| l.starts_with("FileSystem #0"))
+            .unwrap_or_else(|| panic!("rdbtool saw no filesystem:\n{info}"))
+            .to_string();
+        for expected in [
+            "DOS7/0x444f5307",
+            "version=45.13",
+            "size=2564",
+            "global_vec=0xffffffff",
+        ] {
+            assert!(
+                line.contains(expected),
+                "{expected:?} missing from {line:?}"
+            );
+        }
+
+        let extracted = scratch("fsget.bin");
+        rdbtool(&path, &["fsget", "0", extracted.to_str().unwrap()]);
+        assert_eq!(std::fs::read(&extracted).expect("read extracted"), driver);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&extracted);
+    }
+
+    /// The differential in the other direction: `rdbtool` creates the
+    /// image and adds the filesystem, this crate parses it.
+    ///
+    /// The assertions are the FSHD defaults `rdbtool` 0.8.1 writes,
+    /// which are the ones [`fshd_defaults`] documents and this crate
+    /// therefore writes too — `fhb_PatchFlags` 0x180 (`SegList` and
+    /// `GlobalVec` and nothing else), `fhb_GlobalVec` -1, `fhb_HostID` 0
+    /// — so this is the test that would notice if a later amitools
+    /// release moved them and left our defaults describing history.
+    ///
+    /// **The driver is a whole number of `LSEG` payloads on purpose.**
+    /// `rdbtool` 0.8.1 writes a *reduced* `SummedLongs` on a final
+    /// partial `LSEG` block while checksumming the whole block anyway,
+    /// which produces a block that fails its own header whenever the
+    /// driver's length is not a multiple of four — see
+    /// [`RdbBuilder::fill_lseg`], and see
+    /// [`rdbtool_writes_an_lseg_that_fails_its_own_checksum`], which
+    /// pins that behaviour rather than working around it here.
+    #[cfg(feature = "std")]
+    #[test]
+    fn this_crate_reads_a_filesystem_rdbtool_built() {
+        if !differential_enabled() {
+            return;
+        }
+
+        let driver = fake_driver(2 * LSEG_PAYLOAD);
+        let path = scratch("rdbtool-fshd.hdf");
+        rdbtool_fsadd(&path, &driver);
+
+        let mut disk = MemDisk::new(std::fs::read(&path).expect("read image"));
+        let rdb = Rdb::parse(&mut disk).expect("parse rdbtool's image");
+        assert_eq!(rdb.validate(), Vec::new());
+        assert_eq!(rdb.validate_seg_lists(&mut disk).unwrap(), Vec::new());
+
+        assert_eq!(rdb.filesystems.len(), 1);
+        let f = &rdb.filesystems[0];
+        assert_eq!(f.dos_type, 0x444F_5307);
+        assert_eq!((f.version_major(), f.version_minor()), (45, 13));
+        assert_eq!(f.host_id, fshd_defaults::HOST_ID);
+        assert_eq!(f.flags, fshd_defaults::FLAGS);
+        assert_eq!(f.patch_flags, fshd_patch::SEG_LIST | fshd_patch::GLOBAL_VEC);
+        assert_eq!(f.global_vec, Some(fshd_defaults::GLOBAL_VEC));
+        assert_eq!(
+            (f.node_type, f.task, f.lock, f.handler),
+            (None, None, None, None)
+        );
+        assert_eq!((f.stack_size, f.priority, f.startup), (None, None, None));
+
+        // The FSHD goes straight after the RDSK on a disk with no
+        // partitions, and its chain straight after that.
+        assert_eq!(f.fshd_block, 1);
+        assert_eq!(f.seg_list_blocks, 2);
+        let loaded = rdb.load_filesystem(f, &mut disk).unwrap();
+        assert_eq!(loaded, driver);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The finding the FSHD differential turned up, pinned so it stays a
+    /// known quantity rather than a surprise: **`rdbtool` 0.8.1 writes a
+    /// final partial `LSEG` block that fails its own checksum.**
+    ///
+    /// It reduces `SummedLongs` to the longwords the payload actually
+    /// reaches — which is how `fsget` recovers a driver's byte length,
+    /// and which this crate matches — but computes `ChkSum` over the
+    /// whole block regardless, so summing the declared count does not
+    /// give zero. Any reader that follows `SummedLongs` rejects the
+    /// block, this crate's parser and a 68k ROM alike; `rdbtool` itself
+    /// does not check, so it round-trips its own images happily.
+    ///
+    /// Asserted rather than worked around because a differential suite
+    /// that quietly tolerated the oracle being wrong would be testing
+    /// nothing. If a later amitools fixes it, this test fails and says
+    /// so — which is the point, and why CI pins `amitools==0.8.1`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn rdbtool_writes_an_lseg_that_fails_its_own_checksum() {
+        if !differential_enabled() {
+            return;
+        }
+
+        // Three bytes past a whole payload, so the second block's
+        // payload is not a whole number of longwords — which is exactly
+        // when the two disagree: the bytes past the declared count are
+        // the driver's trailing 1..=3, and they are not zero.
+        let driver = fake_driver(LSEG_PAYLOAD + 3);
+        let path = scratch("rdbtool-partial-lseg.hdf");
+        rdbtool_fsadd(&path, &driver);
+
+        let mut disk = MemDisk::new(std::fs::read(&path).expect("read image"));
+        let rdb = Rdb::parse(&mut disk).expect("the RDSK/FSHD chains are fine");
+        let f = &rdb.filesystems[0];
+        // The declared count is the reduced one this crate also writes...
+        let base = f.seg_list_blocks as usize * 512 + 512;
+        assert_eq!(
+            be32(&disk.data, base + hdr::SUMMED_LONGS),
+            LSEG_HEADER_LONGS
+        );
+        // ...but the block does not sum to zero over it.
+        assert_eq!(
+            rdb.load_filesystem(f, &mut disk),
+            Err(RdbError::BadChecksum {
+                lba: f.seg_list_blocks as u64 + 1
+            })
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `rdbtool create + init + fsadd` at `path`, with `driver` as the
+    /// filesystem binary. Overwrites whatever was there.
+    #[cfg(feature = "std")]
+    fn rdbtool_fsadd(path: &std::path::Path, driver: &[u8]) {
+        let driver_path = path.with_extension("driver.bin");
+        std::fs::write(&driver_path, driver).expect("write driver");
+        let _ = std::fs::remove_file(path);
+
+        let out = std::process::Command::new("rdbtool")
+            .arg("-f")
+            .arg(path)
+            .args(["create", "size=10Mi", "+", "init", "+", "fsadd"])
+            .arg(&driver_path)
+            .args(["dostype=DOS7", "version=45.13"])
+            .output()
+            .expect("run rdbtool");
+        assert!(
+            out.status.success(),
+            "rdbtool create failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_file(&driver_path);
     }
 }

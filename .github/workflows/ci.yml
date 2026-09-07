@@ -80,7 +80,34 @@ jobs:
       - run: cargo test
       - run: cargo build --no-default-features
 
-  # TODO: differential job against the GPL oracles — `xdftool <img> open + part`
-  # (amitools) diffed against `rdbinfo`, over the redistributable AROS fixture
-  # once amibake's `aros68k` recipe can build it here. Gated on milestone 2's
-  # round-trip work; see PLAN.md. Run the oracle, never copy it.
+  differential:
+    # The oracle suite: build images here, let amitools' `rdbtool` read them,
+    # and parse images `rdbtool` wrote. Pinned to 0.8.1 because every default
+    # this crate writes — the envec, the RDSK fields, the FSHD patch flags,
+    # the LSEG SummedLongs rule — was observed against that exact version, and
+    # a differential against a moving oracle tests nothing. amitools is GPL:
+    # it is run here, never copied.
+    name: differential (amitools 0.8.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # python3 and pip are preinstalled on the runners; --user keeps it out
+      # of the system site-packages and needs no virtualenv dance.
+      - run: pip install --user amitools==0.8.1
+      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: rdbtool --help > /dev/null
+      # The differential tests are `#[test]`s gated on this variable: without
+      # it they return immediately, which is why the rest of CI needs no
+      # amitools. `rdbtool` filters to just them.
+      - run: cargo test rdbtool
+        env:
+          AMIGA_RDB_DIFFERENTIAL: "1"
+
+  # TODO: the remaining differential is the boot-level one — an AROS `DOS\7`
+  # fixture with its filesystem in the RDB, mounted by a 3.1-era ROM, once
+  # amibake's `aros68k` recipe can build a redistributable image here. The
+  # block-level oracle above covers RDSK/PART/FSHD/LSEG in both directions;
+  # what it cannot say is whether a real ROM boots the result. Milestone 3
+  # adds AmiPart (MIT) as a second oracle for the mutation path.

@@ -299,24 +299,112 @@ want.
       an area of *n* blocks holds *n − 1* RDB structures, so the FSHD +
       LSEG payloads of the next item will need the override or the
       growth path, not the first cylinder.
-- [ ] **FSHD + LSEG writing**: take a hunk-format filesystem binary,
-      split it into LSEG blocks, chain them, patch the FSHD fields.
-      **This is the other half of the AROS DOS\7 fix** — ship a
-      long-name filesystem inside the image so a 3.1-era ROM can mount
-      DOS\7.
-- [ ] **Round-trip property**: every create test parses its own output
-      and asserts equality; `rdbinfo` output diffed against `xdftool
-      <img> open + part` (GPL oracle — run, never copy) in CI where
-      xdftool is available.
+- [x] **FSHD + LSEG writing**: `RdbBuilder::filesystem(FileSystemSpec)`,
+      matching the `PartitionSpec` idiom — `FileSystemSpec::new(dostype,
+      binary)` plus `version(major, minor)` and setters for the
+      patch-flag-gated fields. **This is the other half of the AROS
+      DOS\7 fix** — ship a long-name filesystem inside the image so a
+      3.1-era ROM can mount DOS\7.
 
-      *Partly landed with the builder*: every `RdbBuilder` test already
-      parses its own image and asserts `validate()` is silent, and
-      `rdbtool_reads_an_image_this_crate_built` is the first differential
-      smoke test — it builds an image, runs `rdbtool <img> list`, and
-      asserts the names and cylinder extents agree. Gated on
-      `AMIGA_RDB_DIFFERENTIAL=1` (rdbtool is not a build dependency) and
-      **not wired into CI yet**, which is what remains here along with
-      the full field-by-field diff.
+      **The binary is not parsed**, per the hunk non-goal: any bytes are
+      accepted, split into `block_size - 20`-byte payloads, chained.
+      `rdbtool` accepts arbitrary bytes too, which is how the defaults
+      below were observed without needing a real handler to hand.
+
+      **Every default verified against `rdbtool` 0.8.1** the same way
+      the envec's were — `create + init + fsadd <file>`, then the raw
+      FSHD read back. `fhb_PatchFlags` **0x180 and only 0x180**:
+      `SegList` (bit 7) and `GlobalVec` (bit 8), with `fhb_GlobalVec`
+      **-1** and `Type`/`Task`/`Lock`/`Handler`/`StackSize`/`Priority`/
+      `Startup` left zero *and unpatched* — absent, not zero, which is
+      exactly the distinction the read side's `Option`s preserve, so
+      the spec's defaults are `None` and setting one turns its bit on.
+      `fhb_HostID` **0** — matched even though `rdbtool` writes 7 into
+      the RDSK and every PART on the same disk, because the field is as
+      meaningless on an image either way and byte-identity with the
+      oracle is worth more than tidiness. `fhb_Flags` 0, `fhb_Version`
+      packed major<<16|minor. Layout: each FSHD immediately followed by
+      its own LSEG run, filesystems after the PART blocks, chained in
+      the order added — `rdbtool`'s allocation exactly (FSHD 1, LSEG
+      2..7, FSHD 8, LSEG 9..14 for two 2560-byte drivers).
+
+      **LSEG `SummedLongs` is the count actually summed**, floored: five
+      header longwords plus `payload_len / 4`. Observed either side of
+      every boundary — 493 bytes at 512-byte blocks gives `[128, 5]`,
+      496 gives `[128, 6]`, 9000 bytes at 4 KB blocks gives
+      `[1024, 1024, 217]` — and it is load-bearing rather than cosmetic:
+      `rdbtool fsget` recovers a driver's *byte length* from these
+      counts, so the differential extracts our image's driver
+      byte-for-byte.
+
+      **One deliberate deviation, and it is a bug on the other side.**
+      `rdbtool` 0.8.1 writes that reduced count but sums the *whole
+      block* for `ChkSum`. The two agree only while the bytes past the
+      declared count are zero — true for a driver whose length is a
+      multiple of four, false for any other, whose trailing 1..=3 bytes
+      then sit outside the sum it actually took. Such a block fails
+      `checksum_ok`, and would fail in a 68k ROM just the same. This
+      crate writes the same count with the *correct* sum; the deviation
+      is pinned by `rdbtool_writes_an_lseg_that_fails_its_own_checksum`
+      rather than worked around, because a differential that tolerated
+      the oracle being wrong would be testing nothing.
+
+      **Area accounting.** `layout()`'s `needed` is now `1 + partitions
+      + Σ(1 + ceil(len / (block_size - 20)))` — the FSHD payload size is
+      known up front, as this plan predicted, so the whole budget is
+      still computed before the sink is touched and the growth path and
+      the `RdbAreaTooSmall`/`SinkTooSmall` refusals extended with no new
+      error variants. This is the first thing that makes the growth path
+      matter: a 50 KB driver is 103 blocks against a partition's one, so
+      the default area moves well past `rdbtool`'s first cylinder and
+      `rdb_LoCylinder` with it. (`rdbtool` refuses this case outright —
+      "no space in RDB left" — having fixed the area at creation time.)
+      Write order tightened to match: each LSEG chain, then its FSHD,
+      then the PART blocks, then the RDSK — every block written only
+      after everything it points at.
+- [x] **Round-trip property**: every create test parses its own output
+      and asserts equality; the amitools oracle (GPL — run, never copy)
+      diffed against ours in CI.
+
+      **Round-trip.** Each per-feature test already parses its own image
+      and asserts `validate()` is silent; the broad one added on top is
+      `rebuilding_from_the_parsed_values_reproduces_the_image` — build,
+      parse, rebuild through `RdbBuilder::new(geometry)` +
+      `by_cylinders` + explicit `reserved_blocks` + the envec off
+      `envec_raw` + the FSHD re-added from the parsed header and
+      `load_filesystem`'s bytes, and assert the two images are
+      **byte-identical**. It doubles as a coverage assertion about the
+      *read* surface: anything the builder writes that the parser does
+      not expose would fail it.
+
+      *Byte-identity holds for a driver that is a whole number of LSEG
+      payloads, and that is the honest limit.* LSEG records no byte
+      count, so `load_filesystem` returns the binary padded to a block;
+      feeding that back reproduces the same blocks, but a driver that
+      did not fill its last block comes back padded and the rebuilt
+      final LSEG sums the whole block where the original summed only as
+      far as the driver reached. The difference is two longwords in one
+      block — a property of the format, not a defect in the rebuild.
+
+      **Differential.** Four env-gated tests
+      (`AMIGA_RDB_DIFFERENTIAL=1`, since amitools is not a build
+      dependency): the existing `rdbtool <img> list` extent check, plus
+      `rdbtool_reads_a_filesystem_this_crate_built` (`info` for the FSHD
+      fields, then `fsget` extracting the driver byte-for-byte — which
+      proves the chain, the split, the block order and the SummedLongs
+      rule at once), `this_crate_reads_a_filesystem_rdbtool_built` (the
+      reverse: rdbtool creates and `fsadd`s, we parse and assert the
+      0x180/-1/host-0 defaults, `validate()` and `validate_seg_lists()`
+      clean), and the checksum-bug pin above.
+
+      **CI**: a `differential` job that `pip install --user
+      amitools==0.8.1` — pinned, because every default here was observed
+      against that version and a differential against a moving oracle
+      tests nothing — and runs `AMIGA_RDB_DIFFERENTIAL=1 cargo test
+      rdbtool`, the filter catching the four gated tests plus the three
+      that pin rdbtool-observed constants. The workflow's `TODO` now
+      names what is left: the boot-level AROS-fixture differential,
+      which needs an image a real ROM can be pointed at.
 
 ## Milestone 3 — mutate in place
 
@@ -448,11 +536,13 @@ The risky stage, gated on the differential suite existing first.
 - [x] **CI** (GitHub Actions): test on stable, `--no-default-features`
       build, clippy `-D warnings`, rustfmt, docs build (`RUSTDOCFLAGS=-D
       warnings`), MSRV. One workflow, `.github/workflows/ci.yml`, jobs
-      parallel. Differential
-      job runs when the redistributable AROS fixture can be fetched or
-      rebuilt (amibake's `aros68k` recipe builds from nothing) — not
-      built yet, recorded as a `TODO` in the yaml so the intent has a
-      home next to the jobs it will join.
+      parallel. The **differential** job landed with milestone 2's
+      round-trip item: `amitools==0.8.1` pinned via `pip install
+      --user`, `AMIGA_RDB_DIFFERENTIAL=1 cargo test rdbtool`. What
+      remains a `TODO` in the yaml is the boot-level differential — a
+      redistributable AROS fixture (amibake's `aros68k` recipe builds
+      one from nothing) mounted by a 3.1-era ROM, which is the one
+      question the block-level oracle cannot answer.
 - [x] **MSRV**: 1.63, in `rust-version` and tested by its own CI job
       (test + build only — clippy/rustfmt run on stable, where their
       opinions are current). Verified by actually running the suite on
