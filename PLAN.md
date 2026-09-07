@@ -211,18 +211,94 @@ want.
       implementation was cross-checked against the live amitools
       `DiskGeometry` on 430 randomized sizes across all seven supported
       block sizes: zero mismatches. Run as an oracle, never copied.
-- [ ] **RDSK + PART writing**: builder API — add partitions by size or
-      by cylinder range, auto or explicit `DriveName`, boot priority,
-      dostype, the lot. Block allocation within `rdb_RDBBlocksLo..Hi`.
-- [ ] **RDB-area sizing done right** — the lesson from the overlap
-      bug above: reserve *generously* at creation (partition
-      count is known, FSHD payload size is known or estimable — size
-      from what will actually be stored, plus headroom for later
-      edits, not a fixed small constant), and make "does not fit"
-      a **hard error before any block is written**, never a silent
-      overflow into partition space. The builder computes its full
-      block budget up front; there is no code path that writes block
-      N+1 after discovering block N was the last one.
+- [x] **RDSK + PART writing**: `RdbBuilder`, two entry points —
+      `new(Geometry)` for a caller cloning a disk it already measured,
+      `for_size(total_bytes, block_size)` for one that has a size and no
+      opinion (it goes through `synthesize_geometry`). Partitions are
+      `PartitionSpec::by_size(bytes)` or `by_cylinders(low, high)`, with
+      auto or explicit `DriveName`, bootable + `de_BootPri`, dostype, and
+      every envec field overridable. `build(&mut sink) -> Result<RdbLayout,
+      BuildError<S::Error>>` returns the LBAs and extents it used; the
+      tests re-parse the image anyway, on the principle that the disk is
+      the only authority on what is on the disk.
+
+      **Rounding direction: down, and this contradicts the assumption the
+      item was written under.** `rdbtool` 0.8.1 does *not* round up: its
+      `add` is `cyls = num_bytes // rdisk.get_cylinder_bytes()`, plain
+      floor division, verified against images it wrote — 10 MiB on a
+      129 024-byte cylinder becomes cylinders 1..=81 (10 450 944 bytes),
+      not 82, and a size below one cylinder is refused outright
+      ("invalid partition range given!"). Matched exactly, including the
+      refusal (`BuildError::PartitionTooSmall`), for the interoperability
+      reason that pinned the geometry convention. It is also the same
+      direction `synthesize_geometry` rounds, so the crate has one rule
+      rather than two: a size is a ceiling, and the tool that hands out
+      more than it was asked for is the one that walks off the end of
+      something. `by_cylinders` exists for the caller who needs the other
+      answer exactly.
+
+      **Every default verified against `rdbtool` 0.8.1** by creating
+      images and parsing the raw blocks, not from the NDK's suggestions.
+      Envec: `de_TableSize` **16** (so `de_Baud`/`de_Control`/
+      `de_BootBlocks` are *absent*, not zero — rdbtool only reaches 19
+      when one of them is non-zero), `de_SecOrg` 0, `de_SectorPerBlock`
+      1, `de_Reserved` **2**, `de_PreAlloc` 0, `de_Interleave` 0,
+      `de_NumBuffers` **30**, `de_BufMemType` 0, `de_MaxTransfer`
+      **0x00FFFFFF**, `de_Mask` **0x7FFFFFFE**, `de_DosType`
+      **0x444F5303** (`DOS\3`). `de_SizeBlock` is the one default that is
+      *not* a constant: rdbtool writes `rdb_BlockBytes / 4` (128 at 512,
+      **1024 at 4096**), so `PartitionSpec::size_block_longs` is an
+      `Option` and `envec_defaults::size_block_longs(block_size)` is the
+      rule. RDSK: `rdb_Flags` **0x7** (LAST|LASTLUN|LASTTID), `HostID`
+      **7**, `Interleave` 1, `ParkingZone`/`WritePreComp`/`ReducedWrite`
+      all == `rdb_Cylinders`, `StepRate` 3, `AutoParkSeconds` 0,
+      `DriveInit`/`BadBlockList`/`FileSysHeaderList` all `CHAIN_END`,
+      `SummedLongs` **64 whatever the block size**. RDSK at **block 0**
+      and PART blocks consecutively from block 1, both observed.
+
+      **One deliberate deviation**: rdbtool writes
+      `"RDBTOOL"`/`"IMAGE"`/`"2012"` into the disk identification strings
+      while leaving `rdb_Flags` at 0x7, i.e. *without* `DISK_ID`. By the
+      format's own rule those bytes then mean nothing; this crate leaves
+      them zero rather than plant an unflagged invention a careless
+      reader might print.
+- [x] **RDB-area sizing done right** — "does not fit" is a hard error
+      from `build()` **before any block is written**, and the structure
+      guarantees it rather than the discipline doing so: a private
+      `layout()` with no sink in scope computes the complete block
+      budget, and every check lives there, so there is no path that can
+      write block N+1 after discovering block N was the last one. Proved
+      by test: each refusal builds into a `MemDisk` of zeros and asserts
+      it is still all zeros. Refused cases: partition past the disk's
+      last cylinder (sized or explicit), partition reaching into the RDB
+      area, partitions overlapping each other, inverted cylinder range,
+      a size below one cylinder, more PART blocks than the area holds,
+      a sink smaller than the layout, a geometry describing no blocks, a
+      duplicate or unstorable `DriveName`, and a sink whose block size is
+      not the geometry's. Zero partitions is *not* an error — rdbtool's
+      `create` + `init` produces exactly that, `rdb_PartitionList` is
+      `CHAIN_END`, and it is what a caller partitioning in a later step
+      wants.
+
+      **Reserved-area policy, observed versus exposed.** rdbtool's own
+      default *is* a fixed constant, which is the tension this item
+      predicted: it reserves the disk's whole **first cylinder**
+      (`rdb_RDBBlocksLo` 0, `rdb_RDBBlocksHi = cyl_blocks - 1`,
+      `rdb_LoCylinder` 1) regardless of partition count — 0, 1, 2, 5 and
+      10 partitions all give `RDBBlocksHi = 31` on a 32-block cylinder,
+      with only `rdb_HighRDSKBlock` moving. Resolved in favour of
+      interop for the common case and correctness for the uncommon one:
+      the default is rdbtool's first cylinder **or what the layout needs
+      plus `RDB_HEADROOM_BLOCKS` (16) of slack, whichever is larger**, so
+      images match rdbtool's block-for-block until the point where
+      matching it would mean overflowing into the first partition — at
+      which point the area grows and `rdb_LoCylinder` moves up with it.
+      `RdbBuilder::reserved_blocks(n)` overrides both, for a caller
+      reproducing an existing image's area or one that knows what it is
+      about to store. Note the ceiling this implies and rdbtool shares:
+      an area of *n* blocks holds *n − 1* RDB structures, so the FSHD +
+      LSEG payloads of the next item will need the override or the
+      growth path, not the first cylinder.
 - [ ] **FSHD + LSEG writing**: take a hunk-format filesystem binary,
       split it into LSEG blocks, chain them, patch the FSHD fields.
       **This is the other half of the AROS DOS\7 fix** — ship a
@@ -232,6 +308,15 @@ want.
       and asserts equality; `rdbinfo` output diffed against `xdftool
       <img> open + part` (GPL oracle — run, never copy) in CI where
       xdftool is available.
+
+      *Partly landed with the builder*: every `RdbBuilder` test already
+      parses its own image and asserts `validate()` is silent, and
+      `rdbtool_reads_an_image_this_crate_built` is the first differential
+      smoke test — it builds an image, runs `rdbtool <img> list`, and
+      asserts the names and cylinder extents agree. Gated on
+      `AMIGA_RDB_DIFFERENTIAL=1` (rdbtool is not a build dependency) and
+      **not wired into CI yet**, which is what remains here along with
+      the full field-by-field diff.
 
 ## Milestone 3 — mutate in place
 

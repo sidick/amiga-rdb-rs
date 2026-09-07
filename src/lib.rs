@@ -12,7 +12,9 @@
 //! emulator holding an image file, a tool holding a raw device, and a
 //! test holding a `Vec<u8>`. [`BlockSink`] is its write-side mirror,
 //! kept separate so that "this code only reads" is a fact the type
-//! system enforces. What is *inside* a partition is out of
+//! system enforces, and [`RdbBuilder`] is what writes through it: a
+//! whole partition table computed and checked before its first block
+//! reaches the disk. What is *inside* a partition is out of
 //! scope by design: one filesystem family per crate, composed through
 //! an adapter that offsets a partition's LBAs into the parent device.
 //!
@@ -374,6 +376,9 @@ mod hdr {
     pub const ID: usize = 0;
     pub const SUMMED_LONGS: usize = 4;
     pub const CHK_SUM: usize = 8;
+    /// Shared by every block type — the `RDSK`'s `rdb_HostID`, the
+    /// `PART`'s `pb_HostID`, and so on: one longword, one offset.
+    pub const HOST_ID: usize = 12;
 }
 
 /// The smallest `SummedLongs` that can produce a passing checksum: the
@@ -1513,8 +1518,13 @@ mod part {
 mod de {
     pub const TABLE_SIZE: usize = 0;
     pub const SIZE_BLOCK: usize = 1;
+    pub const SEC_ORG: usize = 2;
     pub const SURFACES: usize = 3;
+    pub const SECTORS_PER_BLOCK: usize = 4;
     pub const BLOCKS_PER_TRACK: usize = 5;
+    pub const RESERVED: usize = 6;
+    pub const PRE_ALLOC: usize = 7;
+    pub const INTERLEAVE: usize = 8;
     pub const LOW_CYL: usize = 9;
     pub const HIGH_CYL: usize = 10;
     pub const NUM_BUFFERS: usize = 11;
@@ -2102,6 +2112,1147 @@ fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
         envec_raw,
     })
 }
+
+/// The values this crate writes into a new `PART` block's `DosEnvec`
+/// when the caller does not override them, and where each came from.
+///
+/// **Provenance: every number here was read back out of an image made by
+/// amitools' `rdbtool` 0.8.1**, by creating a disk, adding partitions and
+/// parsing the raw `PART` blocks — not from the NDK's suggested values
+/// and not from folklore. The reason is the one
+/// [`synthesize_geometry`] gives for the geometry convention:
+/// `rdbtool`'s images are this crate's fixtures and its differential
+/// oracle, so a default that differs from `rdbtool`'s would make every
+/// such comparison a false positive, and would hand the Amiga a mount
+/// parameter subtly unlike the one every other image on the machine
+/// carries.
+///
+/// A caller who wants different values sets them on the
+/// [`PartitionSpec`]; nothing here is enforced, only defaulted.
+pub mod envec_defaults {
+    /// `de_TableSize` — 16, the index of `de_DosType`, so the envec runs
+    /// exactly as far as the last field the format's mount path needs.
+    /// The three tail fields (`de_Baud`, `de_Control`, `de_BootBlocks`)
+    /// are *absent* rather than zero, which is what `rdbtool` writes and
+    /// what [`Partition::baud`](super::Partition::baud) and friends report as `None`.
+    pub const TABLE_SIZE: u32 = 16;
+
+    /// `de_SecOrg` — sector origin. Always zero; the field has never had
+    /// another meaning.
+    pub const SEC_ORG: u32 = 0;
+
+    /// `de_SectorPerBlock` — device sectors per filesystem block. One,
+    /// with `de_SizeBlock` carrying the size instead; every image in the
+    /// wild says one.
+    pub const SECTORS_PER_BLOCK: u32 = 1;
+
+    /// `de_Reserved` — blocks reserved at the start of the partition for
+    /// the boot block. Two, which is what a DOS-family filesystem needs
+    /// and what every tool writes.
+    pub const RESERVED: u32 = 2;
+
+    /// `de_PreAlloc` — blocks reserved at the *end* of the partition.
+    /// Zero: a DOS filesystem needs none.
+    pub const PRE_ALLOC: u32 = 0;
+
+    /// `de_Interleave` — filesystem-level interleave. Zero.
+    pub const INTERLEAVE: u32 = 0;
+
+    /// `de_NumBuffers` — cache buffers the handler allocates at mount.
+    /// A mount parameter that says nothing about the disk; 30 is
+    /// `rdbtool`'s default.
+    pub const NUM_BUFFERS: u32 = 30;
+
+    /// `de_BufMemType` — which memory those buffers want. Zero means
+    /// "any", which is right for everything except a DMA controller that
+    /// cannot reach fast RAM.
+    pub const BUF_MEM_TYPE: u32 = 0;
+
+    /// `de_MaxTransfer` — the largest transfer, in bytes, the driver may
+    /// issue in one go.
+    pub const MAX_TRANSFER: u32 = 0x00FF_FFFF;
+
+    /// `de_Mask` — address mask for DMA-reachable memory. `0x7FFFFFFE`
+    /// is the conventional "anything word-aligned in the low 2 GB".
+    pub const MASK: u32 = 0x7FFF_FFFE;
+
+    /// `de_DosType` — `DOS\x03` (FFS with international caching),
+    /// `rdbtool`'s default for a new partition. Callers who want
+    /// `DOS\x00` or `DOS\x07` say so.
+    pub const DOS_TYPE: u32 = 0x444F_5303;
+
+    /// `de_SizeBlock`, the filesystem block size in longwords, is *not*
+    /// a constant: `rdbtool` writes `rdb_BlockBytes / 4` — 128 on a
+    /// 512-byte-block disk, 1024 on a 4 KB one — so the filesystem block
+    /// and the device block start out the same size. This is the one
+    /// default that depends on the geometry, which is why
+    /// [`PartitionSpec::size_block_longs`](super::PartitionSpec::size_block_longs) is an [`Option`] rather than
+    /// carrying a number the constructor cannot know.
+    ///
+    /// The two remain independent knobs after that: a caller may ask for
+    /// a 32 KB filesystem block on a 512-byte-block disk, which is a real
+    /// and working configuration.
+    pub const fn size_block_longs(block_size: usize) -> u32 {
+        (block_size / 4) as u32
+    }
+}
+
+/// The values this crate writes into a new `RDSK` block when the caller
+/// does not override them — same provenance as [`envec_defaults`]:
+/// observed in `rdbtool` 0.8.1's output, not assumed.
+pub mod rdsk_defaults {
+    /// `rdb_Flags` — `LAST | LASTLUN | LASTTID`
+    /// ([`rdb_flags`](super::rdb_flags)): there is no disk after this
+    /// one, no LUN after this one, no target after this one. The honest
+    /// answer for an image file, which is not on a bus at all, and what
+    /// `rdbtool` writes.
+    pub const FLAGS: u32 =
+        super::rdb_flags::LAST | super::rdb_flags::LAST_LUN | super::rdb_flags::LAST_TID;
+
+    /// `rdb_HostID` — the controller's own SCSI ID. Seven by convention
+    /// (the host adapter traditionally takes the highest priority ID),
+    /// and meaningless on an image.
+    pub const HOST_ID: u32 = 7;
+
+    /// `rdb_Interleave` — physical sector interleave. One means "none".
+    pub const INTERLEAVE: u32 = 1;
+
+    /// `rdb_StepRate` — head step rate in the drive's own units.
+    pub const STEP_RATE: u32 = 3;
+
+    /// `rdb_AutoParkSeconds` — idle seconds before an auto-park. Zero is
+    /// never, which is the only sane value for anything modern.
+    pub const AUTO_PARK_SECONDS: u32 = 0;
+}
+
+/// Where a partition goes: a size the builder turns into cylinders, or
+/// the cylinders themselves.
+///
+/// Two entry points because there are two kinds of caller. One has a
+/// size — "give me a 500 MB `DH0`" — and wants the cylinder arithmetic
+/// done for it. The other is reproducing a layout it already knows (a
+/// clone of an existing disk, a recipe in a build file) and must be able
+/// to say the exact cylinders, because rounding a size back into
+/// cylinders is not guaranteed to land on the same ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// At most this many bytes, placed after the previous partition.
+    ///
+    /// **Rounds the cylinder count down** — `bytes / cylinder_bytes`,
+    /// floored — so a partition never claims more space than was asked
+    /// for, and falls short of it by less than one cylinder. That is what
+    /// `rdbtool` 0.8.1 does (`cyls = num_bytes //
+    /// rdisk.get_cylinder_bytes()`, verified against the images it
+    /// writes: 10 MiB on a 129 024-byte cylinder becomes 81 cylinders,
+    /// 10 450 944 bytes, not 82), and it is the same direction
+    /// [`synthesize_geometry`] rounds, for the same reason — a size is a
+    /// ceiling, and the tool that hands out more than it was asked for is
+    /// the one that walks off the end of something.
+    ///
+    /// A size below one whole cylinder therefore describes no partition
+    /// at all and is [`BuildError::PartitionTooSmall`], not a silently
+    /// rounded-up one: `de_HighCyl` is inclusive, so there is no
+    /// zero-cylinder partition to write. `rdbtool` refuses the same case
+    /// ("invalid partition range given!").
+    ///
+    /// A caller who needs "at least *n* bytes" rounds up itself, or uses
+    /// [`Cylinders`](Self::Cylinders) — the point of the pair is that the
+    /// exact answer is always available.
+    Size(u64),
+    /// Exactly these cylinders, `high` *inclusive*, as `de_LowCyl` and
+    /// `de_HighCyl` will say. Placed where it says, not after the
+    /// previous partition — a builder given only explicit ranges places
+    /// nothing implicitly, and overlaps are refused rather than shuffled.
+    Cylinders {
+        /// `de_LowCyl`, the first cylinder.
+        low: u32,
+        /// `de_HighCyl`, the last — inclusive, so `low == high` is a
+        /// legal one-cylinder partition.
+        high: u32,
+    },
+}
+
+/// One partition to create: where it goes and what its `PART` block will
+/// say.
+///
+/// Construct with [`by_size`](Self::by_size) or
+/// [`by_cylinders`](Self::by_cylinders), which fill every mount
+/// parameter from [`envec_defaults`]; change what you need through the
+/// chainable setters or by assigning the public fields directly, since a
+/// caller cloning an existing disk needs to reproduce values this crate
+/// has no opinion about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionSpec {
+    /// Where the partition goes.
+    pub placement: Placement,
+    /// `pb_DriveName`, or `None` to have the builder assign the first
+    /// free `DH`*n* — see [`RdbBuilder::build`] for exactly which.
+    pub name: Option<String>,
+    /// `pb_Flags` bit 0: the ROM may boot from this partition.
+    pub bootable: bool,
+    /// `pb_Flags` bit 1: mount it, but not automatically at boot.
+    pub no_automount: bool,
+    /// `de_BootPri` — boot priority, higher wins. Ignored unless
+    /// [`bootable`](Self::bootable).
+    pub boot_pri: i32,
+    /// `de_DosType`.
+    pub dos_type: u32,
+    /// `de_SizeBlock`, in longwords — the *filesystem* block size, which
+    /// is per partition and independent of `rdb_BlockBytes`.
+    ///
+    /// `None` takes [`envec_defaults::size_block_longs`] of the
+    /// geometry's block size, which is what `rdbtool` writes and the one
+    /// default the [`PartitionSpec`] constructors cannot fill in, not
+    /// knowing the disk they will be built against.
+    pub size_block_longs: Option<u32>,
+    /// `de_SecOrg`.
+    pub sec_org: u32,
+    /// `de_SectorPerBlock`.
+    pub sectors_per_block: u32,
+    /// `de_Reserved` — boot blocks at the start of the partition.
+    pub reserved: u32,
+    /// `de_PreAlloc` — blocks held back at the end.
+    pub pre_alloc: u32,
+    /// `de_Interleave`.
+    pub interleave: u32,
+    /// `de_NumBuffers`.
+    pub num_buffers: u32,
+    /// `de_BufMemType`.
+    pub buf_mem_type: u32,
+    /// `de_MaxTransfer`.
+    pub max_transfer: u32,
+    /// `de_Mask`.
+    pub mask: u32,
+}
+
+impl PartitionSpec {
+    /// A partition of at least `bytes`, placed after the previous one —
+    /// see [`Placement::Size`] for the rounding.
+    pub fn by_size(bytes: u64) -> Self {
+        Self::with_placement(Placement::Size(bytes))
+    }
+
+    /// A partition on exactly cylinders `low..=high` (inclusive).
+    pub fn by_cylinders(low: u32, high: u32) -> Self {
+        Self::with_placement(Placement::Cylinders { low, high })
+    }
+
+    fn with_placement(placement: Placement) -> Self {
+        Self {
+            placement,
+            name: None,
+            bootable: false,
+            no_automount: false,
+            boot_pri: 0,
+            dos_type: envec_defaults::DOS_TYPE,
+            size_block_longs: None,
+            sec_org: envec_defaults::SEC_ORG,
+            sectors_per_block: envec_defaults::SECTORS_PER_BLOCK,
+            reserved: envec_defaults::RESERVED,
+            pre_alloc: envec_defaults::PRE_ALLOC,
+            interleave: envec_defaults::INTERLEAVE,
+            num_buffers: envec_defaults::NUM_BUFFERS,
+            buf_mem_type: envec_defaults::BUF_MEM_TYPE,
+            max_transfer: envec_defaults::MAX_TRANSFER,
+            mask: envec_defaults::MASK,
+        }
+    }
+
+    /// Set `pb_DriveName` explicitly instead of taking an assigned one.
+    pub fn named(mut self, name: &str) -> Self {
+        self.name = Some(String::from(name));
+        self
+    }
+
+    /// Set `de_DosType`.
+    pub fn dos_type(mut self, dos_type: u32) -> Self {
+        self.dos_type = dos_type;
+        self
+    }
+
+    /// Mark the partition bootable (`pb_Flags` bit 0) with the given
+    /// `de_BootPri`.
+    pub fn bootable(mut self, boot_pri: i32) -> Self {
+        self.bootable = true;
+        self.boot_pri = boot_pri;
+        self
+    }
+
+    /// Set `de_SizeBlock` in longwords — the filesystem block size, not
+    /// the device's.
+    pub fn size_block_longs(mut self, longs: u32) -> Self {
+        self.size_block_longs = Some(longs);
+        self
+    }
+}
+
+/// Why [`RdbBuilder::build`] refused to write.
+///
+/// Every variant except [`Io`](Self::Io) is raised **before the first
+/// block is written**: the builder computes the whole layout, checks it,
+/// and only then writes, so a rejected build leaves the target exactly as
+/// it found it. That is the point of the type — the failure mode this
+/// crate exists to prevent is a partitioner discovering halfway through
+/// that its structures do not fit and writing them into partition space
+/// anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildError<E> {
+    /// The [`BlockSink`] failed on a write. The only variant that can
+    /// leave the target half-written — the layout was valid and the
+    /// device said no.
+    Io(E),
+    /// The sink's [`block_size`](BlockSink::block_size) is not a power of
+    /// two in [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`].
+    UnsupportedBlockSize {
+        /// What the sink said its block size was.
+        block_size: usize,
+    },
+    /// The [`Geometry`]'s block size and the sink's disagree. Every LBA
+    /// the builder computes is in geometry blocks; writing them through a
+    /// differently sized sink would address the wrong bytes.
+    BlockSizeMismatch {
+        /// [`Geometry::block_size`].
+        geometry: usize,
+        /// [`BlockSink::block_size`].
+        sink: usize,
+    },
+    /// The geometry describes no blocks — a zero in `cylinders`, `heads`
+    /// or `sectors`. Nothing can be placed against it.
+    EmptyGeometry {
+        /// The geometry as given.
+        geometry: Geometry,
+    },
+    /// A `pb_DriveName` does not fit the 32-byte BCPL field, or is empty.
+    InvalidName {
+        /// The name asked for.
+        name: String,
+        /// The longest name the field holds.
+        max: usize,
+    },
+    /// Two partitions were given the same `pb_DriveName`. Refused rather
+    /// than silently renamed: two `DH0`s is a layout whose mounts fight
+    /// each other, and the caller asked for it explicitly.
+    DuplicateName {
+        /// The name asked for twice.
+        name: String,
+    },
+    /// A [`Placement::Cylinders`] range runs backwards.
+    CylindersInverted {
+        /// The partition's name.
+        name: String,
+        /// `de_LowCyl` as asked for.
+        low_cyl: u32,
+        /// `de_HighCyl` as asked for — below `low_cyl`, which is the issue.
+        high_cyl: u32,
+    },
+    /// A [`Placement::Size`] is below one cylinder, so it describes no
+    /// partition at all — see that variant for why this is refused
+    /// rather than rounded up to one.
+    PartitionTooSmall {
+        /// The partition's name.
+        name: String,
+        /// The size asked for.
+        bytes: u64,
+        /// One cylinder, in bytes — the smallest partition there is.
+        cylinder_bytes: u64,
+    },
+    /// A partition's last cylinder is past the last cylinder the geometry
+    /// has. Covers both a [`Placement::Cylinders`] range that overshoots
+    /// and a [`Placement::Size`] larger than the space left.
+    PartitionPastEndOfDisk {
+        /// The partition's name.
+        name: String,
+        /// The last cylinder it wanted.
+        high_cyl: u32,
+        /// The last cylinder the disk has (`rdb_Cylinders - 1`).
+        last_cylinder: u32,
+    },
+    /// A partition starts below `rdb_LoCylinder`, i.e. inside the
+    /// reserved RDB area. The overlap this crate exists to refuse.
+    PartitionOverlapsRdbArea {
+        /// The partition's name.
+        name: String,
+        /// The cylinder it wanted to start on.
+        low_cyl: u32,
+        /// The first cylinder available to partitions.
+        lo_cylinder: u32,
+    },
+    /// Two partitions claim the same cylinders.
+    PartitionsOverlap {
+        /// The first partition's name, in the order they were added.
+        a_name: String,
+        /// The second's.
+        b_name: String,
+        /// The first cylinder both claim.
+        low_cyl: u32,
+        /// The last, inclusive.
+        high_cyl: u32,
+    },
+    /// The reserved RDB area cannot hold the blocks the layout needs —
+    /// one `RDSK` plus one `PART` per partition. Either too many
+    /// partitions, or a [`RdbBuilder::reserved_blocks`] override too
+    /// small for them.
+    RdbAreaTooSmall {
+        /// Blocks the layout needs, `RDSK` included.
+        needed: u32,
+        /// Blocks the area has (`rdb_RDBBlocksHi - rdb_RDBBlocksLo + 1`).
+        available: u32,
+    },
+    /// The sink is smaller than the layout: its
+    /// [`block_count`](BlockSink::block_count) is below the last block
+    /// the layout would occupy. Only detectable when the sink knows its
+    /// size; a sink reporting `None` is taken at its word.
+    SinkTooSmall {
+        /// Blocks the layout needs to exist.
+        needed: u64,
+        /// Blocks the sink says it has.
+        available: u64,
+    },
+    /// Sealing a block's checksum failed.
+    ///
+    /// Unreachable in practice — the builder seals 64 longwords into
+    /// blocks of at least [`MIN_BLOCK_SIZE`], which hold 128 — but the
+    /// alternative to a variant here is an `unwrap`, and a writer that
+    /// can panic on a caller's arithmetic is exactly what
+    /// [`seal_checksum`] returns a `Result` to avoid.
+    Seal(SealError),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for BuildError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BuildError::Io(e) => write!(f, "writing a block failed: {e}"),
+            BuildError::UnsupportedBlockSize { block_size } => write!(
+                f,
+                "unsupported device block size {block_size}: \
+                 must be a power of two in {MIN_BLOCK_SIZE}..={MAX_BLOCK_SIZE}"
+            ),
+            BuildError::BlockSizeMismatch { geometry, sink } => write!(
+                f,
+                "the geometry is in {geometry}-byte blocks but the sink writes \
+                 {sink}-byte blocks"
+            ),
+            BuildError::EmptyGeometry { geometry } => write!(
+                f,
+                "the geometry {}/{}/{} describes no blocks",
+                geometry.cylinders, geometry.heads, geometry.sectors
+            ),
+            BuildError::InvalidName { name, max } => write!(
+                f,
+                "drive name {name:?} does not fit pb_DriveName: \
+                 1..={max} characters are available"
+            ),
+            BuildError::DuplicateName { name } => {
+                write!(f, "two partitions are both named {name:?}")
+            }
+            BuildError::CylindersInverted {
+                name,
+                low_cyl,
+                high_cyl,
+            } => write!(
+                f,
+                "partition {name:?} has an inverted cylinder range: \
+                 LowCyl {low_cyl} is above HighCyl {high_cyl}"
+            ),
+            BuildError::PartitionTooSmall {
+                name,
+                bytes,
+                cylinder_bytes,
+            } => write!(
+                f,
+                "partition {name:?} asks for {bytes} bytes, less than the \
+                 {cylinder_bytes}-byte cylinder that is the smallest partition"
+            ),
+            BuildError::PartitionPastEndOfDisk {
+                name,
+                high_cyl,
+                last_cylinder,
+            } => write!(
+                f,
+                "partition {name:?} ends on cylinder {high_cyl}, past the disk's last \
+                 cylinder {last_cylinder}"
+            ),
+            BuildError::PartitionOverlapsRdbArea {
+                name,
+                low_cyl,
+                lo_cylinder,
+            } => write!(
+                f,
+                "partition {name:?} starts on cylinder {low_cyl}, inside the RDB area \
+                 that ends at cylinder {}",
+                lo_cylinder.saturating_sub(1)
+            ),
+            BuildError::PartitionsOverlap {
+                a_name,
+                b_name,
+                low_cyl,
+                high_cyl,
+            } => write!(
+                f,
+                "partitions {a_name:?} and {b_name:?} both claim cylinders \
+                 {low_cyl}..={high_cyl}"
+            ),
+            BuildError::RdbAreaTooSmall { needed, available } => write!(
+                f,
+                "the RDB area holds {available} blocks but the layout needs {needed}"
+            ),
+            BuildError::SinkTooSmall { needed, available } => write!(
+                f,
+                "the layout needs {needed} blocks but the target has {available}"
+            ),
+            BuildError::Seal(e) => write!(f, "sealing a block failed: {e}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: std::error::Error + 'static> std::error::Error for BuildError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BuildError::Io(e) => Some(e),
+            BuildError::Seal(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Where one partition landed: the answer to "what did you write, and
+/// where", for a caller that wants to act on the result without
+/// re-parsing the disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedPartition {
+    /// LBA of the `PART` block written for it.
+    pub part_block: u64,
+    /// The `pb_DriveName` written — the assigned one if the spec left it
+    /// to the builder.
+    pub name: String,
+    /// `de_LowCyl` as written.
+    pub low_cyl: u32,
+    /// `de_HighCyl` as written, *inclusive*.
+    pub high_cyl: u32,
+    /// First device block of the partition's data, as
+    /// [`Partition::start_lba`] will report it.
+    pub start_lba: u64,
+    /// How many device blocks it covers, as [`Partition::block_len`]
+    /// will report it.
+    pub block_len: u64,
+}
+
+/// The complete block layout [`RdbBuilder::build`] computed and wrote.
+///
+/// Returned rather than nothing so a caller need not re-parse the disk
+/// to learn where its partitions ended up — though re-parsing is exactly
+/// what this crate's own tests do, on the principle that the disk is the
+/// only authority on what is on the disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdbLayout {
+    /// LBA the `RDSK` block was written to.
+    pub rdsk_block: u64,
+    /// `rdb_RDBBlocksLo` as written.
+    pub rdb_blocks_lo: u32,
+    /// `rdb_RDBBlocksHi` as written — the reserved ceiling, *inclusive*.
+    pub rdb_blocks_hi: u32,
+    /// `rdb_HighRDSKBlock` as written — the highest block actually used,
+    /// so the gap up to [`rdb_blocks_hi`](Self::rdb_blocks_hi) is the
+    /// headroom a later edit has to work in.
+    pub high_rdsk_block: u32,
+    /// `rdb_LoCylinder` — the first cylinder available to partitions.
+    pub lo_cylinder: u32,
+    /// `rdb_HiCylinder` — the last, *inclusive*.
+    pub hi_cylinder: u32,
+    /// The geometry written into the `RDSK` block.
+    pub geometry: Geometry,
+    /// The partitions, in the order they were added and chained.
+    pub partitions: Vec<PlacedPartition>,
+}
+
+/// Build a fresh RDB — an `RDSK` block and its `PART` chain — on an
+/// empty target.
+///
+/// # The order of operations, which is the whole design
+///
+/// [`build`](Self::build) computes the **complete** block layout,
+/// validates every part of it, and only then writes. There is no code
+/// path that writes block *N+1* after discovering that block *N* was the
+/// last one that fit: "does not fit" is a [`BuildError`] returned before
+/// the sink is touched. This is not defensiveness for its own sake — RDB
+/// images damaged by exactly that failure exist in the wild, partition
+/// tables written past a too-small reserved area into the first
+/// partition, after which the filesystem and the partition table each
+/// destroy the other. [`Rdb::validate`] is how a reader finds such an
+/// image; this is how a writer never makes one.
+///
+/// Blocks are written `PART` chain first and `RDSK` last, so an
+/// interrupted build leaves no valid `RDSK` — an unpartitioned disk
+/// rather than a partition table pointing at blocks that were never
+/// written.
+///
+/// # Example
+///
+/// ```
+/// use amiga_rdb::{PartitionSpec, RdbBuilder};
+/// # use amiga_rdb::{BlockSink, BlockSource, Rdb};
+/// # struct MemDisk(Vec<u8>);
+/// # fn eof() -> std::io::Error {
+/// #     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "past the end of the disk")
+/// # }
+/// # impl BlockSource for MemDisk {
+/// #     type Error = std::io::Error;
+/// #     fn block_size(&self) -> usize { 512 }
+/// #     fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+/// #         let off = lba as usize * 512;
+/// #         buf.copy_from_slice(self.0.get(off..off + 512).ok_or_else(eof)?);
+/// #         Ok(())
+/// #     }
+/// #     fn block_count(&self) -> Option<u64> { Some(self.0.len() as u64 / 512) }
+/// # }
+/// # impl BlockSink for MemDisk {
+/// #     type Error = std::io::Error;
+/// #     fn block_size(&self) -> usize { 512 }
+/// #     fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+/// #         let off = lba as usize * 512;
+/// #         self.0.get_mut(off..off + 512).ok_or_else(eof)?.copy_from_slice(buf);
+/// #         Ok(())
+/// #     }
+/// #     fn block_count(&self) -> Option<u64> { Some(self.0.len() as u64 / 512) }
+/// # }
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut disk = MemDisk(vec![0u8; 64 * 1024 * 1024]);
+///
+/// let layout = RdbBuilder::for_size(64 * 1024 * 1024, 512)?
+///     .partition(PartitionSpec::by_size(16 * 1024 * 1024).bootable(0))
+///     .partition(PartitionSpec::by_size(16 * 1024 * 1024).named("WORK"))
+///     .build(&mut disk)?;
+///
+/// assert_eq!(layout.partitions[0].name, "DH0");
+/// assert_eq!(layout.partitions[1].name, "WORK");
+///
+/// // The disk is the authority on what is on the disk.
+/// let rdb = Rdb::parse(&mut disk)?;
+/// assert_eq!(rdb.partitions.len(), 2);
+/// assert!(rdb.validate().is_empty());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdbBuilder {
+    geometry: Geometry,
+    rdsk_block: u32,
+    reserved_blocks: Option<u32>,
+    flags: u32,
+    host_id: u32,
+    specs: Vec<PartitionSpec>,
+}
+
+/// Longest `pb_DriveName` the 32-byte BCPL field holds: one length byte
+/// and 31 characters.
+const MAX_DRIVE_NAME: usize = 31;
+
+/// How many longwords an `RDSK`, `PART` or `FSHD` block sums over — 64,
+/// i.e. the first 256 bytes, whatever the device block size.
+const HEADER_SUMMED_LONGS: u32 = 64;
+
+impl RdbBuilder {
+    /// A builder for a disk of exactly this [`Geometry`] — the entry
+    /// point for a caller that already has one, whether from
+    /// [`synthesize_geometry`] or from an existing disk it is cloning.
+    pub fn new(geometry: Geometry) -> Self {
+        Self {
+            geometry,
+            rdsk_block: 0,
+            reserved_blocks: None,
+            flags: rdsk_defaults::FLAGS,
+            host_id: rdsk_defaults::HOST_ID,
+            specs: Vec::new(),
+        }
+    }
+
+    /// A builder for a disk of `total_bytes` in `block_size`-byte blocks,
+    /// with the geometry [`synthesize_geometry`] chooses — the entry
+    /// point for a caller that has a size and no opinion about cylinders,
+    /// which is most of them.
+    pub fn for_size(total_bytes: u64, block_size: usize) -> Result<Self, GeometryError> {
+        Ok(Self::new(synthesize_geometry(total_bytes, block_size)?))
+    }
+
+    /// Add a partition. Order matters: [`Placement::Size`] partitions are
+    /// laid out in the order added, and the `PART` chain follows it.
+    pub fn partition(mut self, spec: PartitionSpec) -> Self {
+        self.specs.push(spec);
+        self
+    }
+
+    /// Put the `RDSK` block somewhere other than block 0.
+    ///
+    /// Block 0 is where `rdbtool` writes it and where every image this
+    /// crate has seen carries it; the format allows anywhere in the first
+    /// [`RDB_LOCATION_LIMIT`] blocks, which exists so a disk can carry a
+    /// foreign boot sector at block 0 and an RDB behind it. Values at or
+    /// above the limit are not refused here — the RDSK simply would not
+    /// be found, which [`build`](Self::build) leaves to the caller who
+    /// deliberately asked for it.
+    pub fn rdsk_block(mut self, lba: u32) -> Self {
+        self.rdsk_block = lba;
+        self
+    }
+
+    /// Reserve exactly this many blocks for the RDB area
+    /// (`rdb_RDBBlocksLo..=rdb_RDBBlocksHi`), overriding the default
+    /// policy [`build`](Self::build) documents.
+    ///
+    /// The count is from block 0, so it is also `rdb_RDBBlocksHi + 1`. A
+    /// value too small for the `RDSK` and `PART` blocks the layout needs
+    /// is [`BuildError::RdbAreaTooSmall`], not a silent overflow into the
+    /// first partition.
+    pub fn reserved_blocks(mut self, blocks: u32) -> Self {
+        self.reserved_blocks = Some(blocks);
+        self
+    }
+
+    /// Set `rdb_Flags`, overriding [`rdsk_defaults::FLAGS`].
+    pub fn flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Set `rdb_HostID`, overriding [`rdsk_defaults::HOST_ID`].
+    pub fn host_id(mut self, host_id: u32) -> Self {
+        self.host_id = host_id;
+        self
+    }
+
+    /// Compute the layout, validate it, and write it to `sink`.
+    ///
+    /// # What gets written where
+    ///
+    /// The `RDSK` block goes at [`rdsk_block`](Self::rdsk_block)
+    /// (default 0, `rdbtool`'s choice), and the `PART` blocks follow it
+    /// consecutively, chained in the order the partitions were added and
+    /// terminated with [`CHAIN_END`]. `rdb_HighRDSKBlock` records the
+    /// last block used; `rdb_RDBBlocksHi` records the reserved ceiling,
+    /// which is normally higher — see below. The `FSHD` and `BADB` chain
+    /// heads are `CHAIN_END`: a fresh RDB carries no loadable filesystem
+    /// (that is the next milestone) and no bad blocks.
+    ///
+    /// # Names
+    ///
+    /// A [`PartitionSpec`] without a name gets the first `DH`*n* not
+    /// already claimed by an *explicit* name anywhere in the build — so a
+    /// mixed build of `[unnamed, "DH0", unnamed]` yields `DH1`, `DH0`,
+    /// `DH2`, and never a duplicate. Two explicit names that collide are
+    /// [`BuildError::DuplicateName`]; the builder renames nothing it was
+    /// told.
+    ///
+    /// # Cylinders
+    ///
+    /// `rdb_LoCylinder` is the first cylinder past the reserved area and
+    /// `rdb_HiCylinder` the geometry's last, both inclusive.
+    /// [`Placement::Size`] partitions are packed from `rdb_LoCylinder`
+    /// upward in the order added, each starting on the cylinder after the
+    /// previous one's last; [`Placement::Cylinders`] partitions go
+    /// exactly where they say and do not move the packing cursor past
+    /// themselves except when they end above it. Every partition is then
+    /// checked against the disk's end, against the RDB area, and against
+    /// every other partition.
+    ///
+    /// # Zero partitions
+    ///
+    /// Legal, and supported: `rdb_PartitionList` is [`CHAIN_END`] and the
+    /// result is an initialised disk with no partitions, which is what
+    /// `rdbtool`'s `create` + `init` produces and what a caller
+    /// partitioning in a later step wants.
+    pub fn build<S: BlockSink>(&self, sink: &mut S) -> Result<RdbLayout, BuildError<S::Error>> {
+        let block_size = sink.block_size();
+        if !block_size_ok(block_size) {
+            return Err(BuildError::UnsupportedBlockSize { block_size });
+        }
+        if self.geometry.block_size != block_size {
+            return Err(BuildError::BlockSizeMismatch {
+                geometry: self.geometry.block_size,
+                sink: block_size,
+            });
+        }
+
+        let layout = self.layout(sink.block_count())?;
+
+        // Everything below is a write. Nothing above one wrote a byte,
+        // which is the invariant the whole type exists for.
+        let mut buf = alloc::vec![0u8; block_size];
+        for (i, placed) in layout.partitions.iter().enumerate() {
+            let next = match layout.partitions.get(i + 1) {
+                Some(p) => p.part_block as u32,
+                None => CHAIN_END,
+            };
+            buf.iter_mut().for_each(|b| *b = 0);
+            self.fill_part(&mut buf, &self.specs[i], placed, next)?;
+            sink.write_block(placed.part_block, &buf)
+                .map_err(BuildError::Io)?;
+        }
+
+        // The RDSK last: until it lands the disk has no partition table
+        // at all, which is a better outcome for an interrupted build
+        // than a table pointing at blocks that were never written.
+        buf.iter_mut().for_each(|b| *b = 0);
+        self.fill_rdsk(&mut buf, &layout)?;
+        sink.write_block(layout.rdsk_block, &buf)
+            .map_err(BuildError::Io)?;
+
+        Ok(layout)
+    }
+
+    /// The whole layout, or the first reason it cannot exist. Split out
+    /// of [`build`](Self::build) so that "compute everything, then write"
+    /// is structural rather than a discipline: this function has no sink
+    /// and so cannot write.
+    fn layout<E>(&self, sink_blocks: Option<u64>) -> Result<RdbLayout, BuildError<E>> {
+        let g = self.geometry;
+        let cyl_blocks = g.cylinder_blocks();
+        if g.cylinders == 0 || cyl_blocks == 0 {
+            return Err(BuildError::EmptyGeometry { geometry: g });
+        }
+        let last_cylinder = g.cylinders - 1;
+
+        // Names first: the layout errors below name the partition they
+        // are about, so the names have to exist before the placement.
+        let names = self.assign_names()?;
+
+        // The RDB area. `rdb_RDBBlocksLo` is 0 rather than the RDSK's own
+        // block: the area is what a repartitioner owns, and that includes
+        // any block before the RDSK it might move the RDSK into.
+        let needed = 1u64 + self.specs.len() as u64;
+        let reserved = match self.reserved_blocks {
+            Some(n) => n as u64,
+            None => self.default_reserved_blocks(cyl_blocks, needed),
+        };
+        if reserved < needed || reserved > u32::MAX as u64 {
+            return Err(BuildError::RdbAreaTooSmall {
+                needed: needed.min(u32::MAX as u64) as u32,
+                available: reserved.min(u32::MAX as u64) as u32,
+            });
+        }
+        // Every RDB block must sit inside the area, the RDSK included.
+        let last_used = self.rdsk_block as u64 + needed - 1;
+        if last_used >= reserved {
+            return Err(BuildError::RdbAreaTooSmall {
+                needed: (last_used + 1).min(u32::MAX as u64) as u32,
+                available: reserved as u32,
+            });
+        }
+
+        // The area is rounded up to a whole cylinder because a partition
+        // can only start on one: a reserved area ending mid-cylinder
+        // would leave the rest of that cylinder owned by nobody, or —
+        // worse — by the first partition, which is the overlap.
+        // (`div_ceil` would say this, but it is newer than this crate's
+        // MSRV; `reserved >= 1` so the addition cannot be the problem.)
+        let lo_cylinder = (reserved + cyl_blocks - 1) / cyl_blocks;
+        if lo_cylinder > last_cylinder as u64 {
+            return Err(BuildError::PartitionOverlapsRdbArea {
+                name: String::from("<the disk>"),
+                low_cyl: last_cylinder,
+                lo_cylinder: lo_cylinder.min(u32::MAX as u64) as u32,
+            });
+        }
+        let lo_cylinder = lo_cylinder as u32;
+
+        // Placement, in the order added. `next_cyl` is where the next
+        // sized partition starts; an explicit range pushes it past
+        // itself, so mixing the two packs rather than colliding.
+        let mut next_cyl = lo_cylinder;
+        let mut partitions = Vec::with_capacity(self.specs.len());
+        for (i, spec) in self.specs.iter().enumerate() {
+            let name = names[i].clone();
+            let (low_cyl, high_cyl) = match spec.placement {
+                Placement::Cylinders { low, high } => {
+                    if high < low {
+                        return Err(BuildError::CylindersInverted {
+                            name,
+                            low_cyl: low,
+                            high_cyl: high,
+                        });
+                    }
+                    (low, high)
+                }
+                Placement::Size(bytes) => {
+                    // Floored, matching rdbtool: a partition claims at
+                    // most what was asked for. Below one cylinder there
+                    // is nothing to claim — de_HighCyl is inclusive, so a
+                    // zero-cylinder partition cannot be written — and
+                    // that is an error rather than a rounded-up cylinder.
+                    let cylinder_bytes = cyl_blocks * g.block_size as u64;
+                    let want = bytes / cylinder_bytes;
+                    if want == 0 {
+                        return Err(BuildError::PartitionTooSmall {
+                            name,
+                            bytes,
+                            cylinder_bytes,
+                        });
+                    }
+                    let low = next_cyl as u64;
+                    let high = low.saturating_add(want - 1);
+                    if high > last_cylinder as u64 {
+                        return Err(BuildError::PartitionPastEndOfDisk {
+                            name,
+                            high_cyl: high.min(u32::MAX as u64) as u32,
+                            last_cylinder,
+                        });
+                    }
+                    (low as u32, high as u32)
+                }
+            };
+
+            if high_cyl > last_cylinder {
+                return Err(BuildError::PartitionPastEndOfDisk {
+                    name,
+                    high_cyl,
+                    last_cylinder,
+                });
+            }
+            if low_cyl < lo_cylinder {
+                return Err(BuildError::PartitionOverlapsRdbArea {
+                    name,
+                    low_cyl,
+                    lo_cylinder,
+                });
+            }
+            next_cyl = next_cyl.max(high_cyl.saturating_add(1));
+
+            partitions.push(PlacedPartition {
+                part_block: self.rdsk_block as u64 + 1 + i as u64,
+                name,
+                low_cyl,
+                high_cyl,
+                start_lba: low_cyl as u64 * cyl_blocks,
+                block_len: (high_cyl as u64 - low_cyl as u64 + 1) * cyl_blocks,
+            });
+        }
+
+        // Pairwise overlap. Quadratic on a list that is single digits in
+        // every real layout and capped by the RDB area's block count in
+        // any case; the same check [`Rdb::validate`] makes, made before
+        // the image exists rather than after.
+        for a in 0..partitions.len() {
+            for b in a + 1..partitions.len() {
+                let (pa, pb) = (&partitions[a], &partitions[b]);
+                let low = pa.low_cyl.max(pb.low_cyl);
+                let high = pa.high_cyl.min(pb.high_cyl);
+                if low <= high {
+                    return Err(BuildError::PartitionsOverlap {
+                        a_name: pa.name.clone(),
+                        b_name: pb.name.clone(),
+                        low_cyl: low,
+                        high_cyl: high,
+                    });
+                }
+            }
+        }
+
+        // The target has to actually hold what the layout describes: the
+        // RDB area, and every partition's last block.
+        let mut needed_blocks = reserved;
+        for p in &partitions {
+            needed_blocks = needed_blocks.max(p.start_lba + p.block_len);
+        }
+        if let Some(available) = sink_blocks {
+            if needed_blocks > available {
+                return Err(BuildError::SinkTooSmall {
+                    needed: needed_blocks,
+                    available,
+                });
+            }
+        }
+
+        Ok(RdbLayout {
+            rdsk_block: self.rdsk_block as u64,
+            rdb_blocks_lo: 0,
+            rdb_blocks_hi: (reserved - 1) as u32,
+            high_rdsk_block: last_used as u32,
+            lo_cylinder,
+            hi_cylinder: last_cylinder,
+            geometry: g,
+            partitions,
+        })
+    }
+
+    /// How many blocks to reserve when the caller did not say.
+    ///
+    /// **Policy: `rdbtool`'s reserved area, or what the layout needs plus
+    /// headroom, whichever is larger.** `rdbtool` reserves the disk's
+    /// whole first cylinder (`rdb_RDBBlocksHi = rdb_CylBlocks - 1`,
+    /// `rdb_LoCylinder = 1`) — a *fixed* policy that does not scale with
+    /// the partition count, which is in tension with this crate's plan to
+    /// "size from what will actually be stored". The tension is resolved
+    /// in favour of interoperability for the common case and correctness
+    /// for the uncommon one: a first cylinder is 32 blocks at the
+    /// smallest Amiga geometry and 1024 at a PC-ish one, which is roomy
+    /// for any realistic partition count, so matching `rdbtool` costs
+    /// nothing and keeps images comparable. Where it is *not* enough —
+    /// many partitions on a small-cylinder disk, or a future `FSHD`/`LSEG`
+    /// payload — the area grows to what is needed plus
+    /// [`RDB_HEADROOM_BLOCKS`] of slack for later edits, rather than
+    /// overflowing into the first partition.
+    ///
+    /// [`reserved_blocks`](Self::reserved_blocks) overrides this
+    /// entirely, for a caller reproducing an existing image's area or one
+    /// who knows what it is about to store.
+    fn default_reserved_blocks(&self, cyl_blocks: u64, needed: u64) -> u64 {
+        let rdbtool_area = cyl_blocks;
+        let with_headroom = (self.rdsk_block as u64 + needed).saturating_add(RDB_HEADROOM_BLOCKS);
+        rdbtool_area.max(with_headroom)
+    }
+
+    /// The `pb_DriveName` for every spec, explicit ones as given and the
+    /// rest assigned.
+    fn assign_names<E>(&self) -> Result<Vec<String>, BuildError<E>> {
+        let mut names: Vec<Option<String>> = Vec::with_capacity(self.specs.len());
+        for spec in &self.specs {
+            match &spec.name {
+                Some(n) => {
+                    if n.is_empty() || n.len() > MAX_DRIVE_NAME {
+                        return Err(BuildError::InvalidName {
+                            name: n.clone(),
+                            max: MAX_DRIVE_NAME,
+                        });
+                    }
+                    if names.iter().flatten().any(|other| other == n) {
+                        return Err(BuildError::DuplicateName { name: n.clone() });
+                    }
+                    names.push(Some(n.clone()));
+                }
+                None => names.push(None),
+            }
+        }
+
+        // Assigned names avoid every *explicit* name, not merely the ones
+        // already assigned — otherwise a build of [unnamed, "DH0"] would
+        // hand out DH0 twice and the collision check above would not see
+        // it, the two names having been decided in different places.
+        let mut next = 0u32;
+        let out = names
+            .iter()
+            .map(|n| match n {
+                Some(n) => n.clone(),
+                None => loop {
+                    let candidate = alloc::format!("DH{next}");
+                    next += 1;
+                    if !names.iter().flatten().any(|other| *other == candidate) {
+                        break candidate;
+                    }
+                },
+            })
+            .collect();
+        Ok(out)
+    }
+
+    /// Fill a zeroed buffer with the `RDSK` block and seal it.
+    fn fill_rdsk<E>(&self, buf: &mut [u8], layout: &RdbLayout) -> Result<(), BuildError<E>> {
+        let g = layout.geometry;
+        put_be32(buf, hdr::ID, id::RDSK);
+        put_be32(buf, rdsk::HOST_ID, self.host_id);
+        put_be32(buf, rdsk::BLOCK_BYTES, g.block_size as u32);
+        put_be32(buf, rdsk::FLAGS, self.flags);
+        put_be32(buf, rdsk::BAD_BLOCK_LIST, CHAIN_END);
+        put_be32(
+            buf,
+            rdsk::PARTITION_LIST,
+            match layout.partitions.first() {
+                Some(p) => p.part_block as u32,
+                None => CHAIN_END,
+            },
+        );
+        put_be32(buf, rdsk::FILESYS_HEADER_LIST, CHAIN_END);
+        put_be32(buf, rdsk::DRIVE_INIT, CHAIN_END);
+        put_be32(buf, rdsk::CYLINDERS, g.cylinders);
+        put_be32(buf, rdsk::SECTORS, g.sectors);
+        put_be32(buf, rdsk::HEADS, g.heads);
+        put_be32(buf, rdsk::INTERLEAVE, rdsk_defaults::INTERLEAVE);
+        // Park on the cylinder past the last: the landing zone of a drive
+        // whose data ends where the geometry does.
+        put_be32(buf, rdsk::PARK, g.cylinders);
+        put_be32(buf, rdsk::WRITE_PRE_COMP, g.cylinders);
+        put_be32(buf, rdsk::REDUCED_WRITE, g.cylinders);
+        put_be32(buf, rdsk::STEP_RATE, rdsk_defaults::STEP_RATE);
+        put_be32(buf, rdsk::RDB_BLOCKS_LO, layout.rdb_blocks_lo);
+        put_be32(buf, rdsk::RDB_BLOCKS_HI, layout.rdb_blocks_hi);
+        put_be32(buf, rdsk::LO_CYLINDER, layout.lo_cylinder);
+        put_be32(buf, rdsk::HI_CYLINDER, layout.hi_cylinder);
+        put_be32(buf, rdsk::CYL_BLOCKS, g.cylinder_blocks() as u32);
+        put_be32(
+            buf,
+            rdsk::AUTO_PARK_SECONDS,
+            rdsk_defaults::AUTO_PARK_SECONDS,
+        );
+        put_be32(buf, rdsk::HIGH_RDSK_BLOCK, layout.high_rdsk_block);
+        // The six identification fields stay zero — a deliberate
+        // deviation from rdbtool, which writes "RDBTOOL"/"IMAGE"/"2012"
+        // into the disk triple while leaving rdb_Flags at 0x7, i.e.
+        // without DISK_ID set. By the format's own rule those bytes then
+        // mean nothing, and a consumer that checks the bit (as this
+        // crate's docs require) will not show them either way; writing a
+        // vendor string for a disk that is not on a bus is an invention,
+        // and an unflagged one is an invention a careless reader prints.
+        seal_checksum(buf, HEADER_SUMMED_LONGS).map_err(BuildError::Seal)
+    }
+
+    /// Fill a zeroed buffer with one `PART` block and seal it.
+    fn fill_part<E>(
+        &self,
+        buf: &mut [u8],
+        spec: &PartitionSpec,
+        placed: &PlacedPartition,
+        next: u32,
+    ) -> Result<(), BuildError<E>> {
+        put_be32(buf, hdr::ID, id::PART);
+        put_be32(buf, hdr::HOST_ID, self.host_id);
+        put_be32(buf, chain::NEXT, next);
+        let flags = (spec.bootable as u32) | ((spec.no_automount as u32) << 1);
+        put_be32(buf, part::FLAGS, flags);
+
+        // pb_DriveName is BCPL — a length byte then the characters, no
+        // terminator — unlike the RDSK's identification strings four
+        // structures away, which are space-padded ASCII.
+        let name = placed.name.as_bytes();
+        buf[part::DRIVE_NAME] = name.len() as u8;
+        buf[part::DRIVE_NAME + 1..part::DRIVE_NAME + 1 + name.len()].copy_from_slice(name);
+
+        let g = self.geometry;
+        let mut env = |i: usize, v: u32| put_be32(buf, part::ENVIRONMENT + i * 4, v);
+        env(de::TABLE_SIZE, envec_defaults::TABLE_SIZE);
+        env(
+            de::SIZE_BLOCK,
+            spec.size_block_longs
+                .unwrap_or_else(|| envec_defaults::size_block_longs(g.block_size)),
+        );
+        env(de::SEC_ORG, spec.sec_org);
+        env(de::SURFACES, g.heads);
+        env(de::SECTORS_PER_BLOCK, spec.sectors_per_block);
+        env(de::BLOCKS_PER_TRACK, g.sectors);
+        env(de::RESERVED, spec.reserved);
+        env(de::PRE_ALLOC, spec.pre_alloc);
+        env(de::INTERLEAVE, spec.interleave);
+        env(de::LOW_CYL, placed.low_cyl);
+        env(de::HIGH_CYL, placed.high_cyl);
+        env(de::NUM_BUFFERS, spec.num_buffers);
+        env(de::BUF_MEM_TYPE, spec.buf_mem_type);
+        env(de::MAX_TRANSFER, spec.max_transfer);
+        env(de::MASK, spec.mask);
+        env(de::BOOT_PRI, spec.boot_pri as u32);
+        env(de::DOS_TYPE, spec.dos_type);
+
+        seal_checksum(buf, HEADER_SUMMED_LONGS).map_err(BuildError::Seal)
+    }
+}
+
+/// Blocks of slack the RDB area gets past what a build actually uses,
+/// when the layout needs more than `rdbtool`'s first cylinder.
+///
+/// Headroom exists so a later edit — one more partition, an `FSHD` and
+/// its `LSEG` chain — has somewhere to go that is not the first
+/// partition. Sixteen is a cylinder's worth on the smallest geometry this
+/// crate produces and cheap on any disk; growing the area after the fact
+/// means moving a partition, which is the expensive operation this is
+/// buying insurance against.
+pub const RDB_HEADROOM_BLOCKS: u64 = 16;
 
 /// A [`BlockSource`] view of one partition: LBA 0 here is
 /// `partition.start_lba` on the parent, in the parent's device blocks
@@ -3731,5 +4882,637 @@ mod tests {
             ),
             "SummedLongs 200 exceeds the 128 longwords the block holds"
         );
+    }
+
+    // ---- the write path: RdbBuilder -------------------------------
+
+    /// A zeroed target — the state every refusal test asserts the sink
+    /// is still in afterwards.
+    fn blank_disk(blocks: usize, bs: usize) -> MemDisk {
+        MemDisk {
+            data: vec![0u8; blocks * bs],
+            block_size: bs,
+        }
+    }
+
+    /// Ten mebibytes at 512-byte blocks: 640 cylinders of 32 blocks, so
+    /// one cylinder is 16 KiB and the arithmetic in the assertions below
+    /// stays checkable by eye.
+    const TEN_MIB: u64 = 10 * 1024 * 1024;
+    const TEN_MIB_BLOCKS: usize = (TEN_MIB / 512) as usize;
+
+    /// Build into a blank disk and hand back both. Every builder test
+    /// then parses what it wrote: the disk is the only authority on what
+    /// is on the disk, and a layout that agrees with itself proves
+    /// nothing.
+    fn build_on(builder: RdbBuilder, blocks: usize, bs: usize) -> (MemDisk, RdbLayout, Rdb) {
+        let mut disk = blank_disk(blocks, bs);
+        let layout = builder.build(&mut disk).expect("build");
+        let rdb = Rdb::parse(&mut disk).expect("parse back");
+        assert_eq!(rdb.validate(), Vec::new(), "builder produced a bad layout");
+        (disk, layout, rdb)
+    }
+
+    /// A build that must be refused, and must have written nothing.
+    fn assert_refused(builder: RdbBuilder, blocks: usize, bs: usize, expected: BuildError<()>) {
+        let mut disk = blank_disk(blocks, bs);
+        assert_eq!(builder.build(&mut disk), Err(expected));
+        assert!(
+            disk.data.iter().all(|&b| b == 0),
+            "a refused build wrote to the sink"
+        );
+    }
+
+    /// The whole round trip: two partitions in, an image out, and every
+    /// field read back off the disk — geometry, extents, names, flags,
+    /// dostypes and the envec defaults.
+    #[test]
+    fn builder_round_trips_through_parse() {
+        let (_disk, layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(
+                    PartitionSpec::by_size(4 * 1024 * 1024)
+                        .bootable(5)
+                        .dos_type(0x444F_5307),
+                )
+                .partition(
+                    PartitionSpec::by_size(2 * 1024 * 1024)
+                        .named("WORK")
+                        .size_block_longs(256),
+                ),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+
+        // The RDSK, as the geometry and the reserved-area policy decided.
+        assert_eq!(rdb.rdsk_block, 0);
+        assert_eq!(rdb.block_bytes, 512);
+        assert_eq!((rdb.cylinders, rdb.heads, rdb.sectors), (640, 1, 32));
+        assert_eq!(rdb.cyl_blocks, 32);
+        assert_eq!((rdb.rdb_blocks_lo, rdb.rdb_blocks_hi), (0, 31));
+        assert_eq!((rdb.lo_cylinder, rdb.hi_cylinder), (1, 639));
+        assert_eq!(rdb.high_rdsk_block, 2);
+        assert_eq!(rdb.flags, 0x7);
+        assert_eq!(rdb.host_id, 7);
+        assert_eq!(rdb.drive_init, CHAIN_END);
+        assert_eq!(rdb.filesys_header_list, CHAIN_END);
+        assert_eq!(rdb.bad_block_list, CHAIN_END);
+        assert!(rdb.filesystems.is_empty() && rdb.bad_blocks.is_empty());
+
+        // 4 MiB over a 16 KiB cylinder is 256 cylinders exactly, from
+        // cylinder 1; 2 MiB is 128, packed straight after it.
+        let a = &rdb.partitions[0];
+        assert_eq!(a.part_block, 1);
+        assert_eq!(a.name, "DH0");
+        assert_eq!((a.low_cyl, a.high_cyl), (1, 256));
+        assert_eq!((a.start_lba, a.block_len), (32, 256 * 32));
+        assert_eq!(a.cylinder_blocks, 32);
+        assert!(a.bootable && !a.no_automount);
+        assert_eq!(a.boot_pri, 5);
+        assert_eq!(a.dos_type, 0x444F_5307);
+
+        let b = &rdb.partitions[1];
+        assert_eq!(b.part_block, 2);
+        assert_eq!(b.name, "WORK");
+        assert_eq!((b.low_cyl, b.high_cyl), (257, 384));
+        assert_eq!((b.start_lba, b.block_len), (257 * 32, 128 * 32));
+        assert!(!b.bootable);
+        assert_eq!(b.dos_type, envec_defaults::DOS_TYPE);
+        assert_eq!(b.size_block_longs, 256);
+
+        // The envec defaults, in the units the format stores them in.
+        for p in &rdb.partitions {
+            assert_eq!(p.num_buffers, 30);
+            assert_eq!(p.buf_mem_type, 0);
+            assert_eq!(p.max_transfer, 0x00FF_FFFF);
+            assert_eq!(p.mask, 0x7FFF_FFFE);
+            // de_TableSize 16 means the tail fields are *absent*, not
+            // zero — which is what rdbtool writes and what a
+            // round-tripping consumer must not turn into a zero.
+            assert_eq!((p.baud, p.control, p.boot_blocks), (None, None, None));
+            assert_eq!(p.envec_raw.len(), 17);
+            assert_eq!(p.envec_raw[de::TABLE_SIZE], 16);
+            assert_eq!(p.envec_raw[de::SEC_ORG], 0);
+            assert_eq!(p.envec_raw[de::SECTORS_PER_BLOCK], 1);
+            assert_eq!(p.envec_raw[de::SURFACES], 1);
+            assert_eq!(p.envec_raw[de::BLOCKS_PER_TRACK], 32);
+            assert_eq!(p.envec_raw[de::RESERVED], 2);
+            assert_eq!(p.envec_raw[de::PRE_ALLOC], 0);
+            assert_eq!(p.envec_raw[de::INTERLEAVE], 0);
+        }
+        assert_eq!(rdb.partitions[0].size_block_longs, 128);
+
+        // And the layout says the same as the disk, since a caller may
+        // act on it without re-parsing.
+        assert_eq!(layout.rdsk_block, rdb.rdsk_block);
+        assert_eq!(layout.rdb_blocks_hi, rdb.rdb_blocks_hi);
+        assert_eq!(layout.high_rdsk_block, rdb.high_rdsk_block);
+        assert_eq!(layout.lo_cylinder, rdb.lo_cylinder);
+        for (placed, parsed) in layout.partitions.iter().zip(&rdb.partitions) {
+            assert_eq!(placed.part_block, parsed.part_block);
+            assert_eq!(placed.name, parsed.name);
+            assert_eq!(
+                (placed.low_cyl, placed.high_cyl),
+                (parsed.low_cyl, parsed.high_cyl)
+            );
+            assert_eq!(
+                (placed.start_lba, placed.block_len),
+                (parsed.start_lba, parsed.block_len)
+            );
+        }
+    }
+
+    /// Assigned names step around the explicit ones wherever they
+    /// appear, including an explicit name the assignment would otherwise
+    /// have reached later.
+    #[test]
+    fn builder_assigns_names_around_explicit_ones() {
+        let (_disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_size(1024 * 1024))
+                .partition(PartitionSpec::by_size(1024 * 1024).named("DH0"))
+                .partition(PartitionSpec::by_size(1024 * 1024))
+                .partition(PartitionSpec::by_size(1024 * 1024).named("SCRATCH")),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        let names: Vec<&str> = rdb.partitions.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["DH1", "DH0", "DH2", "SCRATCH"]);
+    }
+
+    /// Sizes round **down** to whole cylinders, pinned against what
+    /// `rdbtool` 0.8.1 does with the same requests on the same geometry
+    /// (`create chs=1000,4,63`, cylinder = 129 024 bytes): 10 MiB
+    /// becomes cylinders 1..=81 and 3 MB the 23 that follow, exactly as
+    /// `rdbtool` places them.
+    #[test]
+    fn builder_size_rounds_down_like_rdbtool() {
+        let geometry = Geometry {
+            cylinders: 1000,
+            heads: 4,
+            sectors: 63,
+            block_size: 512,
+        };
+        let (_disk, _layout, rdb) = build_on(
+            RdbBuilder::new(geometry)
+                .partition(PartitionSpec::by_size(10 * 1024 * 1024))
+                .partition(PartitionSpec::by_size(3_000_000))
+                // Either side of a cylinder boundary: one byte short of
+                // two cylinders is one cylinder, exactly two is two.
+                .partition(PartitionSpec::by_size(258_047))
+                .partition(PartitionSpec::by_size(258_048)),
+            30_000,
+            512,
+        );
+        let extents: Vec<(u32, u32)> = rdb
+            .partitions
+            .iter()
+            .map(|p| (p.low_cyl, p.high_cyl))
+            .collect();
+        assert_eq!(extents, [(1, 81), (82, 104), (105, 105), (106, 107)]);
+    }
+
+    /// Explicit cylinder ranges go exactly where they say, and a sized
+    /// partition after one packs from the cylinder it left free.
+    #[test]
+    fn builder_places_explicit_cylinder_ranges() {
+        let (_disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_cylinders(100, 199))
+                .partition(PartitionSpec::by_size(1024 * 1024))
+                // One cylinder is legal: de_HighCyl is inclusive.
+                .partition(PartitionSpec::by_cylinders(500, 500)),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        let extents: Vec<(u32, u32)> = rdb
+            .partitions
+            .iter()
+            .map(|p| (p.low_cyl, p.high_cyl))
+            .collect();
+        assert_eq!(extents, [(100, 199), (200, 263), (500, 500)]);
+    }
+
+    /// A partition-less RDB is legal — `rdbtool`'s `create` + `init`
+    /// produces one — and is what a caller that partitions in a later
+    /// step wants.
+    #[test]
+    fn builder_writes_an_rdb_with_no_partitions() {
+        let (disk, layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512).unwrap(),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        assert!(rdb.partitions.is_empty());
+        assert!(layout.partitions.is_empty());
+        // The chain head is CHAIN_END, not 0: block 0 is a real address.
+        assert_eq!(be32(&disk.data, rdsk::PARTITION_LIST), CHAIN_END);
+        // Nothing but the RDSK is in use, but the area is still reserved.
+        assert_eq!(rdb.high_rdsk_block, 0);
+        assert_eq!(rdb.rdb_blocks_hi, 31);
+        assert_eq!(rdb.lo_cylinder, 1);
+    }
+
+    /// 4 KB device blocks: every LBA is in *those* blocks, and
+    /// `de_SizeBlock` follows the device block size the way `rdbtool`
+    /// writes it (1024 longwords) rather than staying at 128.
+    #[test]
+    fn builder_round_trips_at_4k_blocks() {
+        let (_disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 4096)
+                .unwrap()
+                .partition(PartitionSpec::by_size(4 * 1024 * 1024).bootable(0)),
+            (TEN_MIB / 4096) as usize,
+            4096,
+        );
+        assert_eq!(rdb.block_bytes, 4096);
+        assert_eq!((rdb.cylinders, rdb.heads, rdb.sectors), (80, 1, 32));
+        assert_eq!(rdb.cyl_blocks, 32);
+        assert_eq!((rdb.rdb_blocks_lo, rdb.rdb_blocks_hi), (0, 31));
+        assert_eq!(rdb.lo_cylinder, 1);
+
+        let p = &rdb.partitions[0];
+        // A cylinder is 32 * 4096 = 128 KiB, so 4 MiB is 32 of them.
+        assert_eq!((p.low_cyl, p.high_cyl), (1, 32));
+        assert_eq!((p.start_lba, p.block_len), (32, 32 * 32));
+        assert_eq!(p.size_block_longs, 1024);
+        assert_eq!(p.max_transfer, 0x00FF_FFFF);
+        assert_eq!(p.mask, 0x7FFF_FFFE);
+    }
+
+    /// The reserved area is `rdbtool`'s first cylinder by default, and
+    /// grows past it — pushing `rdb_LoCylinder` up with it — when the
+    /// `PART` blocks plus headroom do not fit. The alternative, which
+    /// this crate will not produce, is RDB blocks written into the first
+    /// partition.
+    #[test]
+    fn reserved_area_grows_past_the_first_cylinder_when_needed() {
+        let mut builder = RdbBuilder::for_size(TEN_MIB, 512).unwrap();
+        for _ in 0..40 {
+            builder = builder.partition(PartitionSpec::by_size(16 * 1024));
+        }
+        let (_disk, layout, rdb) = build_on(builder, TEN_MIB_BLOCKS, 512);
+
+        // 40 PART blocks + the RDSK is 41, past the 32-block cylinder,
+        // so the area is 41 + RDB_HEADROOM_BLOCKS and the first
+        // partition starts on cylinder 2 rather than 1.
+        assert_eq!(rdb.rdb_blocks_hi, 41 + RDB_HEADROOM_BLOCKS as u32 - 1);
+        assert_eq!(rdb.high_rdsk_block, 40);
+        assert_eq!(rdb.lo_cylinder, 2);
+        assert_eq!(layout.partitions[0].low_cyl, 2);
+        assert_eq!(rdb.partitions.len(), 40);
+        assert_eq!(rdb.partitions[39].part_block, 40);
+    }
+
+    /// An explicit reserved area is honoured as given — the override a
+    /// caller reproducing an existing image needs.
+    #[test]
+    fn explicit_reserved_blocks_are_honoured() {
+        let (_disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .reserved_blocks(64)
+                .partition(PartitionSpec::by_size(1024 * 1024)),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        assert_eq!(rdb.rdb_blocks_hi, 63);
+        assert_eq!(rdb.lo_cylinder, 2);
+        assert_eq!(rdb.partitions[0].low_cyl, 2);
+    }
+
+    /// Every way a layout can fail to fit, each refused **before a byte
+    /// is written** — the property the whole build path is shaped
+    /// around, asserted by handing each case a disk of zeros and
+    /// checking it is still zeros afterwards.
+    #[test]
+    fn build_refuses_a_layout_that_does_not_fit() {
+        let ten_mib = || RdbBuilder::for_size(TEN_MIB, 512).unwrap();
+
+        // A cylinder range past the geometry's last cylinder.
+        assert_refused(
+            ten_mib().partition(PartitionSpec::by_cylinders(600, 700)),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::PartitionPastEndOfDisk {
+                name: String::from("DH0"),
+                high_cyl: 700,
+                last_cylinder: 639,
+            },
+        );
+
+        // A size larger than the space left after the RDB area.
+        assert_refused(
+            ten_mib().partition(PartitionSpec::by_size(TEN_MIB)),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::PartitionPastEndOfDisk {
+                name: String::from("DH0"),
+                high_cyl: 640,
+                last_cylinder: 639,
+            },
+        );
+
+        // A partition reaching into the reserved RDB area.
+        assert_refused(
+            ten_mib().partition(PartitionSpec::by_cylinders(0, 10)),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::PartitionOverlapsRdbArea {
+                name: String::from("DH0"),
+                low_cyl: 0,
+                lo_cylinder: 1,
+            },
+        );
+
+        // Two partitions claiming the same cylinders.
+        assert_refused(
+            ten_mib()
+                .partition(PartitionSpec::by_cylinders(10, 20))
+                .partition(PartitionSpec::by_cylinders(15, 25)),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::PartitionsOverlap {
+                a_name: String::from("DH0"),
+                b_name: String::from("DH1"),
+                low_cyl: 15,
+                high_cyl: 20,
+            },
+        );
+
+        // More PART blocks than the caller's own reserved area holds.
+        let mut cramped = ten_mib().reserved_blocks(4);
+        for _ in 0..5 {
+            cramped = cramped.partition(PartitionSpec::by_size(16 * 1024));
+        }
+        assert_refused(
+            cramped,
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::RdbAreaTooSmall {
+                needed: 6,
+                available: 4,
+            },
+        );
+
+        // A target smaller than the layout: the geometry says 640
+        // cylinders, the sink has 100 blocks.
+        assert_refused(
+            ten_mib().partition(PartitionSpec::by_size(1024 * 1024)),
+            100,
+            512,
+            BuildError::SinkTooSmall {
+                needed: 65 * 32,
+                available: 100,
+            },
+        );
+
+        // A geometry with no blocks in it at all.
+        let empty = Geometry {
+            cylinders: 0,
+            heads: 1,
+            sectors: 32,
+            block_size: 512,
+        };
+        assert_refused(
+            RdbBuilder::new(empty),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::EmptyGeometry { geometry: empty },
+        );
+
+        // A sink whose blocks are not the geometry's.
+        assert_refused(
+            ten_mib().partition(PartitionSpec::by_size(1024 * 1024)),
+            (TEN_MIB / 4096) as usize,
+            4096,
+            BuildError::BlockSizeMismatch {
+                geometry: 512,
+                sink: 4096,
+            },
+        );
+    }
+
+    /// The same discipline for specs that are wrong rather than too big:
+    /// nothing written, and an error naming the partition.
+    #[test]
+    fn build_refuses_a_malformed_spec() {
+        let ten_mib = || RdbBuilder::for_size(TEN_MIB, 512).unwrap();
+
+        assert_refused(
+            ten_mib().partition(PartitionSpec::by_cylinders(200, 100)),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::CylindersInverted {
+                name: String::from("DH0"),
+                low_cyl: 200,
+                high_cyl: 100,
+            },
+        );
+
+        assert_refused(
+            ten_mib()
+                .partition(PartitionSpec::by_size(1024 * 1024).named("DH0"))
+                .partition(PartitionSpec::by_size(1024 * 1024).named("DH0")),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::DuplicateName {
+                name: String::from("DH0"),
+            },
+        );
+
+        let long = "X".repeat(32);
+        assert_refused(
+            ten_mib().partition(PartitionSpec::by_size(1024 * 1024).named(&long)),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::InvalidName {
+                name: long,
+                max: 31,
+            },
+        );
+
+        // Below one 16 KiB cylinder there is no partition to write, and
+        // rounding up would hand out space the caller did not ask for.
+        assert_refused(
+            ten_mib().partition(PartitionSpec::by_size(16 * 1024 - 1)),
+            TEN_MIB_BLOCKS,
+            512,
+            BuildError::PartitionTooSmall {
+                name: String::from("DH0"),
+                bytes: 16 * 1024 - 1,
+                cylinder_bytes: 16 * 1024,
+            },
+        );
+    }
+
+    /// The write order: `PART` blocks first, `RDSK` last, so an
+    /// interrupted build leaves a disk with no partition table rather
+    /// than one pointing at blocks that were never written.
+    #[test]
+    fn build_writes_the_rdsk_last() {
+        /// A sink that fails on the *n*th write, recording what it got.
+        struct FlakySink {
+            data: Vec<u8>,
+            writes: usize,
+            fail_after: usize,
+        }
+        impl BlockSink for FlakySink {
+            type Error = ();
+            fn block_size(&self) -> usize {
+                512
+            }
+            fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
+                if self.writes == self.fail_after {
+                    return Err(());
+                }
+                self.writes += 1;
+                let off = lba as usize * 512;
+                self.data[off..off + 512].copy_from_slice(buf);
+                Ok(())
+            }
+            fn block_count(&self) -> Option<u64> {
+                Some(self.data.len() as u64 / 512)
+            }
+        }
+
+        let mut sink = FlakySink {
+            data: vec![0u8; TEN_MIB_BLOCKS * 512],
+            writes: 0,
+            fail_after: 2,
+        };
+        let err = RdbBuilder::for_size(TEN_MIB, 512)
+            .unwrap()
+            .partition(PartitionSpec::by_size(1024 * 1024))
+            .partition(PartitionSpec::by_size(1024 * 1024))
+            .partition(PartitionSpec::by_size(1024 * 1024))
+            .build(&mut sink)
+            .unwrap_err();
+        assert_eq!(err, BuildError::Io(()));
+        // Two PART blocks landed; block 0 is untouched, so the disk has
+        // no RDSK and a parse says so rather than following a chain into
+        // blocks that do not exist.
+        assert_eq!(be32(&sink.data, 512), id::PART);
+        assert!(sink.data[..512].iter().all(|&b| b == 0));
+        let mut disk = MemDisk {
+            data: sink.data,
+            block_size: 512,
+        };
+        assert_eq!(Rdb::parse(&mut disk), Err(RdbError::NoRdsk));
+    }
+
+    /// Every `BuildError` renders one line fit to show a user, in
+    /// `no_std` as much as `std` — the same contract the parse and
+    /// geometry errors hold to.
+    #[test]
+    fn build_errors_display_as_one_useful_line() {
+        let cases: [(BuildError<&str>, &str); 6] = [
+            (
+                BuildError::Io("device is read-only"),
+                "writing a block failed: device is read-only",
+            ),
+            (
+                BuildError::BlockSizeMismatch {
+                    geometry: 512,
+                    sink: 4096,
+                },
+                "the geometry is in 512-byte blocks but the sink writes 4096-byte blocks",
+            ),
+            (
+                BuildError::DuplicateName {
+                    name: String::from("DH0"),
+                },
+                "two partitions are both named \"DH0\"",
+            ),
+            (
+                BuildError::PartitionPastEndOfDisk {
+                    name: String::from("DH1"),
+                    high_cyl: 700,
+                    last_cylinder: 639,
+                },
+                "partition \"DH1\" ends on cylinder 700, past the disk's last cylinder 639",
+            ),
+            (
+                BuildError::RdbAreaTooSmall {
+                    needed: 6,
+                    available: 4,
+                },
+                "the RDB area holds 4 blocks but the layout needs 6",
+            ),
+            (
+                BuildError::PartitionTooSmall {
+                    name: String::from("DH0"),
+                    bytes: 100,
+                    cylinder_bytes: 16384,
+                },
+                "partition \"DH0\" asks for 100 bytes, less than the 16384-byte cylinder \
+                 that is the smallest partition",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(alloc::format!("{err}"), expected);
+        }
+    }
+
+    /// The differential smoke test: build an image here, and let
+    /// `rdbtool` — the tool whose conventions every default in
+    /// [`envec_defaults`] was read out of — say what it sees. Agreement
+    /// on the partition extents is the claim; anything more is the
+    /// round-trip suite's job.
+    ///
+    /// Gated on `AMIGA_RDB_DIFFERENTIAL=1` because it shells out to a
+    /// tool that is not a build dependency of this crate. It is not
+    /// wired into CI yet; that is the next plan item.
+    #[cfg(feature = "std")]
+    #[test]
+    fn rdbtool_reads_an_image_this_crate_built() {
+        if std::env::var_os("AMIGA_RDB_DIFFERENTIAL").is_none() {
+            return;
+        }
+
+        let mut disk = blank_disk(TEN_MIB_BLOCKS, 512);
+        RdbBuilder::for_size(TEN_MIB, 512)
+            .unwrap()
+            .partition(PartitionSpec::by_size(4 * 1024 * 1024).bootable(0))
+            .partition(PartitionSpec::by_size(2 * 1024 * 1024).named("WORK"))
+            .build(&mut disk)
+            .expect("build");
+
+        let path = std::env::temp_dir().join("amiga-rdb-differential.hdf");
+        std::fs::write(&path, &disk.data).expect("write image");
+
+        let out = std::process::Command::new("rdbtool")
+            .arg(&path)
+            .arg("list")
+            .output()
+            .expect("run rdbtool");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "rdbtool failed: {stdout}");
+
+        // `Partition: #0 'DH0'   1   256   8192  4.0Mi ...`
+        let extents: Vec<(String, u32, u32)> = stdout
+            .lines()
+            .filter(|l| l.starts_with("Partition:"))
+            .map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                (
+                    f[2].trim_matches('\'').to_string(),
+                    f[3].parse().unwrap(),
+                    f[4].parse().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            extents,
+            [
+                (String::from("DH0"), 1, 256),
+                (String::from("WORK"), 257, 384)
+            ]
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
