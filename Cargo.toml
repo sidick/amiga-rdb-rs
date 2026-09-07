@@ -1,0 +1,19 @@
+[package]
+name = "amiga-rdb"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Amiga Rigid Disk Block (RDB) partition tables: parsing, and eventually writing — RDSK, PART, FSHD and LSEG blocks"
+repository = "https://github.com/sidick/amiga-rdb-rs"
+keywords = ["amiga", "rdb", "partition", "retrocomputing"]
+categories = ["filesystem", "no-std", "parser-implementations"]
+
+[dependencies]
+# Deliberately none. This crate is pure format logic over the
+# `BlockSource` trait; consumers bring their own I/O.
+
+[features]
+default = ["std"]
+# `std` only adds conveniences (std::error::Error impls, a BlockSource
+# over std::io types). The core crate is no_std + alloc throughout.
+std = []
