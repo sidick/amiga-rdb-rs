@@ -440,6 +440,28 @@ The risky stage, gated on the differential suite existing first.
       AmiPart (MIT) is the readable reference for the operations users
       actually perform, resize edge cases included.
 
+      **Half landed: the metadata edits.** `RdbEditor` — `open`, the
+      setters, `commit` — covers everything AmiPart's partition and
+      advanced dialogs offer: `set_name`, `set_dos_type`,
+      `set_boot_priority`, `set_bootable`, `set_automount`,
+      `set_flags_raw` (the escape hatch, so we never do what AmiPart's
+      checkbox rebuild does to a flag bit we have not named), the typed
+      envec setters (`set_reserved`, `set_pre_alloc`, `set_interleave`,
+      `set_num_buffers`, `set_buf_mem_type`, `set_max_transfer`,
+      `set_mask`, `set_baud`, `set_control`, `set_boot_blocks`) and the
+      disk-level `set_disk_identity` / `set_controller_identity` /
+      `set_rdb_flags`. **Add, delete and resize are still to come**, and
+      with them `Placement`-shaped `add_partition`, the filesystem
+      operations, and `set_bad_blocks`.
+
+      **`de_TableSize` grows, never shrinks.** The last three envec
+      setters extend it when the envec stops short of their field, and
+      the longwords that become readable on the way are *zeroed* rather
+      than exposing whatever slack the block held: they were absent, and
+      absent is not "whatever bytes happened to be there". `envec_raw`
+      is re-read from the patched block, so the model still says exactly
+      what the block says.
+
       **Scope, from the survey**: a resize is a *table-entry* edit and
       nothing more. Moving partition data and resizing filesystems is
       what AmiPart's `PART_Move`/`GROW`/`SHRINK` do by reaching into
@@ -447,7 +469,7 @@ The risky stage, gated on the differential suite existing first.
       founding non-goal — so shrinking is destructive to whatever
       filesystem is in the partition and must be documented as such
       rather than quietly offered.
-- [ ] **Preserve unmodelled fields**: an edit rewrites every field it
+- [x] **Preserve unmodelled fields**: an edit rewrites every field it
       parsed, including the ones it does not interpret —
       `rdb_DriveInit`, `rdb_BadBlockList`, the controller identity
       strings, unknown `rdb_Flags` and `pb_Flags` bits, the raw envec
@@ -457,6 +479,39 @@ The risky stage, gated on the differential suite existing first.
       `docs/amipart-survey.md` §6) and the one most easily inherited by
       building the write path out of the fields the model happens to
       name.
+
+      **Decided: keep the blocks, not the fields.** `RdbEditor::open`
+      reads the whole area — `RDSK`, every `PART`, every `FSHD`, every
+      `LSEG` of every driver (which the parser leaves lazy, so the
+      editor walks those chains itself), every `BADB` — and holds each
+      block's *bytes*. A setter patches the field it is about and
+      nothing else. This makes the property structural rather than
+      diligent: a longword we have never heard of survives because
+      nothing ever took it apart. Exactly five kinds of byte can change
+      on a commit — the fields an edit set, the chain pointers
+      (`pb_Next`, `fhb_Next`, `lsb_Next`, `bbb_Next`,
+      `fhb_SegListBlocks`), the `RDSK`'s three chain heads,
+      `rdb_HighRDSKBlock`, and each block's `ChkSum`. Each block's own
+      `SummedLongs` is *preserved* rather than replaced with ours, so a
+      foreign `PART` summing 128 longwords still sums 128 and an `LSEG`
+      still declares its driver's byte length.
+
+      **Tested three ways**: `no_op_commit_is_byte_identical` (open a
+      foreign image, commit, assert the disk is the same disk),
+      `editing_one_field_changes_only_that_field` (change one
+      `de_BootPri` and assert *every* differing byte on the whole image
+      lies in that longword or the checksum over it, then compare the
+      re-parsed model against the old one field for field), and
+      `the_foreign_fixture_carries_what_a_rewrite_would_drop`, which
+      proves the fixture is worth testing against in the first place:
+      `rdb_DriveInit` set, a `BADB` chain, controller strings, an
+      unknown `rdb_Flags` bit, `rdb_Reserved1` filled, unknown
+      `pb_Flags` bits, `de_TableSize` 21 with values in every tail
+      longword and two past anything we model, non-zero
+      `de_SecOrg`/`de_PreAlloc`/`de_Interleave`, slack after the envec,
+      an `FSHD` patch mask with a bit above `GlobalVec`, an `LSEG` whose
+      `SummedLongs` stops short of its own payload, and bytes outside
+      the `RDSK`'s checksum entirely.
 - [ ] **Zero what we stop using**, inside the RDB area only: a `PART`
       block orphaned by a delete, the tail of the area a shorter layout
       no longer covers, and a stale `RDSK` left behind when the block it
@@ -465,14 +520,52 @@ The risky stage, gated on the differential suite existing first.
       scan can find them. Pairs with never shrinking `rdb_RDBBlocksHi`:
       the area keeps its declared size, and what is inside it is exactly
       what the chains say.
+
+      **Written, but not yet reachable — so not ticked.** `commit`
+      computes the blocks the old layout used and the new one does not,
+      and zeroes them after the `RDSK` has landed, inside the area only
+      (a vacated block *outside* it belongs to whoever owns that space
+      now; the never-touch guarantee outranks tidiness, and
+      `commit_relocates_a_chain_block_from_outside_the_area` asserts
+      those blocks are left exactly as they were). But with only
+      metadata edits available, no commit ever changes the *number* of
+      structures, and the minimal-motion placement below never moves a
+      structure that is already inside the area — so nothing is ever
+      vacated and the zeroing path has no end-to-end test yet. It gets
+      one with delete, which is the operation that creates the case.
+      The stale-`RDSK` case does not arise from us at all: the editor
+      never moves the `RDSK` (see the crash-shape item), so it cannot
+      leave a second one behind.
 - [ ] **Free-block management** inside the RDB area: reuse holes left
       by deleted PART/FSHD/LSEG blocks before extending toward
       `rdb_HighRDSKBlock`.
-- [ ] **Never-touch guarantee**: mutation writes only inside
+
+      **The allocator exists; the case that needs it does not yet.**
+      `RdbEditor::plan` allocates any structure that has nowhere to go
+      the lowest block the current layout does not occupy, which is hole
+      reuse — but the only structure that needs allocating today is one
+      found *outside* the area, since nothing adds or deletes. Ticked
+      with the add/delete chunk, where it is exercised rather than
+      merely present.
+- [x] **Never-touch guarantee**: mutation writes only inside
       `rdb_RDBBlocksLo..=Hi`, asserted in code, not just documented —
       partition contents are provably out of reach. This is precisely
       the invariant whose absence causes the overlap bug above; here it
       is structural.
+
+      **Structural via `LeasedSink`**, a private type that owns the sink
+      for the whole of a commit and refuses any LBA above
+      `rdb_RDBBlocksHi`. Nothing else in the commit path has the sink in
+      scope, so there is no code around the check — and
+      `CommitError::OutsideRdbArea` is the variant that would fire if
+      the placement arithmetic above it were ever wrong, instead of a
+      block landing in a filesystem. The window is `0..=Hi` rather than
+      `Lo..=Hi` because the `RDSK` may legally sit *below* the area it
+      declares (`rdb_RDBBlocksLo` 1 on a disk carrying a foreign boot
+      sector), and rewriting it where it was found is not a violation.
+      `commit_writes_only_inside_the_rdb_area` tracks every LBA a commit
+      asks for and compares both partitions' extents byte for byte
+      afterwards.
 - [ ] **Refuse-over-overlap**: an edit whose blocks don't fit the
       existing RDB area fails with an error naming the shortfall — the
       overlap outcome does not exist as a behaviour — and unlike a
@@ -483,10 +576,61 @@ The risky stage, gated on the differential suite existing first.
       realistic enabler for editing old images created with the
       historically tiny default area; pairs with the user resizing or
       moving the first partition to free the space.
-- [ ] **Crash-shape discipline**: order writes so an interrupted edit
+- [x] **Crash-shape discipline**: order writes so an interrupted edit
       leaves the *old* chain intact (write new blocks first, flip the
       chain pointer last). The format has no journal; ordering is all
       there is.
+
+      **Order**: every chained block first — `LSEG` before the `FSHD`
+      that heads it, each chain written from its **tail forward**, so no
+      block is ever written before the block it points at — then the
+      `RDSK` alone as the single pointer flip, then the zeroing pass.
+      The exact reverse of AmiPart's ascending order, which puts the
+      `RDSK` first and so publishes a table before the blocks it points
+      at exist (survey §5); there is no compatibility reason to
+      reproduce that.
+
+      **Placement is minimal motion, which is §7.4's option (b) taken
+      one step further.** A structure already inside the area keeps the
+      block it was found on; only a structure with nowhere to go — one
+      *outside* the area today, a new one once adding lands — is
+      allocated a block the current layout does not occupy. So the
+      option-(b) property (new blocks land where the live chains are
+      not) holds, and on top of it an edit that changes no structure
+      count moves nothing at all: the only blocks overwritten in place
+      are the ones being rewritten *as themselves*, every one sealed
+      before it is written, on a chain whose shape did not change. There
+      is no intermediate state in which a chain leads into garbage, and
+      the in-place repack of option (a) is never needed — a layout that
+      does not fit is refused (`CommitError::RdbAreaTooSmall`, which
+      names the shortfall and says that growing the area is not
+      implemented yet) rather than packed destructively.
+
+      **`commit_truncated_at_every_write_leaves_a_readable_rdb`** is the
+      test the survey demands: a sink that fails after *n* writes, for
+      every *n*, re-parsing after each. The RDB always parses, always
+      validates clean (`validate` and `validate_seg_lists` both), always
+      carries both partitions, its `BADB` entries and its `rdb_DriveInit`,
+      the driver always reassembles, and the edited partition is either
+      its old self or its new one — never a mixture.
+
+      **One deliberate difference from the survey's sketch: the `RDSK`
+      is never moved.** AmiPart normalises it to `rdb_RDBBlocksLo`; we
+      rewrite it where the parse found it. Moving it means a window in
+      which two checksum-valid `RDSK` blocks describe two layouts and
+      the format's scan takes the *lower* — the failure that the
+      RDSK-last ordering exists to prevent, reintroduced by the
+      relocation. An `RDSK` above `rdb_RDBBlocksHi` is
+      `CommitError::RdskOutsideRdbArea` rather than a relocation.
+
+      **`commit` takes `S: BlockSink` alone**, not `BlockSource +
+      BlockSink`: the editor already holds every block it needs, so a
+      read bound would be a bound nothing uses — and by the same
+      argument that made `BlockSink` a separate trait in milestone 2, it
+      would rule out a write-only target for no gain. AmiPart's
+      read-back verification pass (survey §5) is the thing that *would*
+      want the source back, and it is a separate decision from this
+      one.
 - [ ] **AmiPart as second differential oracle**: once mutation lands,
       apply the same edit in both tools and compare the results — a
       second independent implementation alongside the xdftool round-trip

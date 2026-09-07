@@ -3664,6 +3664,1147 @@ impl RdbBuilder {
 /// buying insurance against.
 pub const RDB_HEADROOM_BLOCKS: u64 = 16;
 
+/// One RDB structure block as it was found on disk: its LBA and all of
+/// its bytes, whole and unexamined.
+///
+/// Keeping the bytes — rather than rebuilding a block from the fields
+/// [`Rdb`] models — *is* the preserve-unmodelled-fields property. A
+/// longword this crate has never heard of survives an edit because
+/// nothing ever took it apart; `de_TableSize` stays what it was found
+/// as; an unknown `pb_Flags` bit is still set afterwards. The
+/// alternative — write the block out of the model — is exactly how
+/// AmiPart drops `rdb_DriveInit`, the controller strings and every
+/// unmodelled flag bit on each write (`docs/amipart-survey.md` §6), and
+/// it is the single most copyable mistake in that survey.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawBlock {
+    /// Where the block was read from. Where it will be *written* is the
+    /// commit plan's business, not this struct's.
+    lba: u64,
+    /// The block, byte for byte.
+    bytes: Vec<u8>,
+}
+
+impl RawBlock {
+    fn read<S: BlockSource>(
+        disk: &mut S,
+        lba: u64,
+        block_size: usize,
+    ) -> Result<Self, RdbError<S::Error>> {
+        let mut bytes = alloc::vec![0u8; block_size];
+        disk.read_block(lba, &mut bytes).map_err(RdbError::Io)?;
+        Ok(Self { lba, bytes })
+    }
+}
+
+/// Why an [`RdbEditor`] setter refused the edit.
+///
+/// Every variant describes a request the *format* cannot express, and
+/// none of them involves I/O: a setter only patches the editor's
+/// in-memory blocks, so a rejected edit leaves both the editor and the
+/// disk exactly as they were. The failures that need a disk live in
+/// [`CommitError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    /// There is no partition at that index.
+    NoSuchPartition {
+        /// The index asked for.
+        index: usize,
+        /// How many partitions the RDB has, so `index` had to be below it.
+        count: usize,
+    },
+    /// A `pb_DriveName` does not fit the 32-byte BCPL field, or is empty
+    /// — the same rule [`BuildError::InvalidName`] enforces on create.
+    InvalidName {
+        /// The name asked for.
+        name: String,
+        /// The longest name the field holds.
+        max: usize,
+    },
+    /// Another partition already carries that `pb_DriveName`. Refused
+    /// rather than allowed, for the reason
+    /// [`BuildError::DuplicateName`] gives: two `DH0`s is a layout whose
+    /// mounts fight each other.
+    DuplicateName {
+        /// The name asked for.
+        name: String,
+    },
+    /// An identification string is longer than its fixed-width `RDSK`
+    /// field. These are SCSI INQUIRY copies of a fixed size — there is
+    /// nowhere to put the overflow — and truncating silently would
+    /// write an identity the caller did not ask for.
+    IdentityTooLong {
+        /// Which field, as the NDK names it (e.g. `rdb_DiskProduct`).
+        field: &'static str,
+        /// The value asked for.
+        value: String,
+        /// How many bytes the field holds.
+        max: usize,
+    },
+}
+
+impl core::fmt::Display for EditError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EditError::NoSuchPartition { index, count } => write!(
+                f,
+                "there is no partition {index}: the RDB has {count} of them"
+            ),
+            EditError::InvalidName { name, max } => write!(
+                f,
+                "drive name {name:?} does not fit pb_DriveName: \
+                 1..={max} characters are available"
+            ),
+            EditError::DuplicateName { name } => {
+                write!(f, "another partition is already named {name:?}")
+            }
+            EditError::IdentityTooLong { field, value, max } => {
+                write!(f, "{field} holds {max} characters, which {value:?} exceeds")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for EditError {}
+
+/// Why [`RdbEditor::commit`] refused to write, or failed while writing.
+///
+/// Every variant except [`Io`](Self::Io) is raised **before the first
+/// block is written**, on the same terms as [`BuildError`]: the plan and
+/// every block it will write are computed, checked and sealed by
+/// functions that have no sink in scope, so a rejected commit leaves the
+/// disk exactly as it found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitError<E> {
+    /// The [`BlockSink`] failed on a write. The only variant that can
+    /// leave the disk part-written — and the case
+    /// [`RdbEditor::commit`]'s write ordering exists for.
+    Io(E),
+    /// The sink's [`block_size`](BlockSink::block_size) is not a power of
+    /// two in [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`].
+    UnsupportedBlockSize {
+        /// What the sink said its block size was.
+        block_size: usize,
+    },
+    /// The sink's block size is not the one the RDB was read in. Every
+    /// LBA in the plan is a device block of the *original* size; writing
+    /// them through a differently sized sink would address other bytes.
+    BlockSizeMismatch {
+        /// `rdb_BlockBytes`, as parsed.
+        rdb: usize,
+        /// [`BlockSink::block_size`].
+        sink: usize,
+    },
+    /// `rdb_RDBBlocksLo` is above `rdb_RDBBlocksHi`: the area the editor
+    /// is allowed to write is empty or inverted, so there is nowhere to
+    /// put the structures. The read-side counterpart is
+    /// [`ValidationIssue::RdbAreaInvalid`].
+    RdbAreaInvalid {
+        /// `rdb_RDBBlocksLo` as it was read.
+        lo: u32,
+        /// `rdb_RDBBlocksHi` as it was read — below `lo`, which is the issue.
+        hi: u32,
+    },
+    /// The `RDSK` block sits above `rdb_RDBBlocksHi`, so rewriting it
+    /// would mean writing outside the area the editor leases. The
+    /// `RDSK` is never moved (see [`RdbEditor::commit`]), so this is a
+    /// refusal rather than a relocation.
+    RdskOutsideRdbArea {
+        /// Where the `RDSK` was found.
+        rdsk_block: u64,
+        /// `rdb_RDBBlocksHi`, the last block the editor may write.
+        hi: u64,
+    },
+    /// The RDB area cannot hold the blocks the new layout needs.
+    ///
+    /// Growing the area — raising `rdb_RDBBlocksHi` into space no
+    /// partition claims — is the *expand the RDB area* item and is not
+    /// implemented yet, so this is where an image with a historically
+    /// tiny area stops. The area is never shrunk either, so the shortfall
+    /// here is real rather than self-inflicted.
+    RdbAreaTooSmall {
+        /// Blocks the new layout needs inside the area.
+        needed: u64,
+        /// Blocks the area has (`rdb_RDBBlocksHi - rdb_RDBBlocksLo + 1`).
+        available: u64,
+        /// `rdb_RDBBlocksLo`.
+        lo: u64,
+        /// `rdb_RDBBlocksHi`, inclusive.
+        hi: u64,
+    },
+    /// A block would have been written outside `0..=rdb_RDBBlocksHi`.
+    ///
+    /// Unreachable by construction — every write goes through one
+    /// private helper that owns the sink and checks the bound, and the
+    /// plan only ever assigns blocks inside it — but the variant is what
+    /// makes the never-touch guarantee *structural*: there is no code
+    /// path that can reach the sink around the check, and if the
+    /// arithmetic above it were ever wrong the write would fail here
+    /// instead of landing in a partition.
+    OutsideRdbArea {
+        /// The block that was about to be written.
+        lba: u64,
+        /// `rdb_RDBBlocksHi`, the last block the editor may write.
+        hi: u64,
+    },
+    /// Sealing a block's checksum failed — see [`SealError`]. Raised
+    /// while preparing the blocks, so before any write. Reachable only
+    /// for a block whose own `SummedLongs` is below
+    /// [`MIN_SUMMED_LONGS`], which the editor preserves rather than
+    /// replaces; such a block could not have passed the parse's
+    /// checksum check in the first place.
+    Seal(SealError),
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for CommitError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CommitError::Io(e) => write!(f, "writing a block failed: {e}"),
+            CommitError::UnsupportedBlockSize { block_size } => write!(
+                f,
+                "unsupported device block size {block_size}: \
+                 must be a power of two in {MIN_BLOCK_SIZE}..={MAX_BLOCK_SIZE}"
+            ),
+            CommitError::BlockSizeMismatch { rdb, sink } => write!(
+                f,
+                "the RDB is in {rdb}-byte blocks but the sink writes {sink}-byte blocks"
+            ),
+            CommitError::RdbAreaInvalid { lo, hi } => write!(
+                f,
+                "RDB area is empty or inverted: RDBBlocksLo {lo} is above RDBBlocksHi {hi}"
+            ),
+            CommitError::RdskOutsideRdbArea { rdsk_block, hi } => write!(
+                f,
+                "the RDSK block at {rdsk_block} is above RDBBlocksHi {hi}, \
+                 outside the area this edit may write"
+            ),
+            CommitError::RdbAreaTooSmall {
+                needed,
+                available,
+                lo,
+                hi,
+            } => write!(
+                f,
+                "the RDB area {lo}..={hi} holds {available} blocks but the new layout \
+                 needs {needed}; growing RDBBlocksHi is not implemented yet"
+            ),
+            CommitError::OutsideRdbArea { lba, hi } => write!(
+                f,
+                "refusing to write block {lba}, which is outside the RDB area 0..={hi}"
+            ),
+            CommitError::Seal(e) => write!(f, "sealing a block failed: {e}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: std::error::Error + 'static> std::error::Error for CommitError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CommitError::Io(e) => Some(e),
+            CommitError::Seal(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// What one [`RdbEditor::commit`] did: where every structure landed and
+/// which blocks it touched, in the order it touched them.
+///
+/// Returned so a caller need not re-parse the disk to learn the result —
+/// though re-parsing is what this crate's own tests do, the disk being
+/// the only authority on what is on the disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitReport {
+    /// LBA the `RDSK` block was written to — always where it was found,
+    /// since the editor never moves it.
+    pub rdsk_block: u64,
+    /// `rdb_HighRDSKBlock` as written: the highest block the new layout
+    /// occupies, recomputed rather than preserved.
+    pub high_rdsk_block: u32,
+    /// `rdb_RDBBlocksHi` as written — preserved from the parse, never
+    /// shrunk. The area is a lease, and this is its ceiling.
+    pub rdb_blocks_hi: u32,
+    /// LBAs of the `PART` blocks, in chain order.
+    pub part_blocks: Vec<u64>,
+    /// LBAs of the `FSHD` blocks, in chain order.
+    pub fshd_blocks: Vec<u64>,
+    /// Every block written, **in the order it was written** — the chains
+    /// first and the `RDSK` last, then the zeroed blocks. A caller
+    /// reasoning about an interrupted commit reads this as the prefix
+    /// that landed.
+    pub blocks_written: Vec<u64>,
+    /// The blocks the old layout used and the new one does not, zeroed
+    /// after the `RDSK` landed. Always inside the area: a block the old
+    /// layout used *outside* it belongs to whatever owns that space now,
+    /// and the never-touch guarantee outranks tidiness.
+    pub blocks_zeroed: Vec<u64>,
+}
+
+/// One block, prepared in full — patched and sealed — and not yet
+/// written. The unit the commit computes before it touches the sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedBlock {
+    lba: u64,
+    bytes: Vec<u8>,
+}
+
+/// Where each structure will be written, and what the `RDSK` will say
+/// about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitPlan {
+    part_lbas: Vec<u64>,
+    fshd_lbas: Vec<u64>,
+    /// Per filesystem, in [`fshd_lbas`](Self::fshd_lbas) order.
+    lseg_lbas: Vec<Vec<u64>>,
+    badb_lbas: Vec<u64>,
+    high_rdsk_block: u32,
+    /// Blocks the old layout used, the new one does not, and which lie
+    /// inside the area.
+    zeroed: Vec<u64>,
+}
+
+/// The only thing in this crate that writes through a lease.
+///
+/// Owns the sink for the whole of a commit, so there is no path to the
+/// sink that skips the bound check — the never-touch guarantee is a
+/// property of the type rather than of remembering to check. The lower
+/// bound is 0 rather than `rdb_RDBBlocksLo` because the `RDSK` may
+/// legally sit below the area it declares (a disk carrying a foreign
+/// boot sector puts `rdb_RDBBlocksLo` at 1 and the `RDSK` behind it),
+/// and rewriting the `RDSK` where it was found is not a violation.
+struct LeasedSink<'a, S: BlockSink> {
+    sink: &'a mut S,
+    hi: u64,
+}
+
+impl<'a, S: BlockSink> LeasedSink<'a, S> {
+    fn write(&mut self, lba: u64, bytes: &[u8]) -> Result<(), CommitError<S::Error>> {
+        if lba > self.hi {
+            return Err(CommitError::OutsideRdbArea { lba, hi: self.hi });
+        }
+        self.sink.write_block(lba, bytes).map_err(CommitError::Io)
+    }
+}
+
+/// Reseal a block over the `SummedLongs` it already declares.
+///
+/// The count is *preserved*, not recomputed, because it is part of what
+/// the block says about itself and tools differ: 64 is this crate's and
+/// `rdbtool`'s choice for `RDSK`/`PART`/`FSHD`, AmiPart writes
+/// `block_size / 4` for `PART` and `RDSK`, and an `LSEG`'s count encodes
+/// its payload length. Replacing it with our own would change a foreign
+/// image's blocks in a way no edit asked for — and, for the `LSEG` case,
+/// would change what a reader believes the driver's length to be.
+fn reseal_preserving<E>(block: &mut [u8]) -> Result<(), CommitError<E>> {
+    let summed_longs = be32(block, hdr::SUMMED_LONGS);
+    seal_checksum(block, summed_longs).map_err(CommitError::Seal)
+}
+
+/// Edit an RDB that already exists, in place.
+///
+/// # The model: read, edit, write the whole area
+///
+/// [`open`](Self::open) parses the disk *and keeps every RDB block's
+/// bytes* — `RDSK`, every `PART`, every `FSHD`, every `LSEG` of every
+/// driver, every `BADB`. An edit patches the field it is about and
+/// nothing else; [`commit`](Self::commit) recomputes the layout, patches
+/// the chain pointers, reseals, and writes the area back.
+///
+/// **Raw blocks rather than a field-by-field rebuild** is the decision
+/// the type turns on, and it is what makes *preserve unmodelled fields*
+/// a property rather than an aspiration: `rdb_DriveInit`, the controller
+/// identity strings, an unknown `rdb_Flags` bit, an unknown `pb_Flags`
+/// bit, a `de_TableSize` of 19 with tail values, envec longwords past
+/// anything this crate models — none of them are reconstructed, because
+/// none of them are ever taken apart. Only these change on a commit:
+///
+/// - the fields an edit explicitly set;
+/// - `pb_Next`, `fhb_Next`, `lsb_Next`, `bbb_Next` and
+///   `fhb_SegListBlocks` — the chain, which the layout owns;
+/// - `rdb_PartitionList`, `rdb_FileSysHeaderList`, `rdb_BadBlockList`
+///   and `rdb_HighRDSKBlock` on the `RDSK`, for the same reason;
+/// - each block's `ChkSum`, resealed over the `SummedLongs` the block
+///   itself declares.
+///
+/// A commit with no edits at all is therefore byte-identical, with one
+/// documented exception: `rdb_HighRDSKBlock` is *recomputed* as the
+/// high-water mark of the layout, so an image whose stored value
+/// disagreed with its own blocks gets the truthful one.
+///
+/// # What it will not do
+///
+/// `rdb_RDBBlocksHi` is **never shrunk** — the declared area is a lease,
+/// preserved from the parse, and the high-water mark moves instead. The
+/// `RDSK` is **never moved** from where the parse found it: relocating
+/// it to `rdb_RDBBlocksLo` (as AmiPart does) means a window in which two
+/// checksum-valid `RDSK` blocks describe two layouts, and the format's
+/// scan takes the lower one. And no write ever lands outside
+/// `0..=rdb_RDBBlocksHi`, which is a structural guarantee rather than a
+/// documented intention: the commit hands the sink to one private
+/// writer that refuses anything else, so partition contents are provably
+/// out of reach.
+///
+/// # Example
+///
+/// ```
+/// use amiga_rdb::{PartitionSpec, Rdb, RdbBuilder, RdbEditor};
+/// # use amiga_rdb::{BlockSink, BlockSource};
+/// # struct MemDisk(Vec<u8>);
+/// # fn eof() -> std::io::Error {
+/// #     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "past the end of the disk")
+/// # }
+/// # impl BlockSource for MemDisk {
+/// #     type Error = std::io::Error;
+/// #     fn block_size(&self) -> usize { 512 }
+/// #     fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+/// #         let off = lba as usize * 512;
+/// #         buf.copy_from_slice(self.0.get(off..off + 512).ok_or_else(eof)?);
+/// #         Ok(())
+/// #     }
+/// #     fn block_count(&self) -> Option<u64> { Some(self.0.len() as u64 / 512) }
+/// # }
+/// # impl BlockSink for MemDisk {
+/// #     type Error = std::io::Error;
+/// #     fn block_size(&self) -> usize { 512 }
+/// #     fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+/// #         let off = lba as usize * 512;
+/// #         self.0.get_mut(off..off + 512).ok_or_else(eof)?.copy_from_slice(buf);
+/// #         Ok(())
+/// #     }
+/// #     fn block_count(&self) -> Option<u64> { Some(self.0.len() as u64 / 512) }
+/// # }
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut disk = MemDisk(vec![0u8; 16 * 1024 * 1024]);
+/// RdbBuilder::for_size(16 * 1024 * 1024, 512)?
+///     .partition(PartitionSpec::by_size(4 * 1024 * 1024))
+///     .build(&mut disk)?;
+///
+/// let mut editor = RdbEditor::open(&mut disk)?;
+/// editor.set_name(0, "SYS")?;
+/// editor.set_bootable(0, true)?;
+/// editor.set_boot_priority(0, 5)?;
+/// editor.commit(&mut disk)?;
+///
+/// let rdb = Rdb::parse(&mut disk)?;
+/// assert_eq!(rdb.partitions[0].name, "SYS");
+/// assert_eq!(rdb.partitions[0].boot_pri, 5);
+/// assert!(rdb.validate().is_empty());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdbEditor {
+    /// The parse model, kept in step with the raw blocks by re-parsing
+    /// the block every setter touches — so [`rdb`](Self::rdb) can never
+    /// disagree with what a commit would write.
+    rdb: Rdb,
+    block_size: usize,
+    rdsk: Vec<u8>,
+    parts: Vec<RawBlock>,
+    fshds: Vec<RawBlock>,
+    /// Per filesystem, in `fshds` order: its whole `LSEG` chain.
+    lsegs: Vec<Vec<RawBlock>>,
+    badbs: Vec<RawBlock>,
+}
+
+impl RdbEditor {
+    /// Parse the RDB on `disk` and read every block of it into memory.
+    ///
+    /// Strictly more work than [`Rdb::parse`]: the `LSEG` chains, which
+    /// the parser leaves lazy behind [`Rdb::load_filesystem`], are walked
+    /// here too, because an editor that regenerates the area must know
+    /// where every block of it is. The whole area is a few dozen blocks
+    /// plus whatever driver binaries it carries, which is the cost of
+    /// being able to check a complete layout before writing any of it.
+    ///
+    /// Fails exactly as [`Rdb::parse`] does, plus the same failures over
+    /// the `LSEG` chains: a cycle, an off-disk pointer, a wrong ID or a
+    /// bad checksum is an error rather than a truncated read.
+    pub fn open<S: BlockSource>(disk: &mut S) -> Result<Self, RdbError<S::Error>> {
+        let rdb = Rdb::parse(disk)?;
+        let block_size = disk.block_size();
+        let mut buf = alloc::vec![0u8; block_size];
+
+        disk.read_block(rdb.rdsk_block, &mut buf)
+            .map_err(RdbError::Io)?;
+        let rdsk = buf.clone();
+
+        let mut parts = Vec::with_capacity(rdb.partitions.len());
+        for p in &rdb.partitions {
+            parts.push(RawBlock::read(disk, p.part_block, block_size)?);
+        }
+
+        let mut fshds = Vec::with_capacity(rdb.filesystems.len());
+        let mut lsegs = Vec::with_capacity(rdb.filesystems.len());
+        for f in &rdb.filesystems {
+            fshds.push(RawBlock::read(disk, f.fshd_block, block_size)?);
+            let mut chain = Vec::new();
+            walk_chain(disk, f.seg_list_blocks, id::LSEG, &mut buf, |b, lba| {
+                chain.push(RawBlock {
+                    lba,
+                    bytes: b.to_vec(),
+                });
+                Ok(())
+            })?;
+            lsegs.push(chain);
+        }
+
+        let mut badbs = Vec::with_capacity(rdb.badb_blocks.len());
+        for &lba in &rdb.badb_blocks {
+            badbs.push(RawBlock::read(disk, lba, block_size)?);
+        }
+
+        Ok(Self {
+            rdb,
+            block_size,
+            rdsk,
+            parts,
+            fshds,
+            lsegs,
+            badbs,
+        })
+    }
+
+    /// The RDB as it stands, edits included.
+    ///
+    /// The block LBAs in it (`part_block`, `fshd_block`, ...) are where
+    /// the structures were *found*; where they will be written is
+    /// [`commit`](Self::commit)'s answer, in its [`CommitReport`].
+    pub fn rdb(&self) -> &Rdb {
+        &self.rdb
+    }
+
+    /// The partitions as they stand, edits included — shorthand for
+    /// [`rdb`](Self::rdb)`().partitions`.
+    pub fn partitions(&self) -> &[Partition] {
+        &self.rdb.partitions
+    }
+
+    /// Patch partition `index`'s `PART` block and bring the model back
+    /// in step with it.
+    ///
+    /// Re-parsing rather than updating the model field by field, so the
+    /// two cannot drift: whatever a commit would write is what
+    /// [`rdb`](Self::rdb) reports.
+    fn edit_part<F>(&mut self, index: usize, patch: F) -> Result<(), EditError>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        if index >= self.parts.len() {
+            return Err(EditError::NoSuchPartition {
+                index,
+                count: self.parts.len(),
+            });
+        }
+        patch(&mut self.parts[index].bytes);
+        // `parse_part` fails only on a `de_TableSize` below `de_DosType`,
+        // which `open` already cleared and which no setter can lower —
+        // so this is the unreachable branch, and leaving the model
+        // untouched is better than an `unwrap` in a crate that refuses to
+        // panic on data.
+        if let Ok(p) = parse_part::<()>(&self.parts[index].bytes, self.parts[index].lba) {
+            self.rdb.partitions[index] = p;
+        }
+        Ok(())
+    }
+
+    /// Set one `DosEnvec` longword, extending `de_TableSize` if the
+    /// field lies past it.
+    ///
+    /// **Extending exposes longwords that were absent**, and absent is
+    /// not zero: `de_Baud`, `de_Control` and `de_BootBlocks` sit above
+    /// the `de_TableSize` of 16 that this crate and `rdbtool` write, so
+    /// setting `de_BootBlocks` on such a partition makes `de_Baud` and
+    /// `de_Control` readable for the first time. Those newly exposed
+    /// longwords are **zeroed**, not left as whatever slack the block
+    /// carried: a mount that starts reading a field must not be handed a
+    /// value nobody wrote. The field being set is written after, so
+    /// setting `de_Control` alone leaves `de_Baud` at zero and
+    /// `de_TableSize` at 18.
+    ///
+    /// Round-tripping is unaffected either way — `envec_raw` is re-read
+    /// from the patched block, so it grows with `de_TableSize` and still
+    /// says exactly what the block says.
+    fn set_envec(&mut self, index: usize, field: usize, value: u32) -> Result<(), EditError> {
+        self.edit_part(index, |bytes| {
+            let table_size = be32(bytes, part::ENVIRONMENT + de::TABLE_SIZE * 4) as usize;
+            if field > table_size {
+                for i in table_size + 1..field {
+                    put_be32(bytes, part::ENVIRONMENT + i * 4, 0);
+                }
+                put_be32(bytes, part::ENVIRONMENT + de::TABLE_SIZE * 4, field as u32);
+            }
+            put_be32(bytes, part::ENVIRONMENT + field * 4, value);
+        })
+    }
+
+    /// Set `pb_DriveName`.
+    ///
+    /// The 32-byte BCPL field is cleared before the new name goes in, so
+    /// a shorter name leaves none of the old one behind — the
+    /// field-level case of not leaving what we stopped using on the
+    /// disk. A name that collides with another partition's is
+    /// [`EditError::DuplicateName`]; one that does not fit is
+    /// [`EditError::InvalidName`].
+    pub fn set_name(&mut self, index: usize, name: &str) -> Result<(), EditError> {
+        if name.is_empty() || name.len() > MAX_DRIVE_NAME {
+            return Err(EditError::InvalidName {
+                name: String::from(name),
+                max: MAX_DRIVE_NAME,
+            });
+        }
+        if self
+            .rdb
+            .partitions
+            .iter()
+            .enumerate()
+            .any(|(i, p)| i != index && p.name == name)
+        {
+            return Err(EditError::DuplicateName {
+                name: String::from(name),
+            });
+        }
+        let bytes = name.as_bytes();
+        self.edit_part(index, |block| {
+            let field = &mut block[part::DRIVE_NAME..part::DRIVE_NAME + 32];
+            field.fill(0);
+            field[0] = bytes.len() as u8;
+            field[1..1 + bytes.len()].copy_from_slice(bytes);
+        })
+    }
+
+    /// Set `de_DosType` — which filesystem is to mount the partition.
+    pub fn set_dos_type(&mut self, index: usize, dos_type: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::DOS_TYPE, dos_type)
+    }
+
+    /// Set `de_BootPri`. Meaningful only on a bootable partition, and
+    /// not forced to be one: the two are separate fields on disk and a
+    /// tool that changed both would be inventing an intention.
+    pub fn set_boot_priority(&mut self, index: usize, boot_pri: i32) -> Result<(), EditError> {
+        self.set_envec(index, de::BOOT_PRI, boot_pri as u32)
+    }
+
+    /// Set or clear `pb_Flags` bit 0, "the ROM may boot from this
+    /// partition". Every other bit is left exactly as it was — which is
+    /// the whole point, AmiPart's GUI rebuilding `pb_Flags` from four
+    /// checkboxes being how another tool's flag bit gets cleared by an
+    /// unrelated edit (`docs/amipart-survey.md` §6).
+    pub fn set_bootable(&mut self, index: usize, bootable: bool) -> Result<(), EditError> {
+        self.set_part_flag(index, 0, bootable)
+    }
+
+    /// Set or clear automatic mounting. On disk the bit is the negative
+    /// — `pb_Flags` bit 1 is `PBFF_NOMOUNT` — so `set_automount(i,
+    /// false)` is what sets it; the parameter is phrased the way a user
+    /// thinks about it rather than the way the format stores it, and
+    /// [`Partition::no_automount`] still reports the bit.
+    pub fn set_automount(&mut self, index: usize, automount: bool) -> Result<(), EditError> {
+        self.set_part_flag(index, 1, !automount)
+    }
+
+    fn set_part_flag(&mut self, index: usize, bit: u32, set: bool) -> Result<(), EditError> {
+        self.edit_part(index, |bytes| {
+            let mut flags = be32(bytes, part::FLAGS);
+            if set {
+                flags |= 1 << bit;
+            } else {
+                flags &= !(1 << bit);
+            }
+            put_be32(bytes, part::FLAGS, flags);
+        })
+    }
+
+    /// Set the whole of `pb_Flags` — the escape hatch for the bits this
+    /// crate does not model.
+    ///
+    /// Deliberately offered, because the alternative is a caller that
+    /// needs a flag we have not named reaching around the crate to poke
+    /// the block itself. Note that it overwrites bits 0 and 1 as well,
+    /// so a caller using this owns them too.
+    pub fn set_flags_raw(&mut self, index: usize, flags: u32) -> Result<(), EditError> {
+        self.edit_part(index, |bytes| put_be32(bytes, part::FLAGS, flags))
+    }
+
+    /// Set `de_Reserved` — blocks held back at the start of the
+    /// partition for the boot block.
+    pub fn set_reserved(&mut self, index: usize, blocks: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::RESERVED, blocks)
+    }
+
+    /// Set `de_PreAlloc` — blocks held back at the end.
+    pub fn set_pre_alloc(&mut self, index: usize, blocks: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::PRE_ALLOC, blocks)
+    }
+
+    /// Set `de_Interleave` — the filesystem's interleave, not the
+    /// drive's `rdb_Interleave`.
+    pub fn set_interleave(&mut self, index: usize, interleave: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::INTERLEAVE, interleave)
+    }
+
+    /// Set `de_NumBuffers` — cache buffers the handler allocates at mount.
+    pub fn set_num_buffers(&mut self, index: usize, buffers: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::NUM_BUFFERS, buffers)
+    }
+
+    /// Set `de_BufMemType` — which memory those buffers want.
+    pub fn set_buf_mem_type(&mut self, index: usize, mem_type: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::BUF_MEM_TYPE, mem_type)
+    }
+
+    /// Set `de_MaxTransfer` — the largest transfer the driver may issue
+    /// in one go.
+    pub fn set_max_transfer(&mut self, index: usize, max_transfer: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::MAX_TRANSFER, max_transfer)
+    }
+
+    /// Set `de_Mask` — the DMA-reachable address mask.
+    pub fn set_mask(&mut self, index: usize, mask: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::MASK, mask)
+    }
+
+    /// Set `de_Baud`, **extending `de_TableSize` to 17** if the envec
+    /// stopped short of it.
+    ///
+    /// This and the two setters below are the only ones that can move
+    /// `de_TableSize`, and extending it *exposes longwords that were
+    /// absent* — absent being a different thing from zero, which is why
+    /// [`Partition::baud`] and its neighbours are [`Option`]s. Any
+    /// longword that becomes readable on the way is **zeroed** rather
+    /// than left holding whatever slack the block carried: a handler
+    /// that starts reading a field must not be handed a value nobody
+    /// wrote. Setting `de_Control` alone therefore leaves `de_Baud` zero
+    /// and `de_TableSize` at 18, and `envec_raw` — re-read from the
+    /// patched block — grows to say exactly that.
+    pub fn set_baud(&mut self, index: usize, baud: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::BAUD, baud)
+    }
+
+    /// Set `de_Control`, extending `de_TableSize` to 18 if needed.
+    pub fn set_control(&mut self, index: usize, control: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::CONTROL, control)
+    }
+
+    /// Set `de_BootBlocks`, extending `de_TableSize` to 19 if needed.
+    pub fn set_boot_blocks(&mut self, index: usize, blocks: u32) -> Result<(), EditError> {
+        self.set_envec(index, de::BOOT_BLOCKS, blocks)
+    }
+
+    /// Set `rdb_DiskVendor`/`Product`/`Revision` and turn
+    /// [`rdb_flags::DISK_ID`] on.
+    ///
+    /// The flag comes with the strings deliberately: without it those
+    /// bytes mean nothing by the format's own rule, so writing them
+    /// unflagged — which is what `rdbtool` does — plants an identity a
+    /// careful reader will not show and a careless one will.
+    /// [`set_rdb_flags`](Self::set_rdb_flags) can clear the bit again for
+    /// a caller reproducing exactly that.
+    ///
+    /// The three fields are 8, 16 and 4 bytes; anything longer is
+    /// [`EditError::IdentityTooLong`] rather than a silent truncation.
+    pub fn set_disk_identity(
+        &mut self,
+        vendor: &str,
+        product: &str,
+        revision: &str,
+    ) -> Result<(), EditError> {
+        self.set_identity(
+            [
+                ("rdb_DiskVendor", rdsk::DISK_VENDOR, vendor),
+                ("rdb_DiskProduct", rdsk::DISK_PRODUCT, product),
+                ("rdb_DiskRevision", rdsk::DISK_REVISION, revision),
+            ],
+            rdb_flags::DISK_ID,
+        )
+    }
+
+    /// Set `rdb_ControllerVendor`/`Product`/`Revision` and turn
+    /// [`rdb_flags::CTRLR_ID`] on — the controller's identity, on exactly
+    /// the terms [`set_disk_identity`](Self::set_disk_identity)
+    /// describes.
+    pub fn set_controller_identity(
+        &mut self,
+        vendor: &str,
+        product: &str,
+        revision: &str,
+    ) -> Result<(), EditError> {
+        self.set_identity(
+            [
+                ("rdb_ControllerVendor", rdsk::CONTROLLER_VENDOR, vendor),
+                ("rdb_ControllerProduct", rdsk::CONTROLLER_PRODUCT, product),
+                (
+                    "rdb_ControllerRevision",
+                    rdsk::CONTROLLER_REVISION,
+                    revision,
+                ),
+            ],
+            rdb_flags::CTRLR_ID,
+        )
+    }
+
+    fn set_identity(
+        &mut self,
+        fields: [(&'static str, (usize, usize), &str); 3],
+        flag: u32,
+    ) -> Result<(), EditError> {
+        // Checked in full before anything is written, so a rejected
+        // triple leaves none of its three fields changed.
+        for (name, (_, len), value) in fields {
+            if value.len() > len {
+                return Err(EditError::IdentityTooLong {
+                    field: name,
+                    value: String::from(value),
+                    max: len,
+                });
+            }
+        }
+        for (_, (off, len), value) in fields {
+            // Space-padded ASCII, as SCSI INQUIRY writes it — not BCPL,
+            // and not NUL-terminated.
+            self.rdsk[off..off + len].fill(b' ');
+            self.rdsk[off..off + value.len()].copy_from_slice(value.as_bytes());
+        }
+        let flags = be32(&self.rdsk, rdsk::FLAGS) | flag;
+        put_be32(&mut self.rdsk, rdsk::FLAGS, flags);
+        self.resync_rdsk();
+        Ok(())
+    }
+
+    /// Set `rdb_Flags` wholesale — including the
+    /// [`DISK_ID`](rdb_flags::DISK_ID) and
+    /// [`CTRLR_ID`](rdb_flags::CTRLR_ID) bits the identity setters
+    /// manage, and any bit this crate does not name.
+    pub fn set_rdb_flags(&mut self, flags: u32) {
+        put_be32(&mut self.rdsk, rdsk::FLAGS, flags);
+        self.resync_rdsk();
+    }
+
+    /// Bring the modelled `RDSK` fields back in step with the block, the
+    /// way [`edit_part`](Self::edit_part) does for a `PART`.
+    fn resync_rdsk(&mut self) {
+        self.rdb.flags = be32(&self.rdsk, rdsk::FLAGS);
+        self.rdb.disk_vendor = padded_ascii(&self.rdsk, rdsk::DISK_VENDOR);
+        self.rdb.disk_product = padded_ascii(&self.rdsk, rdsk::DISK_PRODUCT);
+        self.rdb.disk_revision = padded_ascii(&self.rdsk, rdsk::DISK_REVISION);
+        self.rdb.controller_vendor = padded_ascii(&self.rdsk, rdsk::CONTROLLER_VENDOR);
+        self.rdb.controller_product = padded_ascii(&self.rdsk, rdsk::CONTROLLER_PRODUCT);
+        self.rdb.controller_revision = padded_ascii(&self.rdsk, rdsk::CONTROLLER_REVISION);
+    }
+
+    /// Write the whole RDB area back, edits and all.
+    ///
+    /// # Order, which is the crash shape
+    ///
+    /// The format has no journal, so ordering is the only protection
+    /// there is. Blocks go out in this order:
+    ///
+    /// 1. every chained block — `LSEG` before the `FSHD` that heads it,
+    ///    each chain written from its **tail forward**, so no block is
+    ///    ever written before the block it points at;
+    /// 2. the `RDSK`, last and alone: the single pointer flip that
+    ///    publishes the new table;
+    /// 3. the blocks the old layout used and the new one does not,
+    ///    zeroed — after the `RDSK` no longer refers to them, and only
+    ///    inside the area.
+    ///
+    /// This is the reverse of AmiPart's ascending order, which writes the
+    /// `RDSK` *first* and so publishes a table before the blocks it
+    /// points at exist (`docs/amipart-survey.md` §5). There is no
+    /// compatibility reason to reproduce that.
+    ///
+    /// # Where the blocks go
+    ///
+    /// Every structure keeps the block it was found on when that block
+    /// is inside the area, so an edit that changes no structure *count*
+    /// — everything in this milestone's first chunk — moves nothing.
+    /// Each block is self-describing and sealed, so an interrupted
+    /// commit leaves a mixture of old and new blocks on an unchanged
+    /// chain, every one of them valid: there is no intermediate state in
+    /// which a chain leads into garbage. A structure whose block lies
+    /// *outside* the area — the damaged-by-construction case
+    /// [`ValidationIssue::BlockOutsideRdbArea`] reports — is moved into
+    /// the lowest free block of the area, which is a relocation into
+    /// space the old layout does not use and so is itself atomic on the
+    /// `RDSK` flip.
+    ///
+    /// # What it refuses
+    ///
+    /// Anything that does not fit the area, before writing a byte —
+    /// [`CommitError::RdbAreaTooSmall`]. The area is never grown (that
+    /// item is still to come) and never shrunk (that one is deliberate).
+    pub fn commit<S: BlockSink>(
+        &self,
+        sink: &mut S,
+    ) -> Result<CommitReport, CommitError<S::Error>> {
+        let block_size = sink.block_size();
+        if !block_size_ok(block_size) {
+            return Err(CommitError::UnsupportedBlockSize { block_size });
+        }
+        if block_size != self.block_size {
+            return Err(CommitError::BlockSizeMismatch {
+                rdb: self.block_size,
+                sink: block_size,
+            });
+        }
+
+        // Everything above and below this pair of calls is arithmetic:
+        // neither has a sink in scope, so "compute the whole thing, then
+        // write it" is structural rather than a discipline — the same
+        // property `RdbBuilder::layout` has, for the same reason.
+        let plan = self.plan()?;
+        let prepared = self.prepare(&plan)?;
+
+        let mut area = LeasedSink {
+            sink,
+            hi: self.rdb.rdb_blocks_hi as u64,
+        };
+        let mut blocks_written = Vec::with_capacity(prepared.len() + plan.zeroed.len());
+        for block in &prepared {
+            area.write(block.lba, &block.bytes)?;
+            blocks_written.push(block.lba);
+        }
+        let zeros = alloc::vec![0u8; block_size];
+        for &lba in &plan.zeroed {
+            area.write(lba, &zeros)?;
+            blocks_written.push(lba);
+        }
+
+        Ok(CommitReport {
+            rdsk_block: self.rdb.rdsk_block,
+            high_rdsk_block: plan.high_rdsk_block,
+            rdb_blocks_hi: self.rdb.rdb_blocks_hi,
+            part_blocks: plan.part_lbas,
+            fshd_blocks: plan.fshd_lbas,
+            blocks_written,
+            blocks_zeroed: plan.zeroed,
+        })
+    }
+
+    /// Assign every structure a block inside the area, or say why it
+    /// cannot be done. No sink in scope, on purpose.
+    ///
+    /// **Minimal motion**: a structure already inside the area stays
+    /// exactly where it is, and only a structure that has nowhere (a
+    /// block outside the area, or — once adding lands — a structure that
+    /// did not exist before) is allocated the lowest block the current
+    /// layout does not occupy. Nothing live is ever overwritten by a
+    /// *different* structure, which is what makes the crash shape hold:
+    /// the only blocks rewritten in place are the ones being rewritten
+    /// as themselves.
+    fn plan<E>(&self) -> Result<CommitPlan, CommitError<E>> {
+        let lo = self.rdb.rdb_blocks_lo as u64;
+        let hi = self.rdb.rdb_blocks_hi as u64;
+        if lo > hi {
+            return Err(CommitError::RdbAreaInvalid {
+                lo: self.rdb.rdb_blocks_lo,
+                hi: self.rdb.rdb_blocks_hi,
+            });
+        }
+        let rdsk = self.rdb.rdsk_block;
+        if rdsk > hi {
+            return Err(CommitError::RdskOutsideRdbArea {
+                rdsk_block: rdsk,
+                hi,
+            });
+        }
+
+        // Every structure, flattened into one list in a fixed order —
+        // PART blocks, then each filesystem's FSHD and its LSEG chain,
+        // then BADB — so the allocation is one pass and the shapes are
+        // restored from the same counts afterwards.
+        let mut current: Vec<u64> = Vec::new();
+        for p in &self.parts {
+            current.push(p.lba);
+        }
+        for (i, f) in self.fshds.iter().enumerate() {
+            current.push(f.lba);
+            for b in &self.lsegs[i] {
+                current.push(b.lba);
+            }
+        }
+        for b in &self.badbs {
+            current.push(b.lba);
+        }
+
+        // `taken` is linear-scanned rather than a set: it is bounded by
+        // the area's block count, which is a few dozen blocks plus
+        // whatever driver payload the image carries, and pulling in a
+        // hash map would mean a dependency this crate does not have.
+        let mut taken: Vec<u64> = alloc::vec![rdsk];
+        let mut assigned: Vec<u64> = alloc::vec![0; current.len()];
+        let mut placed: Vec<bool> = alloc::vec![false; current.len()];
+        for (i, &lba) in current.iter().enumerate() {
+            if (lo..=hi).contains(&lba) && !taken.contains(&lba) {
+                assigned[i] = lba;
+                placed[i] = true;
+                taken.push(lba);
+            }
+        }
+        let mut cursor = lo;
+        for i in 0..assigned.len() {
+            if placed[i] {
+                continue;
+            }
+            while cursor <= hi && taken.contains(&cursor) {
+                cursor += 1;
+            }
+            if cursor > hi {
+                let needed = current.len() as u64 + u64::from(rdsk >= lo);
+                return Err(CommitError::RdbAreaTooSmall {
+                    needed,
+                    available: hi - lo + 1,
+                    lo,
+                    hi,
+                });
+            }
+            assigned[i] = cursor;
+            placed[i] = true;
+            taken.push(cursor);
+            cursor += 1;
+        }
+
+        // Back into the shapes, in the order they were flattened.
+        let mut at = 0usize;
+        let part_lbas = assigned[at..at + self.parts.len()].to_vec();
+        at += self.parts.len();
+        let mut fshd_lbas = Vec::with_capacity(self.fshds.len());
+        let mut lseg_lbas = Vec::with_capacity(self.fshds.len());
+        for chain in &self.lsegs {
+            fshd_lbas.push(assigned[at]);
+            at += 1;
+            lseg_lbas.push(assigned[at..at + chain.len()].to_vec());
+            at += chain.len();
+        }
+        let badb_lbas = assigned[at..].to_vec();
+
+        // `rdb_HighRDSKBlock` is the high-water mark of what is actually
+        // used, recomputed — unlike `rdb_RDBBlocksHi`, which is the
+        // lease and is preserved. AmiPart writes the two equal, which is
+        // why an image edited by it loses its headroom and why the BADB
+        // chain it appends above the old ceiling is orphaned by the next
+        // write (`docs/amipart-survey.md` §4).
+        let high_rdsk_block = taken.iter().copied().max().unwrap_or(rdsk) as u32;
+
+        // What the old layout used, the new one does not, and lies
+        // inside the area. A block outside it is left alone whatever it
+        // holds: it belongs to whoever owns that space now, and the
+        // never-touch guarantee outranks tidiness.
+        let mut zeroed: Vec<u64> = current
+            .iter()
+            .copied()
+            .filter(|lba| (lo..=hi).contains(lba) && !taken.contains(lba))
+            .collect();
+        zeroed.sort_unstable();
+        zeroed.dedup();
+
+        Ok(CommitPlan {
+            part_lbas,
+            fshd_lbas,
+            lseg_lbas,
+            badb_lbas,
+            high_rdsk_block,
+            zeroed,
+        })
+    }
+
+    /// Patch and seal every block the plan will write, in write order —
+    /// chains from their tails, `RDSK` last. No sink in scope here
+    /// either, so a block that cannot be sealed fails before any block
+    /// is written.
+    fn prepare<E>(&self, plan: &CommitPlan) -> Result<Vec<PreparedBlock>, CommitError<E>> {
+        let mut out = Vec::new();
+
+        // Filesystems back to front, and each LSEG chain tail first, so
+        // every `Next` points at a block that is already on the disk.
+        for i in (0..self.fshds.len()).rev() {
+            let chain = &self.lsegs[i];
+            for j in (0..chain.len()).rev() {
+                let mut bytes = chain[j].bytes.clone();
+                let next = match plan.lseg_lbas[i].get(j + 1) {
+                    Some(&lba) => lba as u32,
+                    None => CHAIN_END,
+                };
+                put_be32(&mut bytes, chain::NEXT, next);
+                reseal_preserving(&mut bytes)?;
+                out.push(PreparedBlock {
+                    lba: plan.lseg_lbas[i][j],
+                    bytes,
+                });
+            }
+
+            let mut bytes = self.fshds[i].bytes.clone();
+            let next = match plan.fshd_lbas.get(i + 1) {
+                Some(&lba) => lba as u32,
+                None => CHAIN_END,
+            };
+            put_be32(&mut bytes, chain::NEXT, next);
+            // `fhb_PatchFlags` is *not* recomputed: whether the FSHD asks
+            // for its seglist pointer to be patched into the device node
+            // is the image's business, and only the pointer itself moved.
+            let head = match plan.lseg_lbas[i].first() {
+                Some(&lba) => lba as u32,
+                None => CHAIN_END,
+            };
+            put_be32(&mut bytes, fshd::PATCHED + fshd::SEG_LIST_INDEX * 4, head);
+            reseal_preserving(&mut bytes)?;
+            out.push(PreparedBlock {
+                lba: plan.fshd_lbas[i],
+                bytes,
+            });
+        }
+
+        for i in (0..self.badbs.len()).rev() {
+            let mut bytes = self.badbs[i].bytes.clone();
+            let next = match plan.badb_lbas.get(i + 1) {
+                Some(&lba) => lba as u32,
+                None => CHAIN_END,
+            };
+            put_be32(&mut bytes, chain::NEXT, next);
+            reseal_preserving(&mut bytes)?;
+            out.push(PreparedBlock {
+                lba: plan.badb_lbas[i],
+                bytes,
+            });
+        }
+
+        for i in (0..self.parts.len()).rev() {
+            let mut bytes = self.parts[i].bytes.clone();
+            let next = match plan.part_lbas.get(i + 1) {
+                Some(&lba) => lba as u32,
+                None => CHAIN_END,
+            };
+            put_be32(&mut bytes, chain::NEXT, next);
+            reseal_preserving(&mut bytes)?;
+            out.push(PreparedBlock {
+                lba: plan.part_lbas[i],
+                bytes,
+            });
+        }
+
+        // The RDSK last: the one block whose arrival publishes
+        // everything above it.
+        let mut bytes = self.rdsk.clone();
+        let head = |lbas: &[u64]| match lbas.first() {
+            Some(&lba) => lba as u32,
+            None => CHAIN_END,
+        };
+        put_be32(&mut bytes, rdsk::PARTITION_LIST, head(&plan.part_lbas));
+        put_be32(&mut bytes, rdsk::FILESYS_HEADER_LIST, head(&plan.fshd_lbas));
+        put_be32(&mut bytes, rdsk::BAD_BLOCK_LIST, head(&plan.badb_lbas));
+        put_be32(&mut bytes, rdsk::HIGH_RDSK_BLOCK, plan.high_rdsk_block);
+        reseal_preserving(&mut bytes)?;
+        out.push(PreparedBlock {
+            lba: self.rdb.rdsk_block,
+            bytes,
+        });
+
+        Ok(out)
+    }
+}
+
 /// A [`BlockSource`] view of one partition: LBA 0 here is
 /// `partition.start_lba` on the parent, in the parent's device blocks
 /// (the block size passes through unchanged — this adapter never speaks
@@ -6560,5 +7701,956 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let _ = std::fs::remove_file(&driver_path);
+    }
+
+    // ---- milestone 3: the editor ----------------------------------
+
+    /// Blocks the [`foreign_image`] fixture uses.
+    ///
+    /// Deliberately neither contiguous nor in ascending chain order, and
+    /// with the `RDSK` off block 0: an image written by a tool with a
+    /// different layout policy looks like this, and an editor that
+    /// quietly repacked the area would be caught by the byte-identity
+    /// tests below rather than by a code review.
+    const F_RDSK: usize = 1;
+    const F_PART0: usize = 5;
+    const F_PART1: usize = 3;
+    const F_FSHD: usize = 7;
+    const F_LSEG: usize = 8; // and 9
+    const F_BADB: usize = 11; // and 12
+    const F_HIGH_RDSK: u32 = 12;
+    const F_BLOCKS_HI: u32 = 15;
+
+    /// An image bearing everything a field-by-field rewrite would drop.
+    ///
+    /// `rdb_DriveInit` set, a `BADB` chain, controller identity strings,
+    /// an unknown `rdb_Flags` bit, `rdb_Reserved1` filled, unknown
+    /// `pb_Flags` bits, a `de_TableSize` of 21 with values in every tail
+    /// longword *and* two past anything this crate models, non-zero
+    /// `de_SecOrg`/`de_PreAlloc`/`de_Interleave`, slack bytes after the
+    /// envec, a `PART` `SummedLongs` of 128 rather than 64, an `FSHD`
+    /// with an unusual patch mask including a bit above `GlobalVec`, and
+    /// an `LSEG` whose `SummedLongs` stops short of its own payload.
+    ///
+    /// Geometry: 10 cylinders of 32 blocks, partitions on 2..=5 and
+    /// 6..=9, RDB area 0..=15 — a clean layout, so `validate()` is
+    /// silent and any issue a test sees is one the test made.
+    fn foreign_image() -> Vec<u8> {
+        let bs = 512;
+        let mut d = vec![0u8; 320 * bs];
+
+        put32(&mut d, bs, F_RDSK, hdr::ID, id::RDSK);
+        put32(&mut d, bs, F_RDSK, rdsk::BLOCK_BYTES, bs as u32);
+        put32(
+            &mut d,
+            bs,
+            F_RDSK,
+            rdsk::FLAGS,
+            rdb_flags::LAST | rdb_flags::DISK_ID | rdb_flags::CTRLR_ID | (1 << 31),
+        );
+        put32(&mut d, bs, F_RDSK, rdsk::HOST_ID, 6);
+        // Not CHAIN_END: a drive-init seglist this crate carries and
+        // never follows, and which AmiPart would replace with -1.
+        put32(&mut d, bs, F_RDSK, rdsk::DRIVE_INIT, 0x0000_1234);
+        put32(&mut d, bs, F_RDSK, rdsk::BAD_BLOCK_LIST, F_BADB as u32);
+        put32(&mut d, bs, F_RDSK, rdsk::PARTITION_LIST, F_PART0 as u32);
+        put32(&mut d, bs, F_RDSK, rdsk::FILESYS_HEADER_LIST, F_FSHD as u32);
+        // rdb_Reserved1[6] — six longwords no field of this crate names.
+        for i in 0..6 {
+            put32(&mut d, bs, F_RDSK, 40 + i * 4, 0xFFFF_FFFF);
+        }
+        put32(&mut d, bs, F_RDSK, rdsk::CYLINDERS, 10);
+        put32(&mut d, bs, F_RDSK, rdsk::SECTORS, 32);
+        put32(&mut d, bs, F_RDSK, rdsk::HEADS, 1);
+        put32(&mut d, bs, F_RDSK, rdsk::INTERLEAVE, 2);
+        put32(&mut d, bs, F_RDSK, rdsk::PARK, 10);
+        put32(&mut d, bs, F_RDSK, rdsk::WRITE_PRE_COMP, 4);
+        put32(&mut d, bs, F_RDSK, rdsk::REDUCED_WRITE, 5);
+        put32(&mut d, bs, F_RDSK, rdsk::STEP_RATE, 7);
+        put32(&mut d, bs, F_RDSK, rdsk::RDB_BLOCKS_LO, 0);
+        put32(&mut d, bs, F_RDSK, rdsk::RDB_BLOCKS_HI, F_BLOCKS_HI);
+        put32(&mut d, bs, F_RDSK, rdsk::LO_CYLINDER, 2);
+        put32(&mut d, bs, F_RDSK, rdsk::HI_CYLINDER, 9);
+        put32(&mut d, bs, F_RDSK, rdsk::CYL_BLOCKS, 32);
+        put32(&mut d, bs, F_RDSK, rdsk::AUTO_PARK_SECONDS, 30);
+        put32(&mut d, bs, F_RDSK, rdsk::HIGH_RDSK_BLOCK, F_HIGH_RDSK);
+        // rdb_Reserved4, and bytes past the identification strings that
+        // the 64-longword checksum does not even cover.
+        put32(&mut d, bs, F_RDSK, 156, 0xA5A5_A5A5);
+        put32(&mut d, bs, F_RDSK, 300, 0x5A5A_5A5A);
+        put_padded(&mut d, bs, F_RDSK, rdsk::DISK_VENDOR, "MAXTOR  ");
+        put_padded(&mut d, bs, F_RDSK, rdsk::DISK_PRODUCT, "LXT213S");
+        put_padded(&mut d, bs, F_RDSK, rdsk::DISK_REVISION, "4.10");
+        put_padded(&mut d, bs, F_RDSK, rdsk::CONTROLLER_VENDOR, "GVP");
+        put_padded(&mut d, bs, F_RDSK, rdsk::CONTROLLER_PRODUCT, "SERIES II");
+        put_padded(&mut d, bs, F_RDSK, rdsk::CONTROLLER_REVISION, "4.15");
+        seal(&mut d, bs, F_RDSK, 64);
+
+        write_foreign_part(&mut d, F_PART0, F_PART1 as u32, "DH0", (2, 5), 0, 128);
+        write_foreign_part(&mut d, F_PART1, CHAIN_END, "DH1", (6, 9), -3, 64);
+
+        put32(&mut d, bs, F_FSHD, hdr::ID, id::FSHD);
+        put32(&mut d, bs, F_FSHD, chain::NEXT, CHAIN_END);
+        put32(&mut d, bs, F_FSHD, fshd::HOST_ID, 6);
+        put32(&mut d, bs, F_FSHD, fshd::FLAGS, 0x0000_00FF);
+        put32(&mut d, bs, F_FSHD, fshd::DOS_TYPE, 0x444F_5307);
+        put32(&mut d, bs, F_FSHD, fshd::VERSION, (46 << 16) | 13);
+        // An unusual mask: Task and Lock patched (which rdbtool never
+        // does), Type and Handler not, and a bit above GlobalVec that
+        // this crate models nowhere at all.
+        put32(
+            &mut d,
+            bs,
+            F_FSHD,
+            fshd::PATCH_FLAGS,
+            fshd_patch::TASK
+                | fshd_patch::LOCK
+                | fshd_patch::STARTUP
+                | fshd_patch::SEG_LIST
+                | fshd_patch::GLOBAL_VEC
+                | (1 << 20),
+        );
+        for (i, v) in [
+            0xAAAA_0000u32,
+            0x0000_1111,
+            0x0000_2222,
+            0xBBBB_0000,
+            0xCCCC_0000,
+            0xDDDD_0000,
+            0x0000_3333,
+            F_LSEG as u32,
+            0xFFFF_FFFF,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put32(&mut d, bs, F_FSHD, fshd::PATCHED + i * 4, v);
+        }
+        seal(&mut d, bs, F_FSHD, 64);
+
+        for (i, block) in [F_LSEG, F_LSEG + 1].into_iter().enumerate() {
+            put32(&mut d, bs, block, hdr::ID, id::LSEG);
+            put32(&mut d, bs, block, hdr::HOST_ID, 6);
+            put32(
+                &mut d,
+                bs,
+                block,
+                chain::NEXT,
+                if i == 0 {
+                    (F_LSEG + 1) as u32
+                } else {
+                    CHAIN_END
+                },
+            );
+            let base = block * bs + lseg::LOAD_DATA;
+            for (j, b) in d[base..block * bs + bs].iter_mut().enumerate() {
+                *b = ((i * 97 + j) % 251) as u8;
+            }
+            // The second block's count stops well short of its payload,
+            // as a driver whose last block is mostly slack would — so
+            // the bytes past it are outside the checksum entirely and
+            // only survive because the editor never rebuilds the block.
+            seal(&mut d, bs, block, if i == 0 { 128 } else { 45 });
+        }
+
+        for (block, next, entries) in [
+            (
+                F_BADB,
+                (F_BADB + 1) as u32,
+                &[(700u32, 800u32), (701, 801)][..],
+            ),
+            (F_BADB + 1, CHAIN_END, &[(702, 802)][..]),
+        ] {
+            put32(&mut d, bs, block, hdr::ID, id::BADB);
+            put32(&mut d, bs, block, hdr::HOST_ID, 6);
+            put32(&mut d, bs, block, chain::NEXT, next);
+            for (i, (bad, good)) in entries.iter().enumerate() {
+                put32(&mut d, bs, block, badb::ENTRIES + i * 8, *bad);
+                put32(&mut d, bs, block, badb::ENTRIES + i * 8 + 4, *good);
+            }
+            seal(
+                &mut d,
+                bs,
+                block,
+                (badb::HEADER_LONGS + entries.len() * 2) as u32,
+            );
+        }
+
+        // Partition contents, so "the extents were not touched" is a
+        // comparison against something rather than against zeros.
+        for (i, b) in d[64 * bs..].iter_mut().enumerate() {
+            *b = (i % 253) as u8;
+        }
+
+        d
+    }
+
+    /// One `PART` block of [`foreign_image`], with every field a
+    /// field-by-field rewrite would lose.
+    fn write_foreign_part(
+        d: &mut [u8],
+        block: usize,
+        next: u32,
+        name: &str,
+        (low_cyl, high_cyl): (u32, u32),
+        boot_pri: i32,
+        summed_longs: u32,
+    ) {
+        let bs = 512;
+        put32(d, bs, block, hdr::ID, id::PART);
+        put32(d, bs, block, hdr::HOST_ID, 6);
+        put32(d, bs, block, chain::NEXT, next);
+        // Bootable, plus two bits nobody models — the ones AmiPart's
+        // checkbox rebuild clears on an unrelated edit.
+        put32(d, bs, block, part::FLAGS, 1 | (1 << 7) | (1 << 31));
+        let name = name.as_bytes();
+        d[block * bs + part::DRIVE_NAME] = name.len() as u8;
+        d[block * bs + part::DRIVE_NAME + 1..block * bs + part::DRIVE_NAME + 1 + name.len()]
+            .copy_from_slice(name);
+
+        let e = part::ENVIRONMENT;
+        let mut env = |i: usize, v: u32| put32(d, bs, block, e + i * 4, v);
+        env(de::TABLE_SIZE, 21);
+        env(de::SIZE_BLOCK, 128);
+        env(de::SEC_ORG, 1);
+        env(de::SURFACES, 1);
+        env(de::SECTORS_PER_BLOCK, 1);
+        env(de::BLOCKS_PER_TRACK, 32);
+        env(de::RESERVED, 3);
+        env(de::PRE_ALLOC, 5);
+        env(de::INTERLEAVE, 1);
+        env(de::LOW_CYL, low_cyl);
+        env(de::HIGH_CYL, high_cyl);
+        env(de::NUM_BUFFERS, 50);
+        env(de::BUF_MEM_TYPE, 1);
+        env(de::MAX_TRANSFER, 0x0001_FE00);
+        env(de::MASK, 0xFFFF_FFFE);
+        env(de::BOOT_PRI, boot_pri as u32);
+        env(de::DOS_TYPE, 0x444F_5307);
+        env(de::BAUD, 19200);
+        env(de::CONTROL, 0x0000_CAFE);
+        env(de::BOOT_BLOCKS, 4);
+        // Two longwords past de_BootBlocks: inside de_TableSize, past
+        // anything this crate names, and reachable only through
+        // `envec_raw`.
+        env(20, 0x1111_1111);
+        env(21, 0x2222_2222);
+        // Slack past the envec, which a foreign tool left behind.
+        put32(d, bs, block, e + 22 * 4, 0xDEAD_BEEF);
+        seal(d, bs, block, summed_longs);
+    }
+
+    fn foreign_disk() -> MemDisk {
+        MemDisk::new(foreign_image())
+    }
+
+    /// Every byte offset at which two images differ.
+    fn differing_offsets(a: &[u8], b: &[u8]) -> Vec<usize> {
+        assert_eq!(a.len(), b.len());
+        (0..a.len()).filter(|&i| a[i] != b[i]).collect()
+    }
+
+    /// The fixture is what it claims to be: everything a rewrite could
+    /// drop is *there* before any test asserts it survived.
+    #[test]
+    fn the_foreign_fixture_carries_what_a_rewrite_would_drop() {
+        let mut disk = foreign_disk();
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        let rdb = editor.rdb();
+
+        assert_eq!(rdb.rdsk_block, F_RDSK as u64);
+        assert_eq!(rdb.drive_init, 0x0000_1234);
+        assert_eq!(rdb.flags & (1 << 31), 1 << 31);
+        assert_eq!(rdb.controller_product, "SERIES II");
+        assert_eq!(rdb.bad_blocks.len(), 3);
+        assert_eq!(rdb.badb_blocks, vec![F_BADB as u64, F_BADB as u64 + 1]);
+        assert_eq!(rdb.filesystems.len(), 1);
+        assert_eq!(rdb.filesystems[0].patch_flags & (1 << 20), 1 << 20);
+        assert_eq!(rdb.filesystems[0].task, Some(0x0000_1111));
+
+        let p = &rdb.partitions[0];
+        assert_eq!(p.name, "DH0");
+        assert_eq!(p.envec_raw.len(), 22);
+        assert_eq!(p.envec_raw[20], 0x1111_1111);
+        assert_eq!(p.baud, Some(19200));
+        assert_eq!(p.boot_blocks, Some(4));
+        assert!(rdb.validate().is_empty());
+    }
+
+    /// A commit with no edits writes the area back byte for byte.
+    ///
+    /// The strongest statement of the preserve-everything property
+    /// there is: not "the fields we model came back", but "the disk is
+    /// the same disk". `rdb_HighRDSKBlock` is the one field that is
+    /// recomputed rather than preserved, and the fixture's stored value
+    /// already agrees with its own blocks, so even that does not move.
+    #[test]
+    fn no_op_commit_is_byte_identical() {
+        let before = foreign_image();
+        let mut disk = MemDisk::new(before.clone());
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        let report = editor.commit(&mut disk).unwrap();
+
+        assert_eq!(differing_offsets(&before, &disk.data), Vec::<usize>::new());
+        assert_eq!(report.rdsk_block, F_RDSK as u64);
+        assert_eq!(report.high_rdsk_block, F_HIGH_RDSK);
+        assert_eq!(report.rdb_blocks_hi, F_BLOCKS_HI);
+        assert_eq!(report.part_blocks, vec![F_PART0 as u64, F_PART1 as u64]);
+        assert!(report.blocks_zeroed.is_empty());
+        // The RDSK is the last block written, always.
+        assert_eq!(report.blocks_written.last(), Some(&(F_RDSK as u64)));
+        // A non-standard `SummedLongs` is preserved, not normalised to
+        // the 64 this crate writes on create.
+        assert_eq!(be32(&disk.data[F_PART0 * 512..], hdr::SUMMED_LONGS), 128);
+    }
+
+    /// **The test of this chunk.** One field changes; every other byte
+    /// on the disk — modelled, unmodelled, and outside the checksum —
+    /// is exactly where it was.
+    #[test]
+    fn editing_one_field_changes_only_that_field() {
+        let before = foreign_image();
+        let mut disk = MemDisk::new(before.clone());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_boot_priority(0, 7).unwrap();
+        editor.commit(&mut disk).unwrap();
+
+        // Only two longwords of one block may move: de_BootPri, and the
+        // ChkSum that covers it.
+        let boot_pri = F_PART0 * 512 + part::ENVIRONMENT + de::BOOT_PRI * 4;
+        let chk_sum = F_PART0 * 512 + hdr::CHK_SUM;
+        for off in differing_offsets(&before, &disk.data) {
+            assert!(
+                (boot_pri..boot_pri + 4).contains(&off) || (chk_sum..chk_sum + 4).contains(&off),
+                "byte {off} changed, which no edit asked for"
+            );
+        }
+
+        // And the model that comes back is the model that went in, save
+        // for the one field.
+        let mut fresh = MemDisk::new(before);
+        let old = Rdb::parse(&mut fresh).unwrap();
+        let new = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(new.partitions[0].boot_pri, 7);
+        assert_eq!(old.partitions[0].envec_raw.len(), 22);
+        let mut expected = old.clone();
+        expected.partitions[0].boot_pri = 7;
+        expected.partitions[0].envec_raw[de::BOOT_PRI] = 7;
+        assert_eq!(new, expected);
+    }
+
+    /// Every metadata setter, applied at once and read back off the
+    /// disk — including the three tail fields, which have to extend
+    /// `de_TableSize` on a partition that stops at 16.
+    #[test]
+    fn metadata_edits_round_trip_through_the_disk() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+
+        editor.set_name(0, "WORK").unwrap();
+        editor.set_dos_type(0, 0x444F_5307).unwrap();
+        editor.set_boot_priority(0, -5).unwrap();
+        editor.set_bootable(0, false).unwrap();
+        editor.set_automount(0, false).unwrap();
+        editor.set_reserved(0, 4).unwrap();
+        editor.set_pre_alloc(0, 6).unwrap();
+        editor.set_interleave(0, 3).unwrap();
+        editor.set_num_buffers(0, 300).unwrap();
+        editor.set_buf_mem_type(0, 1).unwrap();
+        editor.set_max_transfer(0, 0x0001_FE00).unwrap();
+        editor.set_mask(0, 0x00FF_FFFE).unwrap();
+        editor.set_baud(0, 9600).unwrap();
+        editor.set_control(0, 0x0000_BEEF).unwrap();
+        editor.set_boot_blocks(0, 2).unwrap();
+        editor.commit(&mut disk).unwrap();
+
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = &rdb.partitions[0];
+        assert_eq!(p.name, "WORK");
+        assert_eq!(p.dos_type, 0x444F_5307);
+        assert_eq!(p.boot_pri, -5);
+        assert!(!p.bootable);
+        assert!(p.no_automount);
+        assert_eq!(p.num_buffers, 300);
+        assert_eq!(p.buf_mem_type, 1);
+        assert_eq!(p.max_transfer, 0x0001_FE00);
+        assert_eq!(p.mask, 0x00FF_FFFE);
+        assert_eq!(p.baud, Some(9600));
+        assert_eq!(p.control, Some(0x0000_BEEF));
+        assert_eq!(p.boot_blocks, Some(2));
+        assert_eq!(p.envec_raw[de::RESERVED], 4);
+        assert_eq!(p.envec_raw[de::PRE_ALLOC], 6);
+        assert_eq!(p.envec_raw[de::INTERLEAVE], 3);
+        assert_eq!(p.envec_raw.len(), 20); // de_TableSize 19 now
+        assert!(rdb.validate().is_empty());
+        // The editor's own model said all of this before the commit did.
+        assert_eq!(rdb.partitions, editor.partitions());
+    }
+
+    /// Setting one tail field extends `de_TableSize` exactly as far as
+    /// it must, and the longwords that become readable on the way are
+    /// zeroed rather than exposing whatever the block was carrying.
+    #[test]
+    fn envec_tail_setters_extend_table_size() {
+        // The fixture plants values in all three tail longwords whatever
+        // de_TableSize says, which is what makes "were they exposed or
+        // zeroed" a question with an observable answer.
+        let mut disk = MemDisk::new(one_partition_image_envec(2, 512, 16));
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        assert_eq!(editor.partitions()[0].baud, None);
+
+        editor.set_control(0, 0x1234_5678).unwrap();
+        let p = &editor.partitions()[0];
+        assert_eq!(p.envec_raw[de::TABLE_SIZE], 18);
+        assert_eq!(p.baud, Some(0), "an exposed field is zeroed, not slack");
+        assert_eq!(p.control, Some(0x1234_5678));
+        assert_eq!(p.boot_blocks, None, "and no further than it must");
+
+        // Extending again leaves what is already there alone.
+        editor.set_boot_blocks(0, 9).unwrap();
+        let p = &editor.partitions()[0];
+        assert_eq!(p.envec_raw[de::TABLE_SIZE], 19);
+        assert_eq!(p.control, Some(0x1234_5678));
+        assert_eq!(p.boot_blocks, Some(9));
+
+        // And a field below de_TableSize never touches it.
+        editor.set_mask(0, 7).unwrap();
+        assert_eq!(editor.partitions()[0].envec_raw[de::TABLE_SIZE], 19);
+    }
+
+    /// A rename rewrites the 32-byte BCPL field and nothing else — a
+    /// shorter name leaves none of the longer one behind, and the rest
+    /// of the `PART` block is untouched.
+    #[test]
+    fn set_name_rewrites_only_the_name_field() {
+        let before = foreign_image();
+        let mut disk = MemDisk::new(before.clone());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_name(0, "A").unwrap();
+        editor.commit(&mut disk).unwrap();
+
+        let name = F_PART0 * 512 + part::DRIVE_NAME;
+        let chk_sum = F_PART0 * 512 + hdr::CHK_SUM;
+        for off in differing_offsets(&before, &disk.data) {
+            assert!(
+                (name..name + 32).contains(&off) || (chk_sum..chk_sum + 4).contains(&off),
+                "byte {off} changed, which the rename did not ask for"
+            );
+        }
+        assert_eq!(Rdb::parse(&mut disk).unwrap().partitions[0].name, "A");
+        // The old name's tail is gone rather than left in the padding.
+        assert!(disk.data[name + 2..name + 32].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn set_name_refuses_a_duplicate_or_unstorable_name() {
+        let mut disk = foreign_disk();
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        assert_eq!(
+            editor.set_name(0, "DH1"),
+            Err(EditError::DuplicateName {
+                name: String::from("DH1")
+            })
+        );
+        assert_eq!(
+            editor.set_name(0, ""),
+            Err(EditError::InvalidName {
+                name: String::new(),
+                max: 31
+            })
+        );
+        // Renaming a partition to what it is already called is not a
+        // duplicate — it is a no-op the caller is entitled to make.
+        editor.set_name(0, "DH0").unwrap();
+        assert_eq!(editor.partitions()[0].name, "DH0");
+    }
+
+    #[test]
+    fn editor_rejects_a_partition_index_that_is_not_there() {
+        let mut disk = foreign_disk();
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        let missing = |index| Err(EditError::NoSuchPartition { index, count: 2 });
+        assert_eq!(editor.set_dos_type(2, 0), missing(2));
+        assert_eq!(editor.set_bootable(9, true), missing(9));
+        assert_eq!(editor.set_mask(2, 0), missing(2));
+        assert_eq!(editor.set_name(2, "NEW"), missing(2));
+    }
+
+    /// `pb_Flags` bits this crate does not model survive an edit to the
+    /// ones it does — the failure AmiPart's checkbox rebuild produces.
+    #[test]
+    fn flag_edits_leave_unmodelled_bits_alone() {
+        let mut disk = foreign_disk();
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_bootable(0, false).unwrap();
+        editor.set_automount(0, false).unwrap();
+        editor.commit(&mut disk).unwrap();
+
+        let flags = be32(&disk.data[F_PART0 * 512..], part::FLAGS);
+        assert_eq!(flags, (1 << 1) | (1 << 7) | (1 << 31));
+
+        // And the escape hatch says exactly what it is told to.
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_flags_raw(0, 0x8000_0003).unwrap();
+        editor.commit(&mut disk).unwrap();
+        assert_eq!(be32(&disk.data[F_PART0 * 512..], part::FLAGS), 0x8000_0003);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert!(rdb.partitions[0].bootable && rdb.partitions[0].no_automount);
+    }
+
+    /// The identity setters write the strings *and* the flag bit that
+    /// makes them mean anything.
+    #[test]
+    fn identity_setters_set_the_flag_that_gates_them() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_rdb_flags(rdsk_defaults::FLAGS);
+        editor
+            .set_disk_identity("SEAGATE", "ST3120A", "1.02")
+            .unwrap();
+        editor
+            .set_controller_identity("CBM", "A2091", "7.0")
+            .unwrap();
+        editor.commit(&mut disk).unwrap();
+
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.disk_vendor, "SEAGATE");
+        assert_eq!(rdb.disk_product, "ST3120A");
+        assert_eq!(rdb.disk_revision, "1.02");
+        assert_eq!(rdb.controller_vendor, "CBM");
+        assert_eq!(rdb.controller_product, "A2091");
+        assert_eq!(rdb.controller_revision, "7.0");
+        assert_eq!(rdb.flags & rdb_flags::DISK_ID, rdb_flags::DISK_ID);
+        assert_eq!(rdb.flags & rdb_flags::CTRLR_ID, rdb_flags::CTRLR_ID);
+
+        // A field that does not fit is refused, and refused before any
+        // of the three is written.
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        assert_eq!(
+            editor.set_disk_identity("SEAGATE", "ST3120A", "12345"),
+            Err(EditError::IdentityTooLong {
+                field: "rdb_DiskRevision",
+                value: String::from("12345"),
+                max: 4,
+            })
+        );
+        assert_eq!(editor.rdb().disk_vendor, "SEAGATE");
+    }
+
+    #[test]
+    fn set_rdb_flags_replaces_the_whole_word() {
+        let mut disk = foreign_disk();
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_rdb_flags(rdb_flags::LAST | (1 << 30));
+        editor.commit(&mut disk).unwrap();
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.flags, rdb_flags::LAST | (1 << 30));
+    }
+
+    /// A sink that records every LBA it is asked to write.
+    struct TrackingSink {
+        data: Vec<u8>,
+        writes: Vec<u64>,
+    }
+
+    impl BlockSink for TrackingSink {
+        type Error = ();
+        fn block_size(&self) -> usize {
+            512
+        }
+        fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
+            self.writes.push(lba);
+            let off = lba as usize * 512;
+            self.data[off..off + 512].copy_from_slice(buf);
+            Ok(())
+        }
+        fn block_count(&self) -> Option<u64> {
+            Some(self.data.len() as u64 / 512)
+        }
+    }
+
+    /// The never-touch guarantee, from the outside: a commit writes only
+    /// inside `0..=rdb_RDBBlocksHi`, and the partitions' contents come
+    /// out byte for byte.
+    #[test]
+    fn commit_writes_only_inside_the_rdb_area() {
+        let before = foreign_image();
+        let mut disk = MemDisk::new(before.clone());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_name(0, "SYS").unwrap();
+        editor.set_boot_priority(1, 20).unwrap();
+        editor.set_dos_type(1, 0x444F_5300).unwrap();
+
+        let mut sink = TrackingSink {
+            data: before.clone(),
+            writes: Vec::new(),
+        };
+        let report = editor.commit(&mut sink).unwrap();
+
+        assert!(!sink.writes.is_empty());
+        for &lba in &sink.writes {
+            assert!(
+                lba <= F_BLOCKS_HI as u64,
+                "block {lba} is outside the RDB area lease"
+            );
+        }
+        assert_eq!(sink.writes, report.blocks_written);
+
+        // Both partitions' extents, byte for byte. The first starts at
+        // cylinder 2, i.e. block 64, which is where the fixture's
+        // partition contents begin.
+        assert_eq!(&sink.data[64 * 512..], &before[64 * 512..]);
+    }
+
+    /// Crash shape, exhaustively: cut the commit off after every
+    /// possible number of writes and re-parse what is on the disk.
+    ///
+    /// The RDB is *always* readable, always self-consistent, and always
+    /// carries both partitions with their old or their new metadata —
+    /// never a chain leading into garbage. That holds because every
+    /// block is sealed before it is written and no block is ever
+    /// overwritten by a *different* structure, so an interrupted commit
+    /// leaves a mixture of old and new blocks on a chain whose shape did
+    /// not change.
+    #[test]
+    fn commit_truncated_at_every_write_leaves_a_readable_rdb() {
+        /// A sink that fails on the *n*th write.
+        struct FlakySink {
+            data: Vec<u8>,
+            writes: usize,
+            fail_after: usize,
+        }
+        impl BlockSink for FlakySink {
+            type Error = ();
+            fn block_size(&self) -> usize {
+                512
+            }
+            fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
+                if self.writes == self.fail_after {
+                    return Err(());
+                }
+                self.writes += 1;
+                let off = lba as usize * 512;
+                self.data[off..off + 512].copy_from_slice(buf);
+                Ok(())
+            }
+            fn block_count(&self) -> Option<u64> {
+                Some(self.data.len() as u64 / 512)
+            }
+        }
+
+        let before = foreign_image();
+        let mut disk = MemDisk::new(before.clone());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_name(0, "SYS").unwrap();
+        editor.set_boot_priority(0, 9).unwrap();
+
+        let total = editor
+            .commit(&mut TrackingSink {
+                data: before.clone(),
+                writes: Vec::new(),
+            })
+            .unwrap()
+            .blocks_written
+            .len();
+        assert!(total > 1);
+
+        for fail_after in 0..=total {
+            let mut sink = FlakySink {
+                data: before.clone(),
+                writes: 0,
+                fail_after,
+            };
+            let result = editor.commit(&mut sink);
+            if fail_after < total {
+                assert_eq!(result.unwrap_err(), CommitError::Io(()));
+            } else {
+                result.unwrap();
+            }
+
+            let mut disk = MemDisk::new(sink.data);
+            let rdb = Rdb::parse(&mut disk).unwrap_or_else(|e| {
+                panic!("truncated at {fail_after} left no readable RDB: {e:?}")
+            });
+            assert!(rdb.validate().is_empty(), "truncated at {fail_after}");
+            assert!(rdb.validate_seg_lists(&mut disk).unwrap().is_empty());
+            assert_eq!(rdb.partitions.len(), 2);
+            assert_eq!(rdb.partitions[1].name, "DH1");
+            assert_eq!(rdb.bad_blocks.len(), 3);
+            assert_eq!(rdb.drive_init, 0x0000_1234);
+            // The one partition being edited is either its old self or
+            // its new one, never a half-written mixture: one block, one
+            // write.
+            let p = &rdb.partitions[0];
+            assert!(
+                (p.name == "DH0" && p.boot_pri == 0) || (p.name == "SYS" && p.boot_pri == 9),
+                "truncated at {fail_after} left partition 0 as {} / {}",
+                p.name,
+                p.boot_pri
+            );
+            // The driver still reassembles, whatever was interrupted.
+            let fs = &rdb.filesystems[0];
+            assert_eq!(rdb.load_filesystem(fs, &mut disk).unwrap().len(), 2 * 492);
+        }
+    }
+
+    /// A structure lying outside the area — the
+    /// damaged-by-construction case — is moved *into* it, into blocks
+    /// the old layout does not use, and its old blocks are left exactly
+    /// as they were: they are outside the lease, so they are not ours to
+    /// tidy up.
+    #[test]
+    fn commit_relocates_a_chain_block_from_outside_the_area() {
+        let mut image = foreign_image();
+        let bs = 512;
+        // Move the BADB chain to blocks 20 and 21, above RDBBlocksHi.
+        for (from, to) in [(F_BADB, 20usize), (F_BADB + 1, 21)] {
+            let (src, dst) = (from * bs, to * bs);
+            let block: Vec<u8> = image[src..src + bs].to_vec();
+            image[dst..dst + bs].copy_from_slice(&block);
+            image[src..src + bs].fill(0);
+        }
+        put32(&mut image, bs, 20, chain::NEXT, 21);
+        seal(&mut image, bs, 20, (badb::HEADER_LONGS + 4) as u32);
+        put32(&mut image, bs, F_RDSK, rdsk::BAD_BLOCK_LIST, 20);
+        seal(&mut image, bs, F_RDSK, 64);
+
+        let mut disk = MemDisk::new(image.clone());
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.validate().len(), 2, "both BADB blocks are outside");
+
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        let report = editor.commit(&mut disk).unwrap();
+        assert!(report.blocks_zeroed.is_empty());
+        for &lba in &report.blocks_written {
+            assert!(lba <= F_BLOCKS_HI as u64);
+        }
+
+        // Relocated into the lowest blocks the old layout left free.
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.badb_blocks, vec![0, 2]);
+        assert_eq!(rdb.bad_blocks.len(), 3);
+        assert_eq!(
+            rdb.bad_blocks[2],
+            BadBlockEntry {
+                bad: 702,
+                good: 802
+            }
+        );
+        assert!(rdb.validate().is_empty());
+        // Nothing outside the lease was touched, the vacated blocks
+        // above it included.
+        assert_eq!(&disk.data[16 * bs..], &image[16 * bs..]);
+    }
+
+    /// An area too small for the layout is refused before a byte is
+    /// written, naming the shortfall — and saying that growing the area
+    /// is not a thing this crate does yet.
+    #[test]
+    fn commit_refuses_an_area_that_cannot_hold_the_layout() {
+        let bs = 512;
+        let mut image = foreign_image();
+        put32(&mut image, bs, F_RDSK, rdsk::RDB_BLOCKS_HI, 6);
+        seal(&mut image, bs, F_RDSK, 64);
+
+        let mut disk = MemDisk::new(image.clone());
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        let err = editor.commit(&mut disk).unwrap_err();
+        assert_eq!(
+            err,
+            CommitError::RdbAreaTooSmall {
+                needed: 8,
+                available: 7,
+                lo: 0,
+                hi: 6,
+            }
+        );
+        assert_eq!(disk.data, image, "a refused commit writes nothing");
+    }
+
+    #[test]
+    fn commit_refuses_an_inverted_area_and_an_unreachable_rdsk() {
+        let bs = 512;
+        for (lo, hi, expected) in [
+            (9u32, 4u32, CommitError::RdbAreaInvalid { lo: 9, hi: 4 }),
+            (
+                0,
+                0,
+                CommitError::RdskOutsideRdbArea {
+                    rdsk_block: F_RDSK as u64,
+                    hi: 0,
+                },
+            ),
+        ] {
+            let mut image = foreign_image();
+            put32(&mut image, bs, F_RDSK, rdsk::RDB_BLOCKS_LO, lo);
+            put32(&mut image, bs, F_RDSK, rdsk::RDB_BLOCKS_HI, hi);
+            seal(&mut image, bs, F_RDSK, 64);
+            let mut disk = MemDisk::new(image.clone());
+            let editor = RdbEditor::open(&mut disk).unwrap();
+            assert_eq!(editor.commit(&mut disk).unwrap_err(), expected);
+            assert_eq!(disk.data, image);
+        }
+    }
+
+    #[test]
+    fn commit_refuses_a_sink_of_the_wrong_block_size() {
+        let mut disk = foreign_disk();
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        let mut wrong = MemDisk {
+            data: vec![0u8; 320 * 4096],
+            block_size: 4096,
+        };
+        assert_eq!(
+            editor.commit(&mut wrong).unwrap_err(),
+            CommitError::BlockSizeMismatch {
+                rdb: 512,
+                sink: 4096
+            }
+        );
+        let mut bad = MemDisk {
+            data: vec![0u8; 4096],
+            block_size: 768,
+        };
+        assert_eq!(
+            editor.commit(&mut bad).unwrap_err(),
+            CommitError::UnsupportedBlockSize { block_size: 768 }
+        );
+    }
+
+    /// The editor works at 4 KB device blocks as it does at 512 —
+    /// nothing in the write path may reintroduce the 512-byte
+    /// assumptions the survey found in AmiPart (§7.5).
+    #[test]
+    fn editor_round_trips_a_4k_block_image() {
+        let before = one_partition_image_bs(2, 4096);
+        let mut disk = MemDisk {
+            data: before.clone(),
+            block_size: 4096,
+        };
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        editor.commit(&mut disk).unwrap();
+        assert_eq!(disk.data, before);
+
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_boot_priority(0, 4).unwrap();
+        editor.commit(&mut disk).unwrap();
+        assert_eq!(Rdb::parse(&mut disk).unwrap().partitions[0].boot_pri, 4);
+    }
+
+    /// An image the builder made, edited and read back: the create and
+    /// mutate paths agree about the same disk.
+    #[test]
+    fn an_image_this_crate_built_survives_an_edit() {
+        let mut disk = MemDisk {
+            data: vec![0u8; TEN_MIB_BLOCKS * 512],
+            block_size: 512,
+        };
+        let driver: Vec<u8> = (0..2000).map(|i| (i % 251) as u8).collect();
+        RdbBuilder::for_size(TEN_MIB, 512)
+            .unwrap()
+            .partition(PartitionSpec::by_size(2 * 1024 * 1024))
+            .partition(PartitionSpec::by_size(2 * 1024 * 1024).named("WORK"))
+            .filesystem(FileSystemSpec::new(0x444F_5307, driver.clone()))
+            .build(&mut disk)
+            .unwrap();
+        let built = disk.data.clone();
+
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        editor.commit(&mut disk).unwrap();
+        assert_eq!(disk.data, built, "a no-op commit changes nothing");
+
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_bootable(1, true).unwrap();
+        editor.set_boot_priority(1, 3).unwrap();
+        editor.commit(&mut disk).unwrap();
+
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert!(rdb.partitions[1].bootable);
+        assert_eq!(rdb.partitions[1].boot_pri, 3);
+        assert!(rdb.validate().is_empty());
+        assert!(rdb.validate_seg_lists(&mut disk).unwrap().is_empty());
+        let loaded = rdb.load_filesystem(&rdb.filesystems[0], &mut disk).unwrap();
+        assert_eq!(&loaded[..driver.len()], &driver[..]);
+    }
+
+    /// Both editor error types render one line fit to show a user, in
+    /// `no_std` as much as `std` — the contract every other error type
+    /// in this crate holds to.
+    #[test]
+    fn editor_errors_display_as_one_useful_line() {
+        let edits: [(EditError, &str); 4] = [
+            (
+                EditError::NoSuchPartition { index: 3, count: 2 },
+                "there is no partition 3: the RDB has 2 of them",
+            ),
+            (
+                EditError::InvalidName {
+                    name: String::from(""),
+                    max: 31,
+                },
+                "drive name \"\" does not fit pb_DriveName: 1..=31 characters are available",
+            ),
+            (
+                EditError::DuplicateName {
+                    name: String::from("DH0"),
+                },
+                "another partition is already named \"DH0\"",
+            ),
+            (
+                EditError::IdentityTooLong {
+                    field: "rdb_DiskRevision",
+                    value: String::from("12345"),
+                    max: 4,
+                },
+                "rdb_DiskRevision holds 4 characters, which \"12345\" exceeds",
+            ),
+        ];
+        for (e, expected) in edits {
+            assert_eq!(alloc::format!("{e}"), expected);
+        }
+
+        let commits: [(CommitError<&str>, &str); 6] = [
+            (
+                CommitError::Io("device is read-only"),
+                "writing a block failed: device is read-only",
+            ),
+            (
+                CommitError::BlockSizeMismatch {
+                    rdb: 512,
+                    sink: 4096,
+                },
+                "the RDB is in 512-byte blocks but the sink writes 4096-byte blocks",
+            ),
+            (
+                CommitError::RdbAreaInvalid { lo: 9, hi: 4 },
+                "RDB area is empty or inverted: RDBBlocksLo 9 is above RDBBlocksHi 4",
+            ),
+            (
+                CommitError::RdskOutsideRdbArea {
+                    rdsk_block: 3,
+                    hi: 1,
+                },
+                "the RDSK block at 3 is above RDBBlocksHi 1, \
+                 outside the area this edit may write",
+            ),
+            (
+                CommitError::RdbAreaTooSmall {
+                    needed: 8,
+                    available: 7,
+                    lo: 0,
+                    hi: 6,
+                },
+                "the RDB area 0..=6 holds 7 blocks but the new layout needs 8; \
+                 growing RDBBlocksHi is not implemented yet",
+            ),
+            (
+                CommitError::OutsideRdbArea { lba: 99, hi: 15 },
+                "refusing to write block 99, which is outside the RDB area 0..=15",
+            ),
+        ];
+        for (e, expected) in commits {
+            assert_eq!(alloc::format!("{e}"), expected);
+        }
     }
 }
