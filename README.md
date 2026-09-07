@@ -5,16 +5,26 @@ permissively-licensed library: `RDSK`, `PART`, `FSHD`, `LSEG` and `BADB`
 blocks, their checksums, and the `DosEnvec` geometry that tells you where
 each partition lives and how to mount it.
 
-In: anything that can read fixed-size blocks (the `BlockSource` trait).
-The block size is the device's, reported at runtime — 512 is the classic
-value, but the format's 32-bit block fields cap such a disk at 2 TB, and
-4 KB-sector disks are in live use. Out: partitions as extents plus
-metadata, loadable filesystem drivers reassembled from their `LSEG`
-chains, bad-block lists, and `Rdb::validate()` — which reports blocks
-with two owners, the layout that parses fine and destroys itself on the
-first write. What's *inside* a partition is deliberately out of scope —
-one filesystem family per crate; a partition composes with a filesystem
-crate through a small adapter that offsets LBAs into the parent device.
+In: anything that can read fixed-size blocks (the `BlockSource` trait)
+and, for writing, anything that can accept them (`BlockSink`). The
+block size is the device's, reported at runtime — 512 is the classic
+value, but the format's 32-bit block fields cap such a disk at 2 TB,
+and 4 KB-sector disks are in live use. Out, reading: partitions as
+extents plus metadata, loadable filesystem drivers reassembled from
+their `LSEG` chains, bad-block lists, and `Rdb::validate()` — which
+reports blocks with two owners, the layout that parses fine and
+destroys itself on the first write. Out, writing: `RdbBuilder` creates
+a fresh RDB — the whole layout computed and validated before the first
+block lands, filesystem drivers shipped inside the image so a 3.1-era
+ROM can mount a dostype it never heard of — and `RdbEditor` mutates an
+existing one in place: add/delete/resize partitions, swap drivers,
+grow the reserved area, while preserving every byte it does not model,
+writing only inside the RDB area, and ordering writes so an
+interruption leaves the old table intact (the `RDSK` lands last).
+What's *inside* a partition is deliberately out of scope — one
+filesystem family per crate; a partition composes with a filesystem
+crate through a small adapter that offsets LBAs into the parent
+device.
 
 `no_std` + `alloc` at the core; the `std` feature (default) adds only
 conveniences. No dependencies. MSRV 1.63, tested in CI on that exact
@@ -22,9 +32,13 @@ toolchain; raising it is a semver-visible change, not an accident.
 
 ## Status
 
-Early: read side first, then create, then in-place editing. The read
-side is complete — everything the format can say is surfaced; nothing
-writes a byte yet. The API is not stable yet.
+Feature-complete against the plan: read, create and in-place editing
+all landed, each validated against independent implementations —
+amitools' `rdbtool` runs in CI reading this crate's images and vice
+versa, and AmiPart's host CLI agrees field-for-field on the same
+edits. The parser and editor are fuzzed. The API is not stable yet:
+pre-1.0, breaking changes arrive with a version bump and a changelog
+line, never silently.
 
 ## Why this exists
 
