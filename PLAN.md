@@ -179,9 +179,70 @@ The risky stage, gated on the differential suite existing first.
       the impl only, so a source whose error is `()` still parses. Under
       `std`, `source()` returns the wrapped error, so `?` into
       `Box<dyn Error>` works and the chain survives.
-- [ ] **Fuzzing**: `cargo-fuzz` target for `Rdb::parse` over arbitrary
+- [x] **Fuzzing**: `cargo-fuzz` target for `Rdb::parse` over arbitrary
       images — the parser already refuses cycles/bounds/checksums, and
       the fuzzer's job is to prove there is no panic path left.
+      `fuzz/fuzz_targets/parse.rs` parses the input as a disk image and,
+      when the parse *succeeds*, keeps going into everything else
+      attacker data reaches: `validate()`, `load_filesystem` for each
+      FSHD, `validate_seg_lists`, and a `PartitionSource` read at both
+      ends of every extent. Every `Result` is discarded on purpose — an
+      `Err` is the specified behaviour, so only a panic or a sanitizer
+      report counts.
+
+      **Input mapping.** The image sits at offset 0 and the *last* byte
+      is a block-size selector, `512 << (sel % 7)`, covering all seven
+      supported device block sizes. Image-first keeps libFuzzer's
+      mutations aligned to block boundaries (a leading selector would
+      slide the whole image sideways on every insert) and makes a crash
+      artifact a real disk image once the last byte is chopped off.
+      The selector matters because block size is a runtime property of
+      the source here and `rdb_BlockBytes` must agree with it, so
+      without steering it the 4 K/32 K paths would never be entered.
+      The in-memory source reports `block_count` and fails reads past
+      the end, so the off-disk refusals are exercised rather than
+      papered over with zero fill.
+
+      **Seeds are committed, the corpus is not.** Reaching a valid RDSK
+      by mutation means guessing a checksum, which coverage feedback
+      cannot steer; `fuzz/seeds/` holds two tiny (4 K and 32 K) images —
+      RDSK + PART + FSHD + LSEG + BADB, one 512-byte-block, one
+      4 K-block — so all four chains are live from the first run.
+      `fuzz/corpus`, `fuzz/artifacts` and `fuzz/target` are gitignored.
+
+      **How to run** (needs nightly and `cargo install cargo-fuzz`):
+
+      ```
+      cargo +nightly fuzz run parse fuzz/corpus/parse fuzz/seeds \
+          -- -max_total_time=60 -max_len=65536
+      ```
+
+      `-max_len` has to clear the 32 KB seed or libFuzzer truncates it
+      into something that no longer parses. `fuzz/` is its own workspace
+      root, so it never joins the parent build graph: `cargo test` and
+      `cargo clippy --all-targets` at the repo root neither see nor need
+      it. **CI does not run the fuzzer** — it needs nightly and a time
+      budget that does not belong on a per-push job. Fine for now; the
+      place for it is a scheduled job, when there is a reason.
+
+      **What it found, first minute:** `parse_part` computed the extent
+      as an unchecked `high_cyl - low_cyl + 1`, so an inverted cylinder
+      range panicked in a debug build and — the worse half — *wrapped*
+      in a release one, conjuring a partition claiming most of the
+      address space out of two plausible u32s. Fixed: an inverted range
+      is an empty extent (`block_len == 0`, which the overlap checks
+      already skip), reported by the new
+      `ValidationIssue::PartitionCylindersInverted` rather than refused,
+      since a recovery tool needs to see the damage. The two extent
+      multiplications saturate now as well — all three factors are
+      attacker-controlled u32s and their product need not fit a `u64`.
+      That saturation then exposed a second panic one layer out, which
+      is why the target reaches into `PartitionSource` at all:
+      `read_block` added `start_lba + lba` unchecked, so a saturated
+      extent made an *in-range* `lba` overflow the parent LBA. It
+      returns `OutOfRange` now — out of range is out of range whichever
+      end it falls off. All three cases have regression tests; several
+      million runs after the fixes, clean.
 - [x] **CI** (GitHub Actions): test on stable, `--no-default-features`
       build, clippy `-D warnings`, rustfmt, docs build (`RUSTDOCFLAGS=-D
       warnings`), MSRV. One workflow, `.github/workflows/ci.yml`, jobs

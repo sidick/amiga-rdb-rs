@@ -490,8 +490,17 @@ pub struct Partition {
     /// `pb_Flags` bit 1: present but not to be mounted automatically.
     pub no_automount: bool,
     /// First block of the partition, in disk device-block LBAs.
+    /// (`de_LowCyl * cylinder_blocks`, saturating: all three factors are
+    /// attacker-controlled u32s and their product need not fit a u64.)
     pub start_lba: u64,
-    /// Number of device blocks in the partition.
+    /// Number of device blocks in the partition:
+    /// `(high_cyl - low_cyl + 1) * cylinder_blocks`, saturating.
+    ///
+    /// **Zero when `high_cyl < low_cyl`** — an inverted cylinder range
+    /// describes no blocks, so that is its length, and
+    /// [`ValidationIssue::PartitionCylindersInverted`] is how a consumer
+    /// hears about it. The raw [`low_cyl`](Self::low_cyl) and
+    /// [`high_cyl`](Self::high_cyl) are still exactly what was on disk.
     pub block_len: u64,
     /// `de_DosType` — e.g. `0x444F5303` (`DOS\x03`).
     pub dos_type: u32,
@@ -849,6 +858,23 @@ pub enum ValidationIssue {
         /// Last block of that area, inclusive.
         hi: u64,
     },
+    /// A partition's `de_HighCyl` is below its `de_LowCyl`: the extent
+    /// runs backwards and so describes no blocks at all.
+    /// [`Partition::block_len`] is zero for such a partition, which
+    /// keeps it out of the overlap checks — this is the issue that says
+    /// why, and it is not the same as a legitimately empty partition
+    /// (there is no such thing: `de_HighCyl` is inclusive, so the
+    /// smallest honest partition is one cylinder).
+    PartitionCylindersInverted {
+        /// Index into [`Rdb::partitions`].
+        index: usize,
+        /// The partition's `pb_DriveName`, so a report can name it.
+        name: String,
+        /// `de_LowCyl` as it was read.
+        low_cyl: u32,
+        /// `de_HighCyl` as it was read — below `low_cyl`, which is the issue.
+        high_cyl: u32,
+    },
     /// Two partitions' extents intersect. Beyond the letter of the
     /// "overlap validation" plan item, but the same failure family and
     /// the same consequence — two filesystems mounting the same blocks,
@@ -893,6 +919,16 @@ impl core::fmt::Display for ValidationIssue {
                 "partition {index} ({name}) covers blocks {start_lba}..{} \
                  and overlaps the RDB area {lo}..={hi}",
                 start_lba.saturating_add(*block_len)
+            ),
+            ValidationIssue::PartitionCylindersInverted {
+                index,
+                name,
+                low_cyl,
+                high_cyl,
+            } => write!(
+                f,
+                "partition {index} ({name}) has an inverted cylinder range: \
+                 LowCyl {low_cyl} is above HighCyl {high_cyl}"
             ),
             ValidationIssue::PartitionsOverlap {
                 a,
@@ -1248,11 +1284,13 @@ impl Rdb {
     ///    lying outside `rdb_RDBBlocksLo..=rdb_RDBBlocksHi`;
     /// 2. every partition extent (`start_lba..start_lba + block_len`,
     ///    device blocks) overlapping that same area;
-    /// 3. every pair of partitions whose extents intersect.
+    /// 3. every partition whose `de_HighCyl` is below its `de_LowCyl`;
+    /// 4. every pair of partitions whose extents intersect.
     ///
-    /// Check 3 goes beyond the RDB-versus-partition case, but it is the
+    /// Check 4 goes beyond the RDB-versus-partition case, but it is the
     /// same failure — two owners, both writing — and costs one pass over
-    /// the partition pairs.
+    /// the partition pairs. Checks 3 and 4 never consult the RDB area,
+    /// so they run even when it is unusable.
     ///
     /// `LSEG` blocks are *not* covered here: they are lazy by design (a
     /// driver binary is hundreds of kilobytes and their LBAs are never
@@ -1304,6 +1342,21 @@ impl Rdb {
                         hi,
                     });
                 }
+            }
+        }
+
+        // Inverted cylinder ranges, which need no RDB area either — and
+        // which run first of the area-independent checks because an
+        // inverted extent is *why* a partition is missing from the
+        // overlap results below.
+        for (index, p) in self.partitions.iter().enumerate() {
+            if p.high_cyl < p.low_cyl {
+                issues.push(ValidationIssue::PartitionCylindersInverted {
+                    index,
+                    name: p.name.clone(),
+                    low_cyl: p.low_cyl,
+                    high_cyl: p.high_cyl,
+                });
             }
         }
 
@@ -1496,18 +1549,37 @@ fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
 
     let surfaces = envec(de::SURFACES) as u64;
     let blocks_per_track = envec(de::BLOCKS_PER_TRACK) as u64;
+    // Two u32s widened first, so this product alone cannot exceed u64.
+    // Everything downstream multiplies it by a *third* u32 and so can,
+    // which is why the extent arithmetic below saturates.
     let cylinder_blocks = surfaces * blocks_per_track;
     let low_cyl = envec(de::LOW_CYL);
     let high_cyl = envec(de::HIGH_CYL);
     let flags = be32(buf, part::FLAGS);
+
+    // `de_HighCyl` is inclusive, so the span is `high - low + 1` — but
+    // nothing on disk makes `high >= low` true, and an inverted pair is
+    // exactly what a corrupt (or hostile) PART block carries. Zero is
+    // the honest length: an inverted range contains no blocks, and a
+    // zero-length extent is already excluded from every overlap check.
+    // The inversion itself is reported by
+    // [`Rdb::validate`](Rdb::validate), where layout nonsense belongs —
+    // refusing the parse would deny a recovery tool the only view of
+    // the damage. Found by the fuzzer: subtracting unchecked panicked
+    // in a debug build and, worse, wrapped in a release one, conjuring
+    // a multi-exabyte partition out of two plausible u32s.
+    let block_len = match high_cyl.checked_sub(low_cyl) {
+        Some(span) => (span as u64 + 1).saturating_mul(cylinder_blocks),
+        None => 0,
+    };
 
     Ok(Partition {
         part_block: lba,
         name,
         bootable: flags & 1 != 0,
         no_automount: flags & 2 != 0,
-        start_lba: low_cyl as u64 * cylinder_blocks,
-        block_len: (high_cyl as u64 - low_cyl as u64 + 1) * cylinder_blocks,
+        start_lba: (low_cyl as u64).saturating_mul(cylinder_blocks),
+        block_len,
         dos_type: envec(de::DOS_TYPE),
         boot_pri: envec(de::BOOT_PRI) as i32,
         max_transfer: envec(de::MAX_TRANSFER),
@@ -1596,14 +1668,22 @@ impl<'a, S: BlockSource> BlockSource for PartitionSource<'a, S> {
     }
 
     fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
-        if lba >= self.block_len {
-            return Err(PartitionSourceError::OutOfRange {
-                lba,
-                len: self.block_len,
-            });
-        }
+        // The second half of the guard is not paranoia about the
+        // caller: a `Partition` parsed from a hostile PART block can
+        // carry a saturated `start_lba` and `block_len`, and then an
+        // in-range `lba` still runs off the end of the *address space*.
+        // Out of range is out of range whichever end it falls off.
+        let parent_lba = match self.start_lba.checked_add(lba) {
+            Some(l) if lba < self.block_len => l,
+            _ => {
+                return Err(PartitionSourceError::OutOfRange {
+                    lba,
+                    len: self.block_len,
+                })
+            }
+        };
         self.parent
-            .read_block(self.start_lba + lba, buf)
+            .read_block(parent_lba, buf)
             .map_err(PartitionSourceError::Parent)
     }
 
@@ -2518,6 +2598,78 @@ mod tests {
         assert_eq!(
             alloc::format!("{}", issues[0]),
             "partitions 0 (DH0) and 1 (DH1) both claim blocks 128..160"
+        );
+    }
+
+    /// An inverted `de_LowCyl`/`de_HighCyl` pair. Found by the fuzzer:
+    /// the span used to be computed as an unchecked `high - low + 1`,
+    /// which panicked in a debug build and — far worse — wrapped in a
+    /// release one, turning a backwards range into a partition claiming
+    /// most of the address space. The parse still succeeds (a recovery
+    /// tool needs to see the damage), the extent is empty, and
+    /// validation names it.
+    #[test]
+    fn inverted_cylinder_range_is_an_empty_extent_not_an_overflow() {
+        let mut d = one_partition_image(2);
+        put32(&mut d, 512, 3, part::ENVIRONMENT + de::LOW_CYL * 4, 9);
+        put32(&mut d, 512, 3, part::ENVIRONMENT + de::HIGH_CYL * 4, 2);
+        seal(&mut d, 512, 3, 64);
+
+        let mut disk = MemDisk::new(d);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = &rdb.partitions[0];
+        assert_eq!((p.low_cyl, p.high_cyl), (9, 2));
+        assert_eq!(p.block_len, 0);
+        // Zero-length, so it cannot collide with anything: the only
+        // issue is the inversion itself.
+        let issues = rdb.validate();
+        assert_eq!(
+            issues,
+            vec![ValidationIssue::PartitionCylindersInverted {
+                index: 0,
+                name: String::from("DH0"),
+                low_cyl: 9,
+                high_cyl: 2,
+            }]
+        );
+        assert_eq!(
+            alloc::format!("{}", issues[0]),
+            "partition 0 (DH0) has an inverted cylinder range: LowCyl 9 is above HighCyl 2"
+        );
+    }
+
+    /// The other half of the same arithmetic: a plausible-looking
+    /// geometry whose cylinder product times `de_LowCyl` does not fit a
+    /// `u64`. Saturating is the only answer that is not a lie; what
+    /// matters is that it does not panic or wrap.
+    #[test]
+    fn absurd_geometry_saturates_rather_than_overflowing() {
+        let mut d = one_partition_image(2);
+        let env = |i: usize| part::ENVIRONMENT + i * 4;
+        put32(&mut d, 512, 3, env(de::SURFACES), u32::MAX);
+        put32(&mut d, 512, 3, env(de::BLOCKS_PER_TRACK), u32::MAX);
+        put32(&mut d, 512, 3, env(de::LOW_CYL), u32::MAX - 1);
+        put32(&mut d, 512, 3, env(de::HIGH_CYL), u32::MAX);
+        seal(&mut d, 512, 3, 64);
+
+        let mut disk = MemDisk::new(d);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = &rdb.partitions[0];
+        assert_eq!(p.start_lba, u64::MAX);
+        assert_eq!(p.block_len, u64::MAX);
+
+        // And the adapter over that extent refuses rather than
+        // overflowing the parent LBA: `block_len` says block 1 is in
+        // range, but `start_lba + 1` does not exist.
+        let mut parent = MemDisk::new(vec![0u8; 512]);
+        let mut view = PartitionSource::new(&mut parent, p);
+        let mut block = vec![0u8; 512];
+        assert_eq!(
+            view.read_block(1, &mut block),
+            Err(PartitionSourceError::OutOfRange {
+                lba: 1,
+                len: u64::MAX
+            })
         );
     }
 
