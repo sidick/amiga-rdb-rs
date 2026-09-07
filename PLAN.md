@@ -133,6 +133,12 @@ want.
 
 The risky stage, gated on the differential suite existing first.
 
+- [ ] **AmiPart survey first**: before designing the edit API, read
+      AmiPart (MIT, so readable closely — unlike xdftool, which stays a
+      run-only GPL oracle) to enumerate the operation set and its edge
+      cases: what happens to `rdb_HighRDSKBlock` on delete, how resize
+      rounds to cylinder boundaries, what it does with holes in the RDB
+      area. The API is shaped by real usage before the first line lands.
 - [ ] **Edit existing structures**: add/delete a partition, change
       flags/bootpri/name, grow/shrink where cylinder math allows.
       AmiPart (MIT) is the readable reference for the operations users
@@ -159,6 +165,11 @@ The risky stage, gated on the differential suite existing first.
       leaves the *old* chain intact (write new blocks first, flip the
       chain pointer last). The format has no journal; ordering is all
       there is.
+- [ ] **AmiPart as second differential oracle**: once mutation lands,
+      apply the same edit in both tools and diff the resulting images
+      block-by-block — a second independent implementation alongside
+      the xdftool round-trip diff from milestone 2, and one whose
+      source can legally be consulted when the diff disagrees.
 
 ## Cross-cutting
 
