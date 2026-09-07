@@ -1,6 +1,6 @@
 [package]
 name = "amiga-rdb"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Conservative floor: nothing here needs anything newer, and old toolchains
 # are common in retrocomputing/distro packaging. Tested in CI on this exact
