@@ -435,7 +435,7 @@ The risky stage, gated on the differential suite existing first.
       write regenerates the whole area contiguously), crash shape (the
       RDSK is written *first*), the invariants it keeps and drops, and a
       recommended operation set. The four items it turned up are below.
-- [ ] **Edit existing structures**: add/delete a partition, change
+- [x] **Edit existing structures**: add/delete a partition, change
       flags/bootpri/name, grow/shrink where cylinder math allows.
       AmiPart (MIT) is the readable reference for the operations users
       actually perform, resize edge cases included.
@@ -450,9 +450,95 @@ The risky stage, gated on the differential suite existing first.
       `set_num_buffers`, `set_buf_mem_type`, `set_max_transfer`,
       `set_mask`, `set_baud`, `set_control`, `set_boot_blocks`) and the
       disk-level `set_disk_identity` / `set_controller_identity` /
-      `set_rdb_flags`. **Add, delete and resize are still to come**, and
-      with them `Placement`-shaped `add_partition`, the filesystem
-      operations, and `set_bad_blocks`.
+      `set_rdb_flags`.
+
+      **Second half landed: the structural edits.** `add_partition`
+      (returning the new index), `remove_partition`, `set_extent` /
+      `resize_partition`, `add_filesystem` / `remove_filesystem` /
+      `replace_filesystem` / `partitions_using_filesystem`, and
+      `set_bad_blocks` / `remove_bad_blocks` — the whole of survey
+      §7.2's operation set bar the disk-level
+      `set_geometry_cylinders` and the area levers, which are their own
+      items below.
+
+      **`PartitionSpec`/`FileSystemSpec` are reused verbatim**, so
+      creating a partition and adding one are described the same way and
+      *written by the same code*: `fill_part_fields`, `fill_fshd_fields`
+      and `fill_lseg_fields` are now free functions that the builder
+      seals immediately and the editor leaves to `prepare`'s reseal. A
+      created `DH0` and an added one are the same bytes because there is
+      one function, not because two were kept in step. Name assignment
+      follows the builder's rule — the first `DH`*n* no existing
+      partition carries, explicit names never renamed, collisions
+      refused.
+
+      **Gap placement policy: first fit, lowest free cylinder upward.**
+      `Placement::Size` scans the gaps between the existing extents
+      (starting at `rdb_LoCylinder`, or the cylinder after
+      `rdb_RDBBlocksHi` when the `RDSK` understates its own area) and
+      takes the first run long enough; the cylinder count is floored, as
+      on create. Best fit was considered and rejected: it keeps large
+      runs intact, but it makes where a partition lands depend on
+      partitions the caller was not thinking about, and on a disk with
+      single-digit partitions there is nothing to optimise. First fit is
+      deterministic, explains itself to a user ("it went in the first
+      hole big enough"), reproduces `rdbtool`'s and AmiPart's
+      pack-after-the-last behaviour on the usual hole-free layout, and
+      fills a hole a delete left rather than growing the used tail —
+      which is the point of having a policy at all.
+      `EditError::NoRoomForPartition` names the largest gap there was;
+      a caller who wants a different answer says `Placement::Cylinders`,
+      which is why the pair exists.
+
+      **Delete does not erase the partition.** Removing the table entry
+      unchains one `PART` block and nothing else — every byte between
+      `de_LowCyl` and `de_HighCyl` stays where it was, and re-adding the
+      same extent gets the filesystem back. Documented loudly and tested
+      by stamping the extent and comparing after. The *block* is zeroed;
+      the contents are not ours to touch.
+
+      **Resize is a table-entry edit, and says so.** `set_extent` and
+      `resize_partition` refuse an inverted range, one past the disk's
+      last cylinder (the lower of `rdb_HiCylinder` and `rdb_Cylinders -
+      1`, which real images disagree about), one reaching into the RDB
+      area, and one overlapping another partition — so no edit can
+      produce a layout `validate()` would complain about. The docs state
+      three destructive facts rather than implying them: shrinking
+      destroys the filesystem inside, growing does not grow it, and
+      moving `de_LowCyl` relocates every filesystem block relative to
+      the partition start.
+
+      **Filesystems: no silent dedupe, and no silent dostype rewrite.**
+      `add_filesystem` appends whatever it is given — two `FSHD`s for one
+      dostype is a layout the format permits and a caller may want — and
+      `replace_filesystem` is the explicit operation AmiPart's `ADDFS`
+      documents and does not perform. `remove_filesystem` **returns the
+      indices of the partitions whose `de_DosType` matched the removed
+      driver** (and `partitions_using_filesystem` asks the same question
+      without removing anything); their dostype is left exactly as it
+      was. AmiPart rewrites them to `DOS\0` (§1a), which silently
+      changes which handler mounts a partition that may be perfectly
+      happy with a ROM filesystem of the same dostype. **Reporting
+      shape: indices into `partitions()`**, not names — indices are what
+      every other editor method takes, so the answer feeds straight back
+      into `set_dos_type` or `remove_partition`.
+
+      **`set_bad_blocks` landed rather than being deferred** — it fell
+      out of the raw-block model in a dozen lines. Entries are repacked
+      into as many `BADB` blocks as they need (`(block_size - 24) / 8`
+      each) with each block's `SummedLongs` the header plus *its own*
+      entries, which is what makes the count readable back; which entry
+      sat in which block carries no information and is not preserved,
+      exactly as the read side already says. `remove_bad_blocks` empties
+      the chain and zeroes what it used. Being the tool that can rewrite
+      a list rather than drop it is the differentiator §7.2 named:
+      AmiPart zeroes `rdb_BadBlockList` on every write, orphaning the
+      blocks its own bad-block dialog appended (§4).
+
+      **A structure added by the editor has no LBA until the commit**,
+      and reads the new public `UNPLACED_BLOCK` (`u64::MAX`, which
+      truncates to `CHAIN_END` in the u32 fields — the format's own "no
+      block") until then. `CommitReport` is the answer to where it went.
 
       **`de_TableSize` grows, never shrinks.** The last three envec
       setters extend it when the envec stops short of their field, and
@@ -512,7 +598,7 @@ The risky stage, gated on the differential suite existing first.
       an `FSHD` patch mask with a bit above `GlobalVec`, an `LSEG` whose
       `SummedLongs` stops short of its own payload, and bytes outside
       the `RDSK`'s checksum entirely.
-- [ ] **Zero what we stop using**, inside the RDB area only: a `PART`
+- [x] **Zero what we stop using**, inside the RDB area only: a `PART`
       block orphaned by a delete, the tail of the area a shorter layout
       no longer covers, and a stale `RDSK` left behind when the block it
       was found at is not `rdb_RDBBlocksLo`. AmiPart leaves all three on
@@ -521,32 +607,68 @@ The risky stage, gated on the differential suite existing first.
       the area keeps its declared size, and what is inside it is exactly
       what the chains say.
 
-      **Written, but not yet reachable — so not ticked.** `commit`
-      computes the blocks the old layout used and the new one does not,
-      and zeroes them after the `RDSK` has landed, inside the area only
-      (a vacated block *outside* it belongs to whoever owns that space
-      now; the never-touch guarantee outranks tidiness, and
+      **Reachable now, and tested end to end.** `commit` computes the
+      blocks the old layout used and the new one does not, and zeroes
+      them after the `RDSK` has landed, inside the area only (a vacated
+      block *outside* it belongs to whoever owns that space now; the
+      never-touch guarantee outranks tidiness, and
       `commit_relocates_a_chain_block_from_outside_the_area` asserts
-      those blocks are left exactly as they were). But with only
-      metadata edits available, no commit ever changes the *number* of
-      structures, and the minimal-motion placement below never moves a
-      structure that is already inside the area — so nothing is ever
-      vacated and the zeroing path has no end-to-end test yet. It gets
-      one with delete, which is the operation that creates the case.
+      those blocks are left exactly as they were).
+
+      **The set is computed from the layout `open` read, not from the
+      structures that survive the edits** — which is what makes a
+      *delete* reach it at all: the block a removed `PART` sat on is
+      gone from every list in the editor, and that record is the only
+      thing that remembers it was ever ours. `remove_partition`,
+      `remove_filesystem` (`FSHD` *and* every block of its `LSEG` chain)
+      and `remove_bad_blocks` all land here, each with a test asserting
+      every vacated block reads back as 512 zero bytes and that the
+      zeroing write comes *after* the `RDSK` in `blocks_written`.
+
+      **Zeroing semantics, stated once:** a vacated block inside the
+      area is overwritten with zeros; a vacated block outside it is not
+      touched at all; a block that is vacated and *reallocated* in the
+      same commit is written with its new contents and not zeroed; and
+      nothing outside `rdb_RDBBlocksLo..=Hi` is ever zeroed no matter
+      what the old layout used it for. `rdb_RDBBlocksHi` is still never
+      shrunk, so the area keeps its declared size and what is inside it
+      is exactly what the chains say.
       The stale-`RDSK` case does not arise from us at all: the editor
       never moves the `RDSK` (see the crash-shape item), so it cannot
       leave a second one behind.
-- [ ] **Free-block management** inside the RDB area: reuse holes left
+- [x] **Free-block management** inside the RDB area: reuse holes left
       by deleted PART/FSHD/LSEG blocks before extending toward
       `rdb_HighRDSKBlock`.
 
-      **The allocator exists; the case that needs it does not yet.**
-      `RdbEditor::plan` allocates any structure that has nowhere to go
-      the lowest block the current layout does not occupy, which is hole
-      reuse — but the only structure that needs allocating today is one
-      found *outside* the area, since nothing adds or deletes. Ticked
-      with the add/delete chunk, where it is exercised rather than
-      merely present.
+      **Satisfied by design: minimal motion over a contiguous-repack-free
+      model.** There is no allocator state, no bitmap and no compaction
+      pass, because there is nothing to compact — a structure already
+      inside the area keeps its block, and one that has nowhere to go
+      takes a block the layout does not occupy. Holes *are* the free
+      list: the layout is what the chains say, and every block of the
+      area they do not name is available. This is the exact opposite of
+      AmiPart, which needs no free-block management because every write
+      regenerates the whole area contiguously (§4) — and which therefore
+      cannot leave a hole, cannot keep a chain order, and rewrites every
+      block on every edit.
+
+      **Two tiers, and the order is the crash shape.** First choice is
+      the lowest block *neither* the old nor the new layout uses — a hole
+      an earlier edit left, or headroom below `rdb_RDBBlocksHi` — so the
+      old chains stay walkable right up to the `RDSK` flip and the swap
+      is genuinely atomic (§7.4's option (b), and another reason never to
+      shrink the ceiling). Only when the area has no such block left does
+      it fall back to a block the old layout is *vacating* in this same
+      commit: still correct, since the new `RDSK` publishes the new
+      chains and the zeroing pass runs after it, but from the moment that
+      block is overwritten the old table can no longer be walked past it.
+      That is the honest cost of a full area; the alternative would be
+      refusing an edit the format allows.
+
+      **Proved by `a_block_freed_by_a_delete_is_reused_by_a_later_add`**:
+      delete, commit (the block is zeroed), add, commit — and the new
+      `PART` lands on exactly the block the delete freed, with no growth
+      and no repack.
 - [x] **Never-touch guarantee**: mutation writes only inside
       `rdb_RDBBlocksLo..=Hi`, asserted in code, not just documented —
       partition contents are provably out of reach. This is precisely
@@ -566,10 +688,33 @@ The risky stage, gated on the differential suite existing first.
       `commit_writes_only_inside_the_rdb_area` tracks every LBA a commit
       asks for and compares both partitions' extents byte for byte
       afterwards.
-- [ ] **Refuse-over-overlap**: an edit whose blocks don't fit the
+- [x] **Refuse-over-overlap**: an edit whose blocks don't fit the
       existing RDB area fails with an error naming the shortfall — the
       overlap outcome does not exist as a behaviour — and unlike a
       tool with history, there is no legacy write-anyway path to keep.
+
+      **Two halves, both landed.** The *blocks* half is
+      `CommitError::RdbAreaTooSmall`, which names `needed`, `available`
+      and the area, is raised by `plan()` (no sink in scope, so a refused
+      commit provably writes nothing), and says in as many words that
+      growing `rdb_RDBBlocksHi` is not implemented yet — the next item.
+      The *extents* half is new with the structural edits:
+      `add_partition`, `set_extent` and `resize_partition` refuse
+      `EditError::CylindersInverted`, `PastEndOfDisk`, `OverlapsRdbArea`
+      and `PartitionsOverlap` before touching the editor's own blocks,
+      using the same block arithmetic `validate()` reports with — so an
+      edit cannot produce a layout the parser would then complain about,
+      and there is no `ENFORCESIZE`-style opt-out or silent clamp
+      (AmiPart clamps a too-large `HIGH` by default, §2). Every refusal
+      has a test asserting the sink, or the editor, is untouched.
+- [ ] **`set_geometry_cylinders(n)`** — AmiPart's `INIT NEWGEO`, the
+      disk-got-bigger case: keep `rdb_Heads`/`rdb_Sectors` and
+      `rdb_LoCylinder`, raise `rdb_Cylinders`/`rdb_HiCylinder`. Named in
+      survey §7.2 and *not* in the structural-edit chunk that landed —
+      recorded here so the plan stays the map. It pairs with the area
+      items below (both are disk-level rewrites of the `RDSK` alone) and
+      needs the same predicate in reverse: shrinking the geometry under
+      an existing partition is the refusal case.
 - [ ] **Expand the RDB area**: grow `rdb_RDBBlocksHi` (and
       `rdb_HighRDSKBlock`) when — and only when — validation proves the
       blocks being claimed are not inside any partition's extent. The
