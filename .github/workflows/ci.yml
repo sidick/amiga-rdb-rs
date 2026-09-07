@@ -99,12 +99,6 @@ jobs:
       # cargo-fuzz needs nightly: the sanitizer flags and the
       # libfuzzer-sys glue are nightly-only.
       - uses: dtolnay/rust-toolchain@nightly
-        with:
-          # cargo-fuzz's default Linux target is musl (a static,
-          # sanitizer-friendly libc) — nightly does not ship it by
-          # default, and without it the build fails before the fuzzer
-          # ever runs.
-          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
@@ -123,9 +117,15 @@ jobs:
       # The corpus directory has to exist before it can be named; new
       # inputs accumulate in it for the length of the job and are then
       # thrown away with the runner.
+      # `--target x86_64-unknown-linux-gnu`: cargo-fuzz's own default on
+      # Linux is the musl triple (a statically-linked libc), and ASan
+      # refuses to link against one at all ("sanitizer is incompatible
+      # with statically linked libc"). glibc is what the runner already
+      # has, so this is the target that actually builds.
       - run: |
           mkdir -p fuzz/corpus/parse
-          cargo fuzz run parse fuzz/corpus/parse fuzz/seeds \
+          cargo fuzz run --target x86_64-unknown-linux-gnu parse \
+            fuzz/corpus/parse fuzz/seeds \
             -- -max_total_time=60 -max_len=65536
 
   differential:
