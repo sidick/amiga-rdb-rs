@@ -58,7 +58,7 @@ Everything the format can say, surfaced. Nothing here writes a byte.
       every LBA in the public API (all of which must be documented as
       *device* blocks of the source's size), so it lands before the
       API attracts consumers, not after.
-- [ ] **Partition `SizeBlock` ≠ 128**: filesystem blocks larger than
+- [x] **Partition `SizeBlock` ≠ 128**: filesystem blocks larger than
       the device block are not just legal but in live use — FFS with
       32 KB blocks on 2 TB partitions is a working real-world setup.
       `Partition` already records it; extent math and `PartitionSource`
@@ -71,10 +71,19 @@ Everything the format can say, surfaced. Nothing here writes a byte.
       partition side by side. A synthetic mixed-`SizeBlock` fixture
       goes in the test suite so nothing ever assumes one value per
       disk.)
-- [ ] **Overlap validation** (`Rdb::validate()` or similar): report (a)
+- [x] **Overlap validation** (`Rdb::validate()`): reports (a)
       any chained block — PART, FSHD, LSEG, BADB — lying outside
       `rdb_RDBBlocksLo..=Hi`, and (b) any partition extent overlapping
-      the RDB area. Both are real: partitioning tools have been known
+      the RDB area. Landed with (c) partitions overlapping *each other*
+      as well — beyond the original item, but the same failure family,
+      the same consequence, and one extra pass over the partition pairs.
+      Shape: `Rdb::validate() -> Vec<ValidationIssue>` for the three
+      eagerly parsed chains and the extents;
+      `Rdb::validate_seg_lists(&mut S)` for LSEG, which is lazy by
+      design and so needs the disk back. An inverted `Lo > Hi` area is
+      itself an issue, reported once, and suppresses the two checks that
+      would otherwise compare against a meaningless range.
+      Both are real: partitioning tools have been known
       to write RDB structures past the reserved area into the first
       partition when the area was too small — after which each side
       trashes the other, both believing they own the same blocks — so

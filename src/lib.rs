@@ -508,6 +508,163 @@ pub struct Rdb {
     /// rewrite repacks them anyway. The chain head survives in
     /// [`bad_block_list`](Self::bad_block_list) for round-tripping.
     pub bad_blocks: Vec<BadBlockEntry>,
+    /// LBAs of the `BADB` blocks the parse visited, in chain order.
+    ///
+    /// [`bad_blocks`](Self::bad_blocks) deliberately forgets which block
+    /// each entry came from, but [`validate`](Self::validate) has to know
+    /// *where the blocks were* to say whether the chain strayed outside
+    /// the RDB area — and unlike `PART` and `FSHD`, whose LBAs ride along
+    /// on [`Partition::part_block`] and [`FileSysHeader::fshd_block`],
+    /// a `BADB` block has no per-block struct to carry it. Hence a list
+    /// here rather than a field that does not exist anywhere else.
+    pub badb_blocks: Vec<u64>,
+}
+
+/// Which kind of RDB structure a [`ValidationIssue`] is about.
+///
+/// Only the four chained block types appear: the `RDSK` block is not
+/// part of any chain and its legal location is bounded by
+/// [`RDB_LOCATION_LIMIT`], not by `rdb_RDBBlocksLo..=Hi`, so an `RDSK`
+/// outside the RDB area is normal rather than an issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    /// A `PART` partition block.
+    Part,
+    /// A `FSHD` filesystem-header block.
+    Fshd,
+    /// A `LSEG` filesystem-driver payload block.
+    Lseg,
+    /// A `BADB` bad-block-list block.
+    Badb,
+}
+
+impl core::fmt::Display for BlockKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            BlockKind::Part => "PART",
+            BlockKind::Fshd => "FSHD",
+            BlockKind::Lseg => "LSEG",
+            BlockKind::Badb => "BADB",
+        })
+    }
+}
+
+/// One way an RDB's *layout* is self-destructive, as reported by
+/// [`Rdb::validate`].
+///
+/// Not an error: every one of these describes an image that parses
+/// perfectly and reads back exactly what is on it. They describe two
+/// owners of the same blocks — an RDB structure sitting where a
+/// filesystem believes it owns the space, or two partitions claiming the
+/// same extent — which is a live grenade rather than a parse failure.
+/// Partitioning tools have written RDB blocks past a too-small reserved
+/// area into the first partition; the image is readable right up until
+/// either side writes, after which both are wrong. A recovery tool needs
+/// the data, so the parser hands it over; this type is how a consumer
+/// learns not to *write*.
+///
+/// All block quantities are *device* blocks, like everything else in
+/// this crate's API. The [`Display`](core::fmt::Display) impl renders a
+/// single line fit to show a user; it is available in `no_std` because
+/// it is `core::fmt`, unlike the error types, which are still waiting on
+/// the cross-cutting error work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationIssue {
+    /// `rdb_RDBBlocksLo` is above `rdb_RDBBlocksHi`: the reserved area is
+    /// empty or inverted, so *nothing* can be said about what lies
+    /// inside it. Reported once, and the checks that depend on the area
+    /// ([`BlockOutsideRdbArea`](Self::BlockOutsideRdbArea),
+    /// [`PartitionOverlapsRdbArea`](Self::PartitionOverlapsRdbArea)) are
+    /// skipped rather than producing an issue per block against a range
+    /// that means nothing. Partition-versus-partition checking is
+    /// unaffected — it never consults the area.
+    RdbAreaInvalid {
+        /// `rdb_RDBBlocksLo` and `rdb_RDBBlocksHi` as they were read.
+        lo: u32,
+        hi: u32,
+    },
+    /// A chained block sits outside `rdb_RDBBlocksLo..=rdb_RDBBlocksHi` —
+    /// i.e. in space the RDB itself says is not reserved, and which a
+    /// partition or a repartitioner is therefore entitled to reuse.
+    BlockOutsideRdbArea {
+        /// Which chain the block belongs to.
+        kind: BlockKind,
+        /// Where it actually is.
+        lba: u64,
+        /// The reserved area it should have been inside, inclusive.
+        lo: u64,
+        hi: u64,
+    },
+    /// A partition's extent covers part of the RDB area: the filesystem
+    /// and the partition table own the same blocks. The classic
+    /// damaged-by-construction image.
+    PartitionOverlapsRdbArea {
+        /// Index into [`Rdb::partitions`].
+        index: usize,
+        /// The partition's `pb_DriveName`, so a report can name it.
+        name: String,
+        /// The partition's extent, `start_lba..start_lba + block_len`.
+        start_lba: u64,
+        block_len: u64,
+        /// The reserved area it collides with, inclusive.
+        lo: u64,
+        hi: u64,
+    },
+    /// Two partitions' extents intersect. Beyond the letter of the
+    /// "overlap validation" plan item, but the same failure family and
+    /// the same consequence — two filesystems mounting the same blocks,
+    /// each destroying the other — for one extra comparison.
+    PartitionsOverlap {
+        /// Indices into [`Rdb::partitions`], `a` always the lower.
+        a: usize,
+        b: usize,
+        /// Their `pb_DriveName`s.
+        a_name: String,
+        b_name: String,
+        /// The blocks both claim: `start..start + len`.
+        start: u64,
+        len: u64,
+    },
+}
+
+impl core::fmt::Display for ValidationIssue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ValidationIssue::RdbAreaInvalid { lo, hi } => write!(
+                f,
+                "RDB area is empty or inverted: RDBBlocksLo {lo} is above RDBBlocksHi {hi}"
+            ),
+            ValidationIssue::BlockOutsideRdbArea { kind, lba, lo, hi } => write!(
+                f,
+                "{kind} block at {lba} lies outside the RDB area {lo}..={hi}"
+            ),
+            ValidationIssue::PartitionOverlapsRdbArea {
+                index,
+                name,
+                start_lba,
+                block_len,
+                lo,
+                hi,
+            } => write!(
+                f,
+                "partition {index} ({name}) covers blocks {start_lba}..{} \
+                 and overlaps the RDB area {lo}..={hi}",
+                start_lba.saturating_add(*block_len)
+            ),
+            ValidationIssue::PartitionsOverlap {
+                a,
+                b,
+                a_name,
+                b_name,
+                start,
+                len,
+            } => write!(
+                f,
+                "partitions {a} ({a_name}) and {b} ({b_name}) both claim blocks {start}..{}",
+                start.saturating_add(*len)
+            ),
+        }
+    }
 }
 
 /// Byte offsets into a `RDSK` block (NDK `RigidDiskBlock`).
@@ -750,6 +907,7 @@ impl Rdb {
             partitions: Vec::new(),
             filesystems: Vec::new(),
             bad_blocks: Vec::new(),
+            badb_blocks: Vec::new(),
         };
         let partition_list = be32(&buf, rdsk::PARTITION_LIST);
 
@@ -774,11 +932,14 @@ impl Rdb {
         rdb.filesystems = filesystems;
 
         let mut bad_blocks = Vec::new();
-        walk_chain(disk, rdb.bad_block_list, id::BADB, &mut buf, |b, _lba| {
+        let mut badb_blocks = Vec::new();
+        walk_chain(disk, rdb.bad_block_list, id::BADB, &mut buf, |b, lba| {
+            badb_blocks.push(lba);
             parse_badb(b, &mut bad_blocks);
             Ok(())
         })?;
         rdb.bad_blocks = bad_blocks;
+        rdb.badb_blocks = badb_blocks;
 
         Ok(rdb)
     }
@@ -826,6 +987,156 @@ impl Rdb {
             Ok(())
         })?;
         Ok(out)
+    }
+
+    /// Check the *layout* for blocks with two owners.
+    ///
+    /// Separate from [`parse`](Self::parse) on purpose, and returning a
+    /// list rather than an error: an image whose RDB structures have
+    /// spilled into a partition still parses, still reads back exactly
+    /// what is on it, and a recovery tool needs precisely that. Refusing
+    /// to parse it would destroy the only path to the data. What a
+    /// consumer needs to know before *writing* is a different question,
+    /// and this is where it is answered.
+    ///
+    /// Reports, in a stable order:
+    ///
+    /// 1. every chained block the parse visited — `PART`, `FSHD`, `BADB` —
+    ///    lying outside `rdb_RDBBlocksLo..=rdb_RDBBlocksHi`;
+    /// 2. every partition extent (`start_lba..start_lba + block_len`,
+    ///    device blocks) overlapping that same area;
+    /// 3. every pair of partitions whose extents intersect.
+    ///
+    /// Check 3 goes beyond the RDB-versus-partition case, but it is the
+    /// same failure — two owners, both writing — and costs one pass over
+    /// the partition pairs.
+    ///
+    /// `LSEG` blocks are *not* covered here: they are lazy by design (a
+    /// driver binary is hundreds of kilobytes and their LBAs are never
+    /// held in memory), so checking them needs the disk back.
+    /// [`validate_seg_lists`](Self::validate_seg_lists) does that, and a
+    /// consumer that cares about the whole layout runs both.
+    ///
+    /// An empty result means the layout is self-consistent. It does not
+    /// mean the image is undamaged — checksums and chain discipline are
+    /// [`parse`](Self::parse)'s business, and passed already.
+    pub fn validate(&self) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+
+        if self.rdb_blocks_lo > self.rdb_blocks_hi {
+            issues.push(ValidationIssue::RdbAreaInvalid {
+                lo: self.rdb_blocks_lo,
+                hi: self.rdb_blocks_hi,
+            });
+        } else {
+            let lo = self.rdb_blocks_lo as u64;
+            let hi = self.rdb_blocks_hi as u64;
+
+            let outside = |kind: BlockKind, lba: u64, issues: &mut Vec<ValidationIssue>| {
+                if lba < lo || lba > hi {
+                    issues.push(ValidationIssue::BlockOutsideRdbArea { kind, lba, lo, hi });
+                }
+            };
+            for p in &self.partitions {
+                outside(BlockKind::Part, p.part_block, &mut issues);
+            }
+            for f in &self.filesystems {
+                outside(BlockKind::Fshd, f.fshd_block, &mut issues);
+            }
+            for &lba in &self.badb_blocks {
+                outside(BlockKind::Badb, lba, &mut issues);
+            }
+
+            for (index, p) in self.partitions.iter().enumerate() {
+                if p.block_len != 0
+                    && p.start_lba <= hi
+                    && p.start_lba.saturating_add(p.block_len) > lo
+                {
+                    issues.push(ValidationIssue::PartitionOverlapsRdbArea {
+                        index,
+                        name: p.name.clone(),
+                        start_lba: p.start_lba,
+                        block_len: p.block_len,
+                        lo,
+                        hi,
+                    });
+                }
+            }
+        }
+
+        // Partition-versus-partition, which needs no RDB area and so
+        // runs even when the area is unusable.
+        for a in 0..self.partitions.len() {
+            for b in a + 1..self.partitions.len() {
+                let (pa, pb) = (&self.partitions[a], &self.partitions[b]);
+                let start = pa.start_lba.max(pb.start_lba);
+                let end = pa
+                    .start_lba
+                    .saturating_add(pa.block_len)
+                    .min(pb.start_lba.saturating_add(pb.block_len));
+                if start < end {
+                    issues.push(ValidationIssue::PartitionsOverlap {
+                        a,
+                        b,
+                        a_name: pa.name.clone(),
+                        b_name: pb.name.clone(),
+                        start,
+                        len: end - start,
+                    });
+                }
+            }
+        }
+
+        issues
+    }
+
+    /// The `LSEG` half of [`validate`](Self::validate): walk every
+    /// filesystem's driver chain and report blocks outside the RDB area.
+    ///
+    /// Takes the disk because `LSEG` chains are only ever walked on
+    /// demand — [`load_filesystem`](Self::load_filesystem) is where their
+    /// LBAs exist at all — so unlike the other three chains there is
+    /// nothing in memory to check. The blocks are read for their chain
+    /// pointers and their payload discarded, which is cheap next to
+    /// reassembling the binaries.
+    ///
+    /// Fails only the way [`load_filesystem`](Self::load_filesystem)
+    /// does: a broken chain (wrong ID, bad checksum, cycle, off-disk
+    /// pointer) is a parse error, not a layout issue. When the RDB area
+    /// itself is unusable ([`ValidationIssue::RdbAreaInvalid`], which
+    /// [`validate`](Self::validate) reports) this returns no issues,
+    /// there being no range to compare against.
+    pub fn validate_seg_lists<S: BlockSource>(
+        &self,
+        disk: &mut S,
+    ) -> Result<Vec<ValidationIssue>, RdbError<S::Error>> {
+        if self.rdb_blocks_lo > self.rdb_blocks_hi {
+            return Ok(Vec::new());
+        }
+        let block_size = disk.block_size();
+        if block_size != self.block_bytes as usize {
+            return Err(RdbError::BlockBytesMismatch {
+                block_bytes: self.block_bytes,
+                block_size,
+            });
+        }
+        let (lo, hi) = (self.rdb_blocks_lo as u64, self.rdb_blocks_hi as u64);
+        let mut buf = alloc::vec![0u8; block_size];
+        let mut issues = Vec::new();
+        for f in &self.filesystems {
+            walk_chain(disk, f.seg_list_blocks, id::LSEG, &mut buf, |_b, lba| {
+                if lba < lo || lba > hi {
+                    issues.push(ValidationIssue::BlockOutsideRdbArea {
+                        kind: BlockKind::Lseg,
+                        lba,
+                        lo,
+                        hi,
+                    });
+                }
+                Ok(())
+            })?;
+        }
+        Ok(issues)
     }
 }
 
@@ -1205,6 +1516,12 @@ mod tests {
         put32(&mut d, bs, rdsk_block, rdsk::HI_CYLINDER, 9);
         put32(&mut d, bs, rdsk_block, rdsk::CYL_BLOCKS, 32);
         put32(&mut d, bs, rdsk_block, rdsk::AUTO_PARK_SECONDS, 0);
+        // A reserved area covering the whole of the first cylinder-ish
+        // prefix, well below the first partition at block 64, so the
+        // fixture is a *clean* layout and validate() has something
+        // meaningful to say when a test then breaks it.
+        put32(&mut d, bs, rdsk_block, rdsk::RDB_BLOCKS_LO, 0);
+        put32(&mut d, bs, rdsk_block, rdsk::RDB_BLOCKS_HI, 15);
         put32(
             &mut d,
             bs,
@@ -1235,37 +1552,82 @@ mod tests {
         put_padded(&mut d, bs, rdsk_block, rdsk::CONTROLLER_REVISION, "40.9");
         seal(&mut d, bs, rdsk_block, 64);
 
-        put32(&mut d, bs, part_block, 0, id::PART);
-        put32(&mut d, bs, part_block, chain::NEXT, CHAIN_END);
-        put32(&mut d, bs, part_block, part::FLAGS, 1); // bootable
-        let name = b"DH0";
-        d[part_block * bs + part::DRIVE_NAME] = name.len() as u8;
-        d[part_block * bs + part::DRIVE_NAME + 1
-            ..part_block * bs + part::DRIVE_NAME + 1 + name.len()]
-            .copy_from_slice(name);
-        let e = part::ENVIRONMENT;
-        put32(&mut d, bs, part_block, e + de::TABLE_SIZE * 4, table_size);
-        put32(
+        write_part(
             &mut d,
             bs,
             part_block,
-            e + de::SIZE_BLOCK * 4,
+            CHAIN_END,
+            "DH0",
             (bs / 4) as u32,
+            (2, 9),
+            table_size,
         );
-        put32(&mut d, bs, part_block, e + de::SURFACES * 4, 1);
-        put32(&mut d, bs, part_block, e + de::BLOCKS_PER_TRACK * 4, 32);
-        put32(&mut d, bs, part_block, e + de::LOW_CYL * 4, 2);
-        put32(&mut d, bs, part_block, e + de::HIGH_CYL * 4, 9);
-        put32(&mut d, bs, part_block, e + de::BOOT_PRI * 4, 0);
-        put32(&mut d, bs, part_block, e + de::DOS_TYPE * 4, 0x444F_5303);
+
+        d
+    }
+
+    /// Write one `PART` block: name, `de_SizeBlock` in longwords, the
+    /// inclusive cylinder range, `de_TableSize`, and the next-block
+    /// pointer. Split out of the image builders because a second
+    /// partition differs from the first only in these, and a fixture
+    /// that duplicated thirty `put32`s to change three of them would
+    /// drift.
+    #[allow(clippy::too_many_arguments)]
+    fn write_part(
+        d: &mut [u8],
+        bs: usize,
+        block: usize,
+        next: u32,
+        name: &str,
+        size_block_longs: u32,
+        (low_cyl, high_cyl): (u32, u32),
+        table_size: u32,
+    ) {
+        put32(d, bs, block, 0, id::PART);
+        put32(d, bs, block, chain::NEXT, next);
+        put32(d, bs, block, part::FLAGS, 1); // bootable
+        let name = name.as_bytes();
+        d[block * bs + part::DRIVE_NAME] = name.len() as u8;
+        d[block * bs + part::DRIVE_NAME + 1..block * bs + part::DRIVE_NAME + 1 + name.len()]
+            .copy_from_slice(name);
+        let e = part::ENVIRONMENT;
+        put32(d, bs, block, e + de::TABLE_SIZE * 4, table_size);
+        put32(d, bs, block, e + de::SIZE_BLOCK * 4, size_block_longs);
+        put32(d, bs, block, e + de::SURFACES * 4, 1);
+        put32(d, bs, block, e + de::BLOCKS_PER_TRACK * 4, 32);
+        put32(d, bs, block, e + de::LOW_CYL * 4, low_cyl);
+        put32(d, bs, block, e + de::HIGH_CYL * 4, high_cyl);
+        put32(d, bs, block, e + de::BOOT_PRI * 4, 0);
+        put32(d, bs, block, e + de::DOS_TYPE * 4, 0x444F_5303);
         // Written unconditionally: whether they are *readable* is
         // de_TableSize's business, and planting them even when it says
         // they are absent is what proves the gate works.
-        put32(&mut d, bs, part_block, e + de::BAUD * 4, 9600);
-        put32(&mut d, bs, part_block, e + de::CONTROL * 4, 0x1234);
-        put32(&mut d, bs, part_block, e + de::BOOT_BLOCKS * 4, 2);
-        seal(&mut d, bs, part_block, 64);
+        put32(d, bs, block, e + de::BAUD * 4, 9600);
+        put32(d, bs, block, e + de::CONTROL * 4, 0x1234);
+        put32(d, bs, block, e + de::BOOT_BLOCKS * 4, 2);
+        seal(d, bs, block, 64);
+    }
 
+    /// A 512-byte-device-block image carrying *two* partitions chained
+    /// off one RDSK, each with its own `de_SizeBlock` and cylinder
+    /// range.
+    ///
+    /// The point of the fixture is that `de_SizeBlock` is per partition:
+    /// one disk legitimately carries a 4 KB-filesystem-block partition
+    /// beside a 32 KB one, and nothing in this crate may assume a single
+    /// value per disk. It doubles as the two-extent fixture the overlap
+    /// validation needs, since overlapping partitions are just a
+    /// different cylinder range here.
+    fn two_partition_image(
+        (name_a, size_block_a, cyls_a): (&str, u32, (u32, u32)),
+        (name_b, size_block_b, cyls_b): (&str, u32, (u32, u32)),
+    ) -> Vec<u8> {
+        let bs = 512;
+        let mut d = one_partition_image(2);
+        write_part(&mut d, bs, 3, 4, name_a, size_block_a, cyls_a, 16);
+        write_part(&mut d, bs, 4, CHAIN_END, name_b, size_block_b, cyls_b, 16);
+        put32(&mut d, bs, 2, rdsk::HIGH_RDSK_BLOCK, 4);
+        seal(&mut d, bs, 2, 64);
         d
     }
 
@@ -1750,6 +2112,193 @@ mod tests {
             parse_badb(&b, &mut out);
             assert_eq!(out.len(), (512 - badb::ENTRIES) / 8);
         }
+    }
+
+    /// `de_SizeBlock` is a *per partition* property: one 512-byte-device
+    /// -block disk carries a 4 KB-filesystem-block partition beside a
+    /// 32 KB one, and everything this crate reports — extents,
+    /// [`PartitionSource`] addressing — stays in the device's 512-byte
+    /// blocks regardless. Nothing may assume one filesystem block size
+    /// per disk.
+    #[test]
+    fn mixed_size_block_partitions_on_one_disk() {
+        let mut disk = MemDisk::new(two_partition_image(
+            ("DH0", 1024, (2, 4)), // 4 KB filesystem blocks
+            ("DH1", 8192, (5, 9)), // 32 KB filesystem blocks
+        ));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.block_bytes, 512);
+        assert_eq!(rdb.partitions.len(), 2);
+
+        let (a, b) = (rdb.partitions[0].clone(), rdb.partitions[1].clone());
+        assert_eq!(a.name, "DH0");
+        assert_eq!(a.size_block_longs, 1024);
+        assert_eq!(b.name, "DH1");
+        assert_eq!(b.size_block_longs, 8192);
+        // 64× apart in filesystem block size, identical arithmetic:
+        // extents are device blocks, cylinders × 32.
+        assert_eq!((a.start_lba, a.block_len), (64, 96)); // cyls 2..=4
+        assert_eq!((b.start_lba, b.block_len), (160, 160)); // cyls 5..=9
+
+        // ...and the adapter a filesystem crate mounts still speaks the
+        // device's block size for both, not de_SizeBlock's.
+        for (p, blocks) in [(&a, 96u64), (&b, 160)] {
+            let ps = PartitionSource::new(&mut disk, p);
+            assert_eq!(ps.block_size(), 512);
+            assert_eq!(ps.block_count(), Some(blocks));
+        }
+
+        // A legal layout, mixed block sizes and all.
+        assert!(rdb.validate().is_empty());
+    }
+
+    /// The fixtures are clean layouts: every chained block inside the
+    /// reserved area, every partition clear of it, no two partitions
+    /// claiming a block. Both halves of the check agree.
+    #[test]
+    fn validate_accepts_a_clean_image() {
+        let (img, _) = fs_image();
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.rdb_blocks_lo, 0);
+        assert_eq!(rdb.rdb_blocks_hi, 15);
+        assert_eq!(
+            rdb.badb_blocks,
+            vec![BADB_BLOCK as u64, BADB_BLOCK as u64 + 1]
+        );
+        assert!(rdb.validate().is_empty());
+        assert!(rdb.validate_seg_lists(&mut disk).unwrap().is_empty());
+    }
+
+    /// A `PART` block past `rdb_RDBBlocksHi` sits in space the RDB says
+    /// is not reserved — readable, and a repartitioner is entitled to
+    /// hand that block to a filesystem.
+    #[test]
+    fn validate_reports_a_part_block_outside_the_rdb_area() {
+        let mut img = one_partition_image(2);
+        put32(&mut img, 512, 2, rdsk::RDB_BLOCKS_HI, 2); // PART is at 3
+        seal(&mut img, 512, 2, 64);
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(
+            rdb.validate(),
+            vec![ValidationIssue::BlockOutsideRdbArea {
+                kind: BlockKind::Part,
+                lba: 3,
+                lo: 0,
+                hi: 2,
+            }]
+        );
+    }
+
+    /// The real-world case: a tool wrote RDB structures past the
+    /// reserved area, so the area now runs into the first partition and
+    /// each side will trash the other. The image still parses — a
+    /// recovery tool needs the data — and `validate` is how a consumer
+    /// finds out before writing.
+    #[test]
+    fn validate_reports_a_partition_overlapping_the_rdb_area() {
+        let mut img = one_partition_image(2);
+        put32(&mut img, 512, 2, rdsk::RDB_BLOCKS_HI, 100); // DH0 starts at 64
+        seal(&mut img, 512, 2, 64);
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        // Still fully readable: that is the whole point.
+        assert_eq!(rdb.partitions[0].start_lba, 64);
+        assert_eq!(
+            rdb.validate(),
+            vec![ValidationIssue::PartitionOverlapsRdbArea {
+                index: 0,
+                name: String::from("DH0"),
+                start_lba: 64,
+                block_len: 256,
+                lo: 0,
+                hi: 100,
+            }]
+        );
+    }
+
+    /// Beyond the plan item, same failure family: two partitions
+    /// claiming the same blocks, each filesystem destroying the other.
+    #[test]
+    fn validate_reports_overlapping_partitions() {
+        let mut disk = MemDisk::new(two_partition_image(
+            ("DH0", 1024, (2, 4)), // 64..160
+            ("DH1", 8192, (4, 9)), // 128..320
+        ));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let issues = rdb.validate();
+        assert_eq!(
+            issues,
+            vec![ValidationIssue::PartitionsOverlap {
+                a: 0,
+                b: 1,
+                a_name: String::from("DH0"),
+                b_name: String::from("DH1"),
+                start: 128,
+                len: 32,
+            }]
+        );
+        assert_eq!(
+            alloc::format!("{}", issues[0]),
+            "partitions 0 (DH0) and 1 (DH1) both claim blocks 128..160"
+        );
+    }
+
+    /// `LSEG` blocks are lazy, so they are checked with the disk in
+    /// hand. Here the area stops at the FSHD, leaving the driver's own
+    /// blocks — and the BADB chain behind them — outside it.
+    #[test]
+    fn validate_seg_lists_reports_lseg_outside_the_rdb_area() {
+        let (mut img, _) = fs_image();
+        put32(&mut img, 512, 2, rdsk::RDB_BLOCKS_HI, FSHD_BLOCK as u32);
+        seal(&mut img, 512, 2, 64);
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+
+        let outside = |kind, lba| ValidationIssue::BlockOutsideRdbArea {
+            kind,
+            lba,
+            lo: 0,
+            hi: FSHD_BLOCK as u64,
+        };
+        // The eager chains: PART and FSHD are inside, both BADBs are not.
+        assert_eq!(
+            rdb.validate(),
+            vec![
+                outside(BlockKind::Badb, BADB_BLOCK as u64),
+                outside(BlockKind::Badb, BADB_BLOCK as u64 + 1),
+            ]
+        );
+        assert_eq!(
+            rdb.validate_seg_lists(&mut disk).unwrap(),
+            vec![
+                outside(BlockKind::Lseg, LSEG_BLOCK as u64),
+                outside(BlockKind::Lseg, LSEG_BLOCK as u64 + 1),
+            ]
+        );
+    }
+
+    /// An inverted reserved area says nothing about what is inside it,
+    /// so it is reported once instead of once per block — but the
+    /// partition-versus-partition check does not consult the area and
+    /// still runs.
+    #[test]
+    fn validate_reports_an_inverted_rdb_area_once() {
+        let mut img = two_partition_image(("DH0", 1024, (2, 4)), ("DH1", 8192, (4, 9)));
+        put32(&mut img, 512, 2, rdsk::RDB_BLOCKS_LO, 16);
+        put32(&mut img, 512, 2, rdsk::RDB_BLOCKS_HI, 0);
+        seal(&mut img, 512, 2, 64);
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let issues = rdb.validate();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0], ValidationIssue::RdbAreaInvalid { lo: 16, hi: 0 });
+        assert!(matches!(
+            issues[1],
+            ValidationIssue::PartitionsOverlap { a: 0, b: 1, .. }
+        ));
+        assert!(rdb.validate_seg_lists(&mut disk).unwrap().is_empty());
     }
 
     #[test]

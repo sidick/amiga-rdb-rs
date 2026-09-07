@@ -93,4 +93,21 @@ fn main() {
             if p.no_automount { "  noautomount" } else { "" },
         );
     }
+
+    // Layout validation last, so it reads as a verdict on everything
+    // printed above. Both halves: `validate` covers the chains held in
+    // memory, `validate_seg_lists` needs the disk back for the lazy LSEG
+    // blocks. Reported, never fatal — an image whose RDB has spilled
+    // into a partition is exactly the one someone is trying to recover.
+    let mut issues = rdb.validate();
+    match rdb.validate_seg_lists(&mut disk) {
+        Ok(more) => issues.extend(more),
+        Err(e) => eprintln!("{path}: walking LSEG chains: {e:?}"),
+    }
+    if !issues.is_empty() {
+        println!("layout issues ({}):", issues.len());
+        for issue in &issues {
+            println!("  ! {issue}");
+        }
+    }
 }
