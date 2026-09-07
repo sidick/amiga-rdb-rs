@@ -3,7 +3,7 @@
 //! `block-size` is the *device* block size the image was taken from
 //! (default 512); it must match the RDB's `rdb_BlockBytes`.
 
-use amiga_rdb::{Rdb, SeekBlockSource, CHAIN_END};
+use amiga_rdb::{rdb_flags, Rdb, SeekBlockSource, CHAIN_END};
 use std::fs::File;
 
 fn main() {
@@ -34,6 +34,21 @@ fn main() {
         rdb.rdb_blocks_lo,
         rdb.rdb_blocks_hi
     );
+    // Only printed when the flag says the bytes mean anything: without
+    // DISKID/CTRLRID these fields are uninitialised, and showing them
+    // would be inventing a drive identity.
+    if rdb.flags & rdb_flags::DISK_ID != 0 {
+        println!(
+            "disk: {} {} rev {}",
+            rdb.disk_vendor, rdb.disk_product, rdb.disk_revision
+        );
+    }
+    if rdb.flags & rdb_flags::CTRLR_ID != 0 {
+        println!(
+            "controller: {} {} rev {}",
+            rdb.controller_vendor, rdb.controller_product, rdb.controller_revision
+        );
+    }
     if rdb.filesys_header_list != CHAIN_END {
         println!("FSHD chain head: block {}", rdb.filesys_header_list);
     }

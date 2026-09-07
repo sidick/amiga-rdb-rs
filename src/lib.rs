@@ -93,6 +93,37 @@ pub mod id {
     pub const BADB: u32 = 0x4241_4442;
 }
 
+/// `rdb_Flags` bits (`RDBFF_*`, NDK `devices/hardblocks.h`).
+///
+/// The field stays a plain [`u32`] on [`Rdb`] — the format allows any
+/// bit pattern and a reader must preserve what it did not understand —
+/// but the bits that *are* defined get names here rather than being
+/// spelled `1 << 4` at every call site. Most of them are SCSI-bus
+/// scanning hints written by the controller's setup tool, meaningful
+/// only to the driver that scans the bus; two of them
+/// ([`DISK_ID`]/[`CTRLR_ID`]) gate whether the RDSK's identification
+/// strings hold anything real, so a consumer printing those must check.
+pub mod rdb_flags {
+    /// No disks exist after this one on this controller — the scan may
+    /// stop here.
+    pub const LAST: u32 = 1 << 0;
+    /// No LUNs exist after this one on this target — stop probing LUNs.
+    pub const LAST_LUN: u32 = 1 << 1;
+    /// No target IDs exist after this one — stop probing targets.
+    pub const LAST_TID: u32 = 1 << 2;
+    /// The drive may not be told to reselect; the driver must keep the
+    /// bus for the whole transfer.
+    pub const NO_RESELECT: u32 = 1 << 3;
+    /// The `rdb_DiskVendor`/`Product`/`Revision` strings are valid.
+    /// Without this bit their bytes mean nothing and must not be shown.
+    pub const DISK_ID: u32 = 1 << 4;
+    /// The `rdb_ControllerVendor`/`Product`/`Revision` strings are
+    /// valid, on the same terms.
+    pub const CTRLR_ID: u32 = 1 << 5;
+    /// The drive supports synchronous SCSI transfers.
+    pub const SYNCH: u32 = 1 << 6;
+}
+
 /// The chain terminator used by every block-pointer field
 /// (`rdb_PartitionList`, `pb_Next`, ...): `0xFFFFFFFF`, i.e. `-1`, not
 /// `0` — block 0 is a valid block address on a disk whose RDSK sits
@@ -218,6 +249,26 @@ pub struct Partition {
     /// Per partition: one disk can carry differently sized filesystem
     /// blocks side by side.
     pub size_block_longs: u32,
+    /// `de_Baud` (envec longword 17) — serial rate for a
+    /// serial-attached handler. `None` when `de_TableSize` stops short
+    /// of it: absent and zero are different things, and a writer that
+    /// rounds-trips must not invent a field the original did not have.
+    pub baud: Option<u32>,
+    /// `de_Control` (18) — handler-defined control word.
+    pub control: Option<u32>,
+    /// `de_BootBlocks` (19) — number of blocks reserved for boot code.
+    pub boot_blocks: Option<u32>,
+    /// The `DosEnvec` as raw longwords, `de_TableSize` included, so the
+    /// vector holds `table_size + 1` entries — everything the envec
+    /// claims, whether or not this crate models it. A consumer can
+    /// round-trip an envec byte-for-byte from this.
+    ///
+    /// Clamped to what actually fits between the envec's offset (128)
+    /// and the end of the block: `de_TableSize` is attacker-controlled
+    /// and a hostile value must truncate, never read past the block.
+    /// So `envec_raw.len()` is `min(table_size + 1, (block_size - 128) /
+    /// 4)` — compare it against `table_size` to detect the truncation.
+    pub envec_raw: Vec<u32>,
 }
 
 /// A parsed RDB: the disk-level header plus its partitions.
@@ -234,17 +285,74 @@ pub struct Rdb {
     /// successful parse; carried so consumers can do byte math without
     /// the source in hand.
     pub block_bytes: u32,
-    /// `rdb_Flags`.
+    /// `rdb_Flags`. Left as a bare `u32` because the format permits
+    /// bits this crate does not know and a reader must preserve them;
+    /// the defined bits have names in [`rdb_flags`].
     pub flags: u32,
+    /// `rdb_HostID` — the SCSI ID of the controller that owns this
+    /// disk. Meaningless on non-SCSI media, preserved regardless.
+    pub host_id: u32,
+    /// `rdb_DriveInit` — an optional seglist pointer for drive-specific
+    /// init code. On disk it is a block address; this crate does not
+    /// follow it (nothing in the wild uses it), it just carries it so a
+    /// rewrite does not drop it.
+    pub drive_init: u32,
     /// Disk geometry as the RDB declares it.
     pub cylinders: u32,
     pub heads: u32,
     pub sectors: u32,
+    /// `rdb_Interleave` — physical sector interleave. Historical: a
+    /// value tuned to a controller too slow to read consecutive
+    /// sectors. Kept because it is part of what the drive was formatted
+    /// with, not because anything modern honours it.
+    pub interleave: u32,
+    /// `rdb_Park` — the cylinder to park the heads on. Dead on any
+    /// drive made since parking became automatic.
+    pub park: u32,
+    /// `rdb_WritePreComp` — first cylinder needing write precompensation.
+    pub write_pre_comp: u32,
+    /// `rdb_ReducedWrite` — first cylinder needing reduced write current.
+    pub reduced_write: u32,
+    /// `rdb_StepRate` — head step rate in the drive's own units.
+    pub step_rate: u32,
     /// The block range the RDB structures themselves occupy
     /// (`rdb_RDBBlocksLo..=rdb_RDBBlocksHi`) — the area a repartitioner
     /// may rewrite and a filesystem must never touch.
     pub rdb_blocks_lo: u32,
     pub rdb_blocks_hi: u32,
+    /// `rdb_LoCylinder`/`rdb_HiCylinder` — the cylinder range available
+    /// to partitions. Distinct from `cylinders`: the RDB area itself
+    /// normally sits below `lo_cylinder`, so this is the range a
+    /// partitioner may actually hand out.
+    pub lo_cylinder: u32,
+    pub hi_cylinder: u32,
+    /// `rdb_CylBlocks` — device blocks per cylinder as the *drive*
+    /// declares it. Each partition states its own (`de_Surfaces *
+    /// de_BlocksPerTrack`) and the two are allowed to disagree, which is
+    /// why both are surfaced rather than one derived from the other.
+    pub cyl_blocks: u32,
+    /// `rdb_AutoParkSeconds` — idle seconds before an auto-park, 0 for
+    /// never. As dead as [`park`](Self::park).
+    pub auto_park_seconds: u32,
+    /// `rdb_HighRDSKBlock` — the highest block any RDB structure
+    /// currently occupies. `rdb_blocks_hi` is the *reserved* ceiling;
+    /// this is the high-water mark actually used, so a writer knows
+    /// where free space in the RDB area begins.
+    pub high_rdsk_block: u32,
+    /// `rdb_DiskVendor`/`Product`/`Revision` — SCSI INQUIRY identity of
+    /// the drive, space-padded ASCII (*not* BCPL, unlike
+    /// `pb_DriveName`). Only meaningful when `flags` has
+    /// [`rdb_flags::DISK_ID`]; otherwise these are whatever bytes
+    /// happened to be there, so they are parsed unconditionally but must
+    /// not be displayed without checking the bit.
+    pub disk_vendor: String,
+    pub disk_product: String,
+    pub disk_revision: String,
+    /// `rdb_ControllerVendor`/`Product`/`Revision`, gated the same way
+    /// by [`rdb_flags::CTRLR_ID`].
+    pub controller_vendor: String,
+    pub controller_product: String,
+    pub controller_revision: String,
     /// Head of the `FSHD` chain ([`CHAIN_END`] if none).
     pub filesys_header_list: u32,
     /// Head of the `BADB` chain ([`CHAIN_END`] if none).
@@ -255,16 +363,42 @@ pub struct Rdb {
 
 /// Byte offsets into a `RDSK` block (NDK `RigidDiskBlock`).
 mod rdsk {
+    pub const HOST_ID: usize = 12;
     pub const BLOCK_BYTES: usize = 16;
     pub const FLAGS: usize = 20;
     pub const BAD_BLOCK_LIST: usize = 24;
     pub const PARTITION_LIST: usize = 28;
     pub const FILESYS_HEADER_LIST: usize = 32;
+    pub const DRIVE_INIT: usize = 36;
+    // 40..64: rdb_Reserved1[6]
     pub const CYLINDERS: usize = 64;
     pub const SECTORS: usize = 68;
     pub const HEADS: usize = 72;
+    pub const INTERLEAVE: usize = 76;
+    pub const PARK: usize = 80;
+    // 84..96: rdb_Reserved2[3]
+    pub const WRITE_PRE_COMP: usize = 96;
+    pub const REDUCED_WRITE: usize = 100;
+    pub const STEP_RATE: usize = 104;
+    // 108..128: rdb_Reserved3[5]
     pub const RDB_BLOCKS_LO: usize = 128;
     pub const RDB_BLOCKS_HI: usize = 132;
+    pub const LO_CYLINDER: usize = 136;
+    pub const HI_CYLINDER: usize = 140;
+    pub const CYL_BLOCKS: usize = 144;
+    pub const AUTO_PARK_SECONDS: usize = 148;
+    pub const HIGH_RDSK_BLOCK: usize = 152;
+    // 156: rdb_Reserved4
+
+    /// The identification strings: `(byte offset, byte length)`. Not
+    /// BCPL — plain space-padded ASCII, unlike `pb_DriveName` four
+    /// structures away.
+    pub const DISK_VENDOR: (usize, usize) = (160, 8);
+    pub const DISK_PRODUCT: (usize, usize) = (168, 16);
+    pub const DISK_REVISION: (usize, usize) = (184, 4);
+    pub const CONTROLLER_VENDOR: (usize, usize) = (188, 8);
+    pub const CONTROLLER_PRODUCT: (usize, usize) = (196, 16);
+    pub const CONTROLLER_REVISION: (usize, usize) = (212, 4);
 }
 
 /// Byte offsets into a `PART` block (NDK `PartitionBlock`).
@@ -290,6 +424,12 @@ mod de {
     pub const MASK: usize = 14;
     pub const BOOT_PRI: usize = 15;
     pub const DOS_TYPE: usize = 16;
+    /// The three optional tail fields. `de_TableSize` counts longwords
+    /// *after itself*, so a field at index `i` is present exactly when
+    /// `table_size >= i`.
+    pub const BAUD: usize = 17;
+    pub const CONTROL: usize = 18;
+    pub const BOOT_BLOCKS: usize = 19;
 }
 
 impl Rdb {
@@ -335,11 +475,29 @@ impl Rdb {
             rdsk_block: rdsk_at,
             block_bytes,
             flags: be32(&buf, rdsk::FLAGS),
+            host_id: be32(&buf, rdsk::HOST_ID),
+            drive_init: be32(&buf, rdsk::DRIVE_INIT),
             cylinders: be32(&buf, rdsk::CYLINDERS),
             heads: be32(&buf, rdsk::HEADS),
             sectors: be32(&buf, rdsk::SECTORS),
+            interleave: be32(&buf, rdsk::INTERLEAVE),
+            park: be32(&buf, rdsk::PARK),
+            write_pre_comp: be32(&buf, rdsk::WRITE_PRE_COMP),
+            reduced_write: be32(&buf, rdsk::REDUCED_WRITE),
+            step_rate: be32(&buf, rdsk::STEP_RATE),
             rdb_blocks_lo: be32(&buf, rdsk::RDB_BLOCKS_LO),
             rdb_blocks_hi: be32(&buf, rdsk::RDB_BLOCKS_HI),
+            lo_cylinder: be32(&buf, rdsk::LO_CYLINDER),
+            hi_cylinder: be32(&buf, rdsk::HI_CYLINDER),
+            cyl_blocks: be32(&buf, rdsk::CYL_BLOCKS),
+            auto_park_seconds: be32(&buf, rdsk::AUTO_PARK_SECONDS),
+            high_rdsk_block: be32(&buf, rdsk::HIGH_RDSK_BLOCK),
+            disk_vendor: padded_ascii(&buf, rdsk::DISK_VENDOR),
+            disk_product: padded_ascii(&buf, rdsk::DISK_PRODUCT),
+            disk_revision: padded_ascii(&buf, rdsk::DISK_REVISION),
+            controller_vendor: padded_ascii(&buf, rdsk::CONTROLLER_VENDOR),
+            controller_product: padded_ascii(&buf, rdsk::CONTROLLER_PRODUCT),
+            controller_revision: padded_ascii(&buf, rdsk::CONTROLLER_REVISION),
             filesys_header_list: be32(&buf, rdsk::FILESYS_HEADER_LIST),
             bad_block_list: be32(&buf, rdsk::BAD_BLOCK_LIST),
             partitions: Vec::new(),
@@ -382,6 +540,23 @@ impl Rdb {
     }
 }
 
+/// Read a fixed-width, space-padded ASCII field as a `String`.
+///
+/// The RDSK identification fields are SCSI INQUIRY data copied
+/// verbatim: fixed width, padded with spaces — not BCPL, and not
+/// NUL-terminated by specification, though real controllers pad with
+/// NULs often enough that both are trimmed. Bytes become chars
+/// one-for-one (latin-1-ish) rather than being trusted as UTF-8, the
+/// same treatment `pb_DriveName` gets.
+fn padded_ascii(buf: &[u8], (off, len): (usize, usize)) -> String {
+    let field = &buf[off..off + len];
+    let end = field
+        .iter()
+        .rposition(|&b| b != b' ' && b != 0)
+        .map_or(0, |i| i + 1);
+    field[..end].iter().map(|&b| b as char).collect()
+}
+
 fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
     let envec = |i: usize| be32(buf, part::ENVIRONMENT + i * 4);
 
@@ -391,6 +566,23 @@ fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
     if (table_size as usize) < de::DOS_TYPE {
         return Err(RdbError::EnvecTooShort { lba, table_size });
     }
+
+    // How many envec longwords the block physically holds. de_TableSize
+    // is attacker-controlled, so every read past DOS_TYPE — the
+    // optional fields and envec_raw alike — is clamped to this, and a
+    // hostile 0xFFFFFFFF truncates instead of running off the block.
+    let envec_capacity = (buf.len() - part::ENVIRONMENT) / 4;
+    let present = |i: usize| {
+        if table_size as usize >= i && i < envec_capacity {
+            Some(envec(i))
+        } else {
+            None
+        }
+    };
+    // table_size + 1 longwords, TableSize itself included; saturating
+    // so table_size == u32::MAX cannot wrap to zero.
+    let raw_len = (table_size as usize).saturating_add(1).min(envec_capacity);
+    let envec_raw: Vec<u32> = (0..raw_len).map(envec).collect();
 
     // BCPL string: length byte then bytes, no terminator. The name is
     // ASCII in every image ever seen, but bytes are passed through
@@ -423,6 +615,10 @@ fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
         num_buffers: envec(de::NUM_BUFFERS),
         buf_mem_type: envec(de::BUF_MEM_TYPE),
         size_block_longs: envec(de::SIZE_BLOCK),
+        baud: present(de::BAUD),
+        control: present(de::CONTROL),
+        boot_blocks: present(de::BOOT_BLOCKS),
+        envec_raw,
     })
 }
 
@@ -609,10 +805,28 @@ mod tests {
         put32(disk, bs, block, 8, sum.wrapping_neg());
     }
 
+    /// Write a fixed-width, space-padded ASCII field (the RDSK
+    /// identification convention) at `off`, truncating an over-long
+    /// value the way a real controller's INQUIRY copy would.
+    fn put_padded(disk: &mut [u8], bs: usize, block: usize, (off, len): (usize, usize), s: &str) {
+        let base = block * bs + off;
+        disk[base..base + len].fill(b' ');
+        let b = s.as_bytes();
+        let n = b.len().min(len);
+        disk[base..base + n].copy_from_slice(&b[..n]);
+    }
+
     /// Build a minimal valid image with the given device block size:
     /// RDSK at `rdsk_block`, one PART. Geometry: 10 cylinders of 32
     /// blocks, regardless of block size.
     fn one_partition_image_bs(rdsk_block: usize, bs: usize) -> Vec<u8> {
+        one_partition_image_envec(rdsk_block, bs, 16)
+    }
+
+    /// As [`one_partition_image_bs`], but with an explicit
+    /// `de_TableSize` and the longwords 17..=19 filled in, so the
+    /// optional-tail cases (and a hostile TableSize) share one builder.
+    fn one_partition_image_envec(rdsk_block: usize, bs: usize, table_size: u32) -> Vec<u8> {
         // Sized to the geometry it declares: 10 cylinders of 32 blocks.
         let mut d = vec![0u8; 320 * bs];
         let part_block = rdsk_block + 1;
@@ -631,6 +845,45 @@ mod tests {
         put32(&mut d, bs, rdsk_block, rdsk::CYLINDERS, 10);
         put32(&mut d, bs, rdsk_block, rdsk::SECTORS, 32);
         put32(&mut d, bs, rdsk_block, rdsk::HEADS, 1);
+        put32(&mut d, bs, rdsk_block, rdsk::HOST_ID, 7);
+        put32(&mut d, bs, rdsk_block, rdsk::DRIVE_INIT, CHAIN_END);
+        put32(&mut d, bs, rdsk_block, rdsk::INTERLEAVE, 1);
+        put32(&mut d, bs, rdsk_block, rdsk::PARK, 10);
+        put32(&mut d, bs, rdsk_block, rdsk::WRITE_PRE_COMP, 10);
+        put32(&mut d, bs, rdsk_block, rdsk::REDUCED_WRITE, 10);
+        put32(&mut d, bs, rdsk_block, rdsk::STEP_RATE, 3);
+        put32(&mut d, bs, rdsk_block, rdsk::LO_CYLINDER, 2);
+        put32(&mut d, bs, rdsk_block, rdsk::HI_CYLINDER, 9);
+        put32(&mut d, bs, rdsk_block, rdsk::CYL_BLOCKS, 32);
+        put32(&mut d, bs, rdsk_block, rdsk::AUTO_PARK_SECONDS, 0);
+        put32(
+            &mut d,
+            bs,
+            rdsk_block,
+            rdsk::HIGH_RDSK_BLOCK,
+            part_block as u32,
+        );
+        put32(
+            &mut d,
+            bs,
+            rdsk_block,
+            rdsk::FLAGS,
+            rdb_flags::DISK_ID | rdb_flags::CTRLR_ID,
+        );
+        // Space-padded, and DISK_PRODUCT deliberately fills its whole
+        // 16 bytes so the trimmer is exercised on both cases.
+        put_padded(&mut d, bs, rdsk_block, rdsk::DISK_VENDOR, "QUANTUM ");
+        put_padded(
+            &mut d,
+            bs,
+            rdsk_block,
+            rdsk::DISK_PRODUCT,
+            "FIREBALL_TM3200S",
+        );
+        put_padded(&mut d, bs, rdsk_block, rdsk::DISK_REVISION, "300 ");
+        put_padded(&mut d, bs, rdsk_block, rdsk::CONTROLLER_VENDOR, "CBM     ");
+        put_padded(&mut d, bs, rdsk_block, rdsk::CONTROLLER_PRODUCT, "A4091");
+        put_padded(&mut d, bs, rdsk_block, rdsk::CONTROLLER_REVISION, "40.9");
         seal(&mut d, bs, rdsk_block, 64);
 
         put32(&mut d, bs, part_block, 0, id::PART);
@@ -642,7 +895,7 @@ mod tests {
             ..part_block * bs + part::DRIVE_NAME + 1 + name.len()]
             .copy_from_slice(name);
         let e = part::ENVIRONMENT;
-        put32(&mut d, bs, part_block, e + de::TABLE_SIZE * 4, 16);
+        put32(&mut d, bs, part_block, e + de::TABLE_SIZE * 4, table_size);
         put32(
             &mut d,
             bs,
@@ -656,6 +909,12 @@ mod tests {
         put32(&mut d, bs, part_block, e + de::HIGH_CYL * 4, 9);
         put32(&mut d, bs, part_block, e + de::BOOT_PRI * 4, 0);
         put32(&mut d, bs, part_block, e + de::DOS_TYPE * 4, 0x444F_5303);
+        // Written unconditionally: whether they are *readable* is
+        // de_TableSize's business, and planting them even when it says
+        // they are absent is what proves the gate works.
+        put32(&mut d, bs, part_block, e + de::BAUD * 4, 9600);
+        put32(&mut d, bs, part_block, e + de::CONTROL * 4, 0x1234);
+        put32(&mut d, bs, part_block, e + de::BOOT_BLOCKS * 4, 2);
         seal(&mut d, bs, part_block, 64);
 
         d
@@ -789,6 +1048,98 @@ mod tests {
             ps.read_block(256, &mut buf),
             Err(PartitionSourceError::OutOfRange { lba: 256, len: 256 })
         ));
+    }
+
+    /// The full envec: TableSize 20 means longwords 1..=20 follow, so
+    /// Baud/Control/BootBlocks are all present and `envec_raw` holds 21
+    /// entries (TableSize itself included).
+    #[test]
+    fn table_size_20_envec_exposes_the_optional_tail() {
+        let mut disk = MemDisk::new(one_partition_image_envec(2, 512, 20));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = &rdb.partitions[0];
+        assert_eq!(p.baud, Some(9600));
+        assert_eq!(p.control, Some(0x1234));
+        assert_eq!(p.boot_blocks, Some(2));
+        assert_eq!(p.envec_raw.len(), 21);
+        assert_eq!(p.envec_raw[de::TABLE_SIZE], 20);
+        assert_eq!(p.envec_raw[de::DOS_TYPE], 0x444F_5303);
+        assert_eq!(p.envec_raw[de::BOOT_BLOCKS], 2);
+    }
+
+    /// TableSize 16 stops at DosType. The tail longwords are physically
+    /// present in the block (the builder writes them) and must still
+    /// read as `None` — absent is not the same as zero, and a
+    /// round-tripping writer must not resurrect them.
+    #[test]
+    fn table_size_16_envec_has_no_optional_tail() {
+        let mut disk = MemDisk::new(one_partition_image_envec(2, 512, 16));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = &rdb.partitions[0];
+        assert_eq!(p.baud, None);
+        assert_eq!(p.control, None);
+        assert_eq!(p.boot_blocks, None);
+        assert_eq!(p.envec_raw.len(), 17);
+    }
+
+    /// A hostile `de_TableSize` must clamp to what the block holds, not
+    /// index past it. 512-byte block, envec at 128 → 96 longwords.
+    #[test]
+    fn hostile_table_size_clamps_envec_raw() {
+        for bogus in [96u32, 1000, 0x7FFF_FFFF, u32::MAX] {
+            let mut disk = MemDisk::new(one_partition_image_envec(2, 512, bogus));
+            let rdb = Rdb::parse(&mut disk).unwrap();
+            let p = &rdb.partitions[0];
+            assert_eq!(p.envec_raw.len(), (512 - part::ENVIRONMENT) / 4);
+            // The tail fields still fit the block, so they read fine —
+            // clamping bounds the read, it does not suppress it.
+            assert_eq!(p.boot_blocks, Some(2));
+        }
+    }
+
+    /// The same clamp on a 4 KB block, where the *declared* size is the
+    /// binding one: 20 longwords is far less than the 992 that fit.
+    #[test]
+    fn envec_raw_follows_table_size_when_it_fits() {
+        let mut disk = MemDisk {
+            data: one_partition_image_envec(2, 4096, 20),
+            block_size: 4096,
+        };
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.partitions[0].envec_raw.len(), 21);
+    }
+
+    #[test]
+    fn identification_strings_parse_with_padding_trimmed() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.disk_vendor, "QUANTUM");
+        assert_eq!(rdb.disk_product, "FIREBALL_TM3200S"); // fills all 16
+        assert_eq!(rdb.disk_revision, "300");
+        assert_eq!(rdb.controller_vendor, "CBM");
+        assert_eq!(rdb.controller_product, "A4091");
+        assert_eq!(rdb.controller_revision, "40.9");
+        assert!(rdb.flags & rdb_flags::DISK_ID != 0);
+        assert!(rdb.flags & rdb_flags::CTRLR_ID != 0);
+        assert!(rdb.flags & rdb_flags::LAST == 0);
+    }
+
+    #[test]
+    fn remaining_rdsk_fields_are_surfaced() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.host_id, 7);
+        assert_eq!(rdb.drive_init, CHAIN_END);
+        assert_eq!(rdb.interleave, 1);
+        assert_eq!(rdb.park, 10);
+        assert_eq!(rdb.write_pre_comp, 10);
+        assert_eq!(rdb.reduced_write, 10);
+        assert_eq!(rdb.step_rate, 3);
+        assert_eq!(rdb.lo_cylinder, 2);
+        assert_eq!(rdb.hi_cylinder, 9);
+        assert_eq!(rdb.cyl_blocks, 32);
+        assert_eq!(rdb.auto_park_seconds, 0);
+        assert_eq!(rdb.high_rdsk_block, 3);
     }
 
     #[test]

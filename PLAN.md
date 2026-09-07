@@ -24,13 +24,13 @@ gets *added here first* so the plan stays the map.
 
 Everything the format can say, surfaced. Nothing here writes a byte.
 
-- [ ] **Full `DosEnvec`**: `de_TableSize` 17–20 fields (`de_Baud`,
+- [x] **Full `DosEnvec`**: `de_TableSize` 17–20 fields (`de_Baud`,
       `de_Control`, `de_BootBlocks`); expose the raw longwords too, so a
       consumer can round-trip an envec this crate doesn't fully model.
-- [ ] **Remaining RDSK fields**: vendor/product/revision (space-padded,
+- [x] **Remaining RDSK fields**: vendor/product/revision (space-padded,
       not BCPL), `rdb_HostID`, `rdb_DriveInit`, controller fields,
       `rdb_HighRDSKBlock`, park/interleave/precomp geometry.
-- [ ] **`rdb_Flags` semantics** as named constants (`LAST`, `LASTLUN`,
+- [x] **`rdb_Flags` semantics** as named constants (`LAST`, `LASTLUN`,
       `LASTTID`, `NORESELECT`, `DISKID`, `CTRLRID`, `SYNCH`), not a bare u32.
 - [ ] **FSHD chain**: `FileSysHeaderBlock` — `fhb_DosType`,
       `fhb_Version`, `fhb_PatchFlags` and the patched fields it gates
