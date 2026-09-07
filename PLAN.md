@@ -1116,6 +1116,92 @@ differential oracle.
       helper, so `cargo test` runs the whole path for real and the public
       API stays what it says it is.
 
+## Review findings (2026-09)
+
+An independent review of the whole crate after 0.3.0, confirmed
+finding by finding. Each item below is fixed with a regression test
+that fails before the fix and passes after. Two of them break the
+public API, which pre-1.0 is allowed but not silent: both are noted
+here and in the changelog when 0.4 goes out.
+
+- [x] **An interrupted commit could publish a mixed table.** `plan`
+      kept an in-area block in place and `prepare` then rewrote it with
+      a changed `pb_Next` — *before* the `RDSK` flip, so the still
+      published old `RDSK` walked its old head straight into the new
+      structure. Crash there and the disk carried a checksum-valid
+      table that was neither the old one nor the new one: a deleted
+      partition still at the head with its overlapping replacement
+      spliced in behind it, two filesystems each free to destroy the
+      other. The rule now is that a block may only be rewritten where
+      it lies if its **pointers do not change** — `Next`, and an
+      `FSHD`'s seg-list head; anything else relocates to a block the
+      old layout does not use, and the rule cascades back along the
+      chain to a fixed point. A change that is *not* a pointer (a name,
+      a dostype, a boot priority) still rewrites in place, which is the
+      old-or-new-per-field transient this crate has always documented
+      and is unaffected by chain shape. Knock-ons: relocation spends
+      first-tier blocks, but the two-tier allocator already refuses to
+      hand out a block the old layout occupies until nothing else is
+      left, so no new `RdbAreaTooSmall` arithmetic was needed; a
+      structural edit now moves the chain it touches and zeroes what it
+      vacated, which two existing tests were rewritten to assert. The
+      truncation test over a structural edit now asserts the strict
+      property — every prefix parses as *exactly* the old table or
+      *exactly* the new one — and a new test does it in the destructive
+      shape, where the replacement partition reuses the deleted one's
+      cylinders.
+- [x] **End-of-disk checks mixed drive and partition cylinders.**
+      `de_Surfaces * de_BlocksPerTrack` is per partition and may differ
+      from `rdb_Heads * rdb_Sectors`, so comparing a partition's
+      `de_HighCyl` against the drive's last cylinder compares two
+      different units: a divergent-geometry partition could be extended
+      past the medium, or truncated by a `set_geometry_cylinders`
+      shrink that read as passing. Both checks are now in device
+      blocks — the unit `validate()` already thinks in — as is the
+      `rdb_LoCylinder` floor at the other end, which had the same
+      disease. The errors still name cylinders, but computed from
+      blocks and in the extent's *own* cylinder, so the number means
+      something for a divergent geometry and is unchanged for the usual
+      one. `add_partition`, `set_extent` and `resize_partition` all go
+      through the one fixed predicate.
+- [x] **`place_by_size` panicked on a hostile geometry.** A parsed
+      `rdb_Heads * rdb_Sectors` is bounded only by `u32::MAX` squared,
+      so a cylinder times the block size overflowed `u64` — a debug
+      panic, and in release a wrap to zero and then a division by it.
+      Saturating arithmetic, which lands an absurd cylinder in
+      `PartitionTooSmall` (no size a caller can express reaches one),
+      plus the same treatment for the RDB-area cylinder rounding.
+- [x] **One short `DosEnvec` aborted the whole parse.** A `PART` block
+      whose `de_TableSize` does not reach `de_DosType` failed
+      `Rdb::parse` outright, so one damaged entry cost a recovery tool
+      every other partition on the chain — the opposite of this crate's
+      read-everything rule. Such a partition is now parsed with what
+      the envec declares, absent numeric fields reading as zero (a
+      partition with no `de_HighCyl` gets a zero-length extent, the
+      inverted case's answer), `envec_raw` preserving exactly the
+      longwords the block carried so an edit round-trips it byte for
+      byte, and the new `ValidationIssue::EnvecTooShort` reporting it
+      where the rest of the layout damage is reported. **API break**:
+      `RdbError::EnvecTooShort` is removed — `parse_part` is now
+      infallible — and with it `EditError::UnreadableBlock`, whose only
+      reason to exist was that call's `Result`.
+- [x] **`checksum_ok` broke its own contract twice.** It indexed
+      `SummedLongs` at byte 4 without checking the slice was that long,
+      so a fragment panicked the host; and it accepted `SummedLongs` of
+      1 or 2 though `MIN_SUMMED_LONGS` documents them as unsatisfiable
+      — a block whose first longwords happened to sum to zero passed a
+      check that had not covered `ChkSum` at all. Both are `false` now.
+      Nothing real is excluded: `RDSK`/`PART`/`FSHD` say 64, the
+      shortest `BADB` says 6, `LSEG` the whole block.
+- [x] **The `RDSK` probe turned end-of-medium into the wrong error.** A
+      source that declines to report a block count can only signal its
+      end by failing a read, so a four-block image with no RDB on it
+      answered `Io` where `NoRdsk` is documented. A failed read now
+      ends the *scan*; a genuinely failing device gets `NoRdsk` from
+      the probe too, which is the right trade — the probe is a search,
+      not a health check — and every read after an `RDSK` is found
+      still reports its error faithfully.
+
 ## Non-goals, so they don't creep in
 
 - **Hunk relocation/loading** — reassembling LSEG payload bytes is in

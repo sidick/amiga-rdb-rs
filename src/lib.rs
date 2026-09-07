@@ -397,9 +397,26 @@ pub const MIN_SUMMED_LONGS: u32 = (hdr::CHK_SUM / 4) as u32 + 1;
 /// big-endian longwords of the block sum to zero with 32-bit wrapping
 /// arithmetic. Returns `false` for a `SummedLongs` that doesn't fit the
 /// block — a malformed count must fail the check, not panic the host.
+///
+/// A slice too short to hold the header longwords the check itself
+/// reads (`ID`, `SummedLongs`, `ChkSum` — twelve bytes) is `false`
+/// rather than a panic: the function is handed whatever a caller has,
+/// and "this is not a valid block" is the honest answer for a fragment,
+/// not a reason to take the host down.
+///
+/// A `SummedLongs` below [`MIN_SUMMED_LONGS`] is `false` too, matching
+/// what that constant documents and what [`seal_checksum`] refuses to
+/// write: a sum that does not cover `ChkSum` cannot be made zero by any
+/// value stored there, so a block claiming one is unsatisfiable however
+/// its longwords happen to add up. Real blocks are far above the floor —
+/// `RDSK`, `PART` and `FSHD` say 64, the shortest `BADB` says 6 — so
+/// nothing legitimate is excluded.
 pub fn checksum_ok(block: &[u8]) -> bool {
+    if block.len() < hdr::CHK_SUM + 4 {
+        return false;
+    }
     let longs = be32(block, hdr::SUMMED_LONGS) as usize;
-    if longs == 0 || longs > block.len() / 4 {
+    if longs < MIN_SUMMED_LONGS as usize || longs > block.len() / 4 {
         return false;
     }
     let mut sum: u32 = 0;
@@ -849,6 +866,14 @@ pub enum RdbError<E> {
     /// Not necessarily damage: RDB-less images (a bare filesystem from
     /// block 0) are a real, if less common, layout — this is how a
     /// caller detects one.
+    ///
+    /// Also the answer when the scan cannot read that far: a source
+    /// that declines to report a [`block_count`](BlockSource::block_count)
+    /// signals its end of medium by failing a read, and a medium too
+    /// short to hold an RDB has no RDB on it. A device failing for some
+    /// other reason therefore reports this too — the probe is a search,
+    /// not a health check — but only during the search: a read that
+    /// fails once an `RDSK` has been found is [`Io`](Self::Io).
     NoRdsk,
     /// A block in a chain had the wrong ID. `expected`/`found` are the
     /// magic numbers; `lba` is where.
@@ -891,14 +916,6 @@ pub enum RdbError<E> {
         block_bytes: u32,
         /// What the source says it reads in.
         block_size: usize,
-    },
-    /// A `PART` block's `DosEnvec` was too short to contain the fields
-    /// this crate needs (`de_TableSize` below `DE_DOSTYPE`).
-    EnvecTooShort {
-        /// The `PART` block carrying the short envec.
-        lba: u64,
-        /// The `de_TableSize` it declared.
-        table_size: u32,
     },
 }
 
@@ -944,12 +961,6 @@ impl<E: core::fmt::Display> core::fmt::Display for RdbError<E> {
                 f,
                 "the RDB declares {block_bytes}-byte blocks but the source reads \
                  {block_size}-byte blocks"
-            ),
-            RdbError::EnvecTooShort { lba, table_size } => write!(
-                f,
-                "the DosEnvec in the PART block at {lba} declares de_TableSize {table_size}, \
-                 short of the {} needed to reach de_DosType",
-                de::DOS_TYPE
             ),
         }
     }
@@ -1405,6 +1416,29 @@ pub enum ValidationIssue {
         /// How many, so the shared extent is `start..start + len`.
         len: u64,
     },
+    /// A partition's `DosEnvec` is too short to reach `de_DosType`, so
+    /// the fields below it — the dostype, and at a short enough
+    /// `de_TableSize` the `de_LowCyl`/`de_HighCyl` extent and the
+    /// `de_Surfaces`/`de_BlocksPerTrack` geometry too — are not on the
+    /// block at all.
+    ///
+    /// The partition is still parsed and still in
+    /// [`Rdb::partitions`](Rdb::partitions): a damaged entry must not
+    /// cost a recovery tool the other entries on the chain, and the
+    /// `PART` block round-trips through an edit unchanged because
+    /// nothing takes its envec apart. What the absent fields read as is
+    /// zero, which for the extent pair means a zero-length extent —
+    /// excluded from every overlap check here, exactly like an inverted
+    /// range.
+    EnvecTooShort {
+        /// Index into [`Rdb::partitions`].
+        index: usize,
+        /// The partition's `pb_DriveName`, so a report can name it.
+        name: String,
+        /// `de_TableSize` as the block declares it — below
+        /// `de_DosType`'s index, which is the issue.
+        table_size: u32,
+    },
 }
 
 impl core::fmt::Display for ValidationIssue {
@@ -1452,6 +1486,16 @@ impl core::fmt::Display for ValidationIssue {
                 f,
                 "partitions {a} ({a_name}) and {b} ({b_name}) both claim blocks {start}..{}",
                 start.saturating_add(*len)
+            ),
+            ValidationIssue::EnvecTooShort {
+                index,
+                name,
+                table_size,
+            } => write!(
+                f,
+                "partition {index} ({name}) declares de_TableSize {table_size}, \
+                 short of the {} needed to reach de_DosType",
+                de::DOS_TYPE
             ),
         }
     }
@@ -1638,7 +1682,9 @@ impl Rdb {
     /// whose checksum passes (both conditions: an `RDSK` ID with a bad
     /// sum is skipped, matching what the ROM does, so a stale copy at a
     /// lower LBA cannot shadow the live RDB), then walks the `PART`
-    /// chain. `rdb_BlockBytes` must match the source's
+    /// chain. A read that fails *during the scan* ends it rather than
+    /// failing the parse — see [`RdbError::NoRdsk`] for why, and for
+    /// what it costs. `rdb_BlockBytes` must match the source's
     /// [`block_size`](BlockSource::block_size) — see
     /// [`RdbError::BlockBytesMismatch`].
     pub fn parse<S: BlockSource>(disk: &mut S) -> Result<Self, RdbError<S::Error>> {
@@ -1654,7 +1700,19 @@ impl Rdb {
             None => RDB_LOCATION_LIMIT,
         };
         for lba in 0..scan_end {
-            disk.read_block(lba, &mut buf).map_err(RdbError::Io)?;
+            // A read that fails ends the *scan*, it does not fail the
+            // parse: a source that declines to give a block count
+            // (`block_count() == None`) can only signal its end of
+            // medium by failing a read, and a disk of four blocks with
+            // no RDB on it must answer `NoRdsk` — the documented
+            // outcome — rather than an `Io` about block 4. The cost is
+            // that a genuinely failing device gets `NoRdsk` from the
+            // probe too, which is the right trade: the probe is a
+            // search, not a health check, and every read *after* an
+            // RDSK is found still reports its error faithfully.
+            if disk.read_block(lba, &mut buf).is_err() {
+                break;
+            }
             if be32(&buf, hdr::ID) == id::RDSK && checksum_ok(&buf) {
                 rdsk_at = Some(lba);
                 break;
@@ -1708,7 +1766,7 @@ impl Rdb {
 
         let mut partitions = Vec::new();
         walk_chain(disk, partition_list, id::PART, &mut buf, |b, lba| {
-            partitions.push(parse_part(b, lba)?);
+            partitions.push(parse_part(b, lba));
             Ok(())
         })?;
         rdb.partitions = partitions;
@@ -1801,7 +1859,10 @@ impl Rdb {
     /// 2. every partition extent (`start_lba..start_lba + block_len`,
     ///    device blocks) overlapping that same area;
     /// 3. every partition whose `de_HighCyl` is below its `de_LowCyl`;
-    /// 4. every pair of partitions whose extents intersect.
+    /// 4. every pair of partitions whose extents intersect;
+    /// 5. every partition whose `de_TableSize` is too short to reach
+    ///    `de_DosType`, whose fields below it are therefore absent
+    ///    rather than zero (see [`ValidationIssue::EnvecTooShort`]).
     ///
     /// Check 4 goes beyond the RDB-versus-partition case, but it is the
     /// same failure — two owners, both writing — and costs one pass over
@@ -1896,6 +1957,22 @@ impl Rdb {
                         len: end - start,
                     });
                 }
+            }
+        }
+
+        // Short envecs last: a partition whose `de_TableSize` does not
+        // reach `de_DosType` parsed anyway (see `parse_part`), and this
+        // is where a consumer is told that some of what it is reading
+        // was not on the block. Like the inverted case, it explains a
+        // partition's absence from the extent checks above.
+        for (index, p) in self.partitions.iter().enumerate() {
+            let table_size = p.envec_raw.first().copied().unwrap_or(0);
+            if (table_size as usize) < de::DOS_TYPE {
+                issues.push(ValidationIssue::EnvecTooShort {
+                    index,
+                    name: p.name.clone(),
+                    table_size,
+                });
             }
         }
 
@@ -2029,20 +2106,31 @@ fn padded_ascii(buf: &[u8], (off, len): (usize, usize)) -> String {
     field[..end].iter().map(|&b| b as char).collect()
 }
 
-fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
+/// Parse one `PART` block. Infallible by design: every field is either
+/// present, or absent and reported as such.
+///
+/// **A short `DosEnvec` is tolerated, not refused.** `de_TableSize`
+/// counts the longwords after itself, and a block declaring fewer than
+/// `de_DosType`'s index has no dostype and — below that — no
+/// `de_LowCyl`/`de_HighCyl` either, so it describes no extent. Failing
+/// the whole parse on it (which this crate used to do) contradicts the
+/// read-everything philosophy in the most expensive way: one damaged
+/// `PART` block would deny a recovery tool every *other* partition on
+/// the disk. So the partition is parsed with what is there, fields
+/// beyond `de_TableSize` read as zero — giving a zero-length extent,
+/// the same treatment an inverted range gets — and
+/// [`ValidationIssue::EnvecTooShort`] reports it where the rest of the
+/// layout damage is reported. `envec_raw` still holds exactly the
+/// longwords the block carried, so an editor round-trips such a
+/// partition byte for byte.
+fn parse_part(buf: &[u8], lba: u64) -> Partition {
     let envec = |i: usize| be32(buf, part::ENVIRONMENT + i * 4);
 
-    // de_TableSize counts longwords *after itself*; DOS_TYPE is the
-    // last field this crate requires. Enforced before reading past it.
     let table_size = envec(de::TABLE_SIZE);
-    if (table_size as usize) < de::DOS_TYPE {
-        return Err(RdbError::EnvecTooShort { lba, table_size });
-    }
-
     // How many envec longwords the block physically holds. de_TableSize
-    // is attacker-controlled, so every read past DOS_TYPE — the
-    // optional fields and envec_raw alike — is clamped to this, and a
-    // hostile 0xFFFFFFFF truncates instead of running off the block.
+    // is attacker-controlled, so every read — the optional fields and
+    // envec_raw alike — is clamped to this, and a hostile 0xFFFFFFFF
+    // truncates instead of running off the block.
     let envec_capacity = (buf.len() - part::ENVIRONMENT) / 4;
     let present = |i: usize| {
         if table_size as usize >= i && i < envec_capacity {
@@ -2051,6 +2139,12 @@ fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
             None
         }
     };
+    // A field the declared envec does not reach is *not on the block*,
+    // whatever bytes happen to lie at its offset: `de_TableSize` is how
+    // long the structure a mount copies out is, so reading past it would
+    // be inventing a value. Zero is what an absent numeric field reads
+    // as, which for the extent pair means no extent at all.
+    let field = |i: usize| present(i).unwrap_or(0);
     // table_size + 1 longwords, TableSize itself included; saturating
     // so table_size == u32::MAX cannot wrap to zero.
     let raw_len = (table_size as usize).saturating_add(1).min(envec_capacity);
@@ -2063,14 +2157,14 @@ fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
     let name_bytes = &buf[part::DRIVE_NAME + 1..part::DRIVE_NAME + 1 + name_len];
     let name: String = name_bytes.iter().map(|&b| b as char).collect();
 
-    let surfaces = envec(de::SURFACES) as u64;
-    let blocks_per_track = envec(de::BLOCKS_PER_TRACK) as u64;
+    let surfaces = field(de::SURFACES) as u64;
+    let blocks_per_track = field(de::BLOCKS_PER_TRACK) as u64;
     // Two u32s widened first, so this product alone cannot exceed u64.
     // Everything downstream multiplies it by a *third* u32 and so can,
     // which is why the extent arithmetic below saturates.
     let cylinder_blocks = surfaces * blocks_per_track;
-    let low_cyl = envec(de::LOW_CYL);
-    let high_cyl = envec(de::HIGH_CYL);
+    let low_cyl = field(de::LOW_CYL);
+    let high_cyl = field(de::HIGH_CYL);
     let flags = be32(buf, part::FLAGS);
 
     // `de_HighCyl` is inclusive, so the span is `high - low + 1` — but
@@ -2089,28 +2183,28 @@ fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
         None => 0,
     };
 
-    Ok(Partition {
+    Partition {
         part_block: lba,
         name,
         bootable: flags & 1 != 0,
         no_automount: flags & 2 != 0,
         start_lba: (low_cyl as u64).saturating_mul(cylinder_blocks),
         block_len,
-        dos_type: envec(de::DOS_TYPE),
-        boot_pri: envec(de::BOOT_PRI) as i32,
-        max_transfer: envec(de::MAX_TRANSFER),
-        mask: envec(de::MASK),
+        dos_type: field(de::DOS_TYPE),
+        boot_pri: field(de::BOOT_PRI) as i32,
+        max_transfer: field(de::MAX_TRANSFER),
+        mask: field(de::MASK),
         cylinder_blocks,
         low_cyl,
         high_cyl,
-        num_buffers: envec(de::NUM_BUFFERS),
-        buf_mem_type: envec(de::BUF_MEM_TYPE),
-        size_block_longs: envec(de::SIZE_BLOCK),
+        num_buffers: field(de::NUM_BUFFERS),
+        buf_mem_type: field(de::BUF_MEM_TYPE),
+        size_block_longs: field(de::SIZE_BLOCK),
         baud: present(de::BAUD),
         control: present(de::CONTROL),
         boot_blocks: present(de::BOOT_BLOCKS),
         envec_raw,
-    })
+    }
 }
 
 /// The values this crate writes into a new `PART` block's `DosEnvec`
@@ -3766,7 +3860,41 @@ struct RawBlock {
     bytes: Vec<u8>,
 }
 
+/// Where one block of the *published* layout pointed when
+/// [`RdbEditor::open`] read it — the shape of the chain that is on the
+/// disk right now, and that a commit must leave walkable until the
+/// `RDSK` flip replaces it wholesale.
+///
+/// Recorded from the block's own bytes rather than derived from the
+/// order the structures were read in, because that order is exactly
+/// what the edits are allowed to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OriginalLinks {
+    /// The block this describes.
+    lba: u64,
+    /// Its `pb_Next`/`fhb_Next`/`bbb_Next`/`lsb_Next` — one field at one
+    /// offset for all four chains.
+    next: u32,
+    /// For an `FSHD`, its `fhb_SegListBlocks`: the head of the driver
+    /// chain hanging off it, which is a successor of the same kind.
+    /// [`CHAIN_END`] for every other block, which has none.
+    seg_list: u32,
+}
+
 impl RawBlock {
+    /// What this block, as read from the disk, points at.
+    fn links(&self, is_fshd: bool) -> OriginalLinks {
+        OriginalLinks {
+            lba: self.lba,
+            next: be32(&self.bytes, chain::NEXT),
+            seg_list: if is_fshd {
+                be32(&self.bytes, fshd::PATCHED + fshd::SEG_LIST_INDEX * 4)
+            } else {
+                CHAIN_END
+            },
+        }
+    }
+
     fn read<S: BlockSource>(
         disk: &mut S,
         lba: u64,
@@ -3838,12 +3966,22 @@ pub enum EditError {
         /// `de_HighCyl` as asked for — below `low_cyl`, which is the issue.
         high_cyl: u32,
     },
-    /// An extent's last cylinder is past the last one the disk has.
+    /// An extent runs past the end of the medium.
+    ///
+    /// Decided in device blocks — the extent's last block against the
+    /// block count the drive geometry gives (`rdb_Cylinders`,
+    /// `rdb_HiCylinder`, `rdb_Heads`, `rdb_Sectors`) — because a
+    /// partition's `de_Surfaces`/`de_BlocksPerTrack` may describe a
+    /// cylinder of a different size from the drive's, and then the two
+    /// cylinder numbers are not comparable at all.
     PastEndOfDisk {
-        /// The last cylinder asked for.
+        /// The last cylinder asked for, in the extent's own cylinders.
         high_cyl: u32,
-        /// The last cylinder a partition may use: the lower of
-        /// `rdb_HiCylinder` and `rdb_Cylinders - 1`.
+        /// The last cylinder the extent's own geometry can reach on the
+        /// medium: the drive's block count divided by the extent's
+        /// cylinder, less one. The lower of `rdb_HiCylinder` and
+        /// `rdb_Cylinders - 1` whenever the extent's geometry and the
+        /// drive's agree, which is the usual case.
         last_cylinder: u32,
     },
     /// An extent reaches into the RDB area — the overlap this crate
@@ -3852,9 +3990,11 @@ pub enum EditError {
     OverlapsRdbArea {
         /// The first cylinder asked for.
         low_cyl: u32,
-        /// The first cylinder available to partitions: `rdb_LoCylinder`,
+        /// The first cylinder available to partitions — `rdb_LoCylinder`,
         /// or the cylinder after the one holding `rdb_RDBBlocksHi` if
-        /// that is higher.
+        /// that is higher — in the *extent's own* cylinders, the floor
+        /// itself being decided in device blocks for the reason
+        /// [`PastEndOfDisk`](Self::PastEndOfDisk) gives.
         lo_cylinder: u32,
     },
     /// An extent overlaps another partition's. Reported in *device
@@ -3981,15 +4121,6 @@ pub enum EditError {
         /// `rdb_Cylinders * rdb_Heads * rdb_Sectors`.
         disk_blocks: u64,
     },
-    /// A block this crate had just built did not parse back.
-    ///
-    /// Unreachable by construction — every such block carries
-    /// [`envec_defaults::TABLE_SIZE`], and an envec too short to reach
-    /// `de_DosType` is the only thing the parse refuses — but the
-    /// variant is what keeps the crate's no-panic rule structural: the
-    /// alternative here is an `unwrap`, and the editor is left exactly
-    /// as it was rather than carrying a block its model cannot describe.
-    UnreadableBlock,
 }
 
 impl core::fmt::Display for EditError {
@@ -4102,9 +4233,6 @@ impl core::fmt::Display for EditError {
                 f,
                 "block {last_block} is past the end of a disk of {disk_blocks} blocks"
             ),
-            EditError::UnreadableBlock => {
-                write!(f, "a block this crate had just built did not parse back")
-            }
         }
     }
 }
@@ -4506,10 +4634,13 @@ pub struct RdbEditor {
     lsegs: Vec<Vec<RawBlock>>,
     badbs: Vec<RawBlock>,
     /// Every block the layout occupied when [`open`](Self::open) read
-    /// it, `RDSK` aside — kept because a structure the edits *removed*
-    /// is gone from the lists above, and the blocks a commit must zero
-    /// are exactly the ones this holds and the new layout does not.
-    original: Vec<u64>,
+    /// it, `RDSK` aside, with the pointers each one carried — kept
+    /// because a structure the edits *removed* is gone from the lists
+    /// above, and the blocks a commit must zero are exactly the ones
+    /// this holds and the new layout does not; and because the old
+    /// chain's shape is what [`plan`](Self::plan) must not disturb
+    /// before the `RDSK` flip.
+    original: Vec<OriginalLinks>,
     /// [`BlockSource::block_count`] as `open` found it, when the source
     /// said — the disk-size authority [`expand_rdb_area`](Self::expand_rdb_area)
     /// and [`set_geometry_cylinders`](Self::set_geometry_cylinders)
@@ -4570,10 +4701,10 @@ impl RdbEditor {
 
         let original = parts
             .iter()
-            .chain(fshds.iter())
-            .chain(lsegs.iter().flatten())
-            .chain(badbs.iter())
-            .map(|b| b.lba)
+            .map(|b| b.links(false))
+            .chain(fshds.iter().map(|b| b.links(true)))
+            .chain(lsegs.iter().flatten().map(|b| b.links(false)))
+            .chain(badbs.iter().map(|b| b.links(false)))
             .collect();
 
         Ok(Self {
@@ -4629,14 +4760,7 @@ impl RdbEditor {
             });
         }
         patch(&mut self.parts[index].bytes);
-        // `parse_part` fails only on a `de_TableSize` below `de_DosType`,
-        // which `open` already cleared and which no setter can lower —
-        // so this is the unreachable branch, and leaving the model
-        // untouched is better than an `unwrap` in a crate that refuses to
-        // panic on data.
-        if let Ok(p) = parse_part::<()>(&self.parts[index].bytes, self.parts[index].lba) {
-            self.rdb.partitions[index] = p;
-        }
+        self.rdb.partitions[index] = parse_part(&self.parts[index].bytes, self.parts[index].lba);
         Ok(())
     }
 
@@ -5104,8 +5228,10 @@ impl RdbEditor {
     ///
     /// # What it refuses
     ///
-    /// Shrinking below any partition's `de_HighCyl`
-    /// ([`EditError::CylindersBelowPartition`], naming it), and shrinking
+    /// Shrinking below any partition's last *block*
+    /// ([`EditError::CylindersBelowPartition`], naming it — in blocks
+    /// because a partition's `de_Surfaces`/`de_BlocksPerTrack` cylinder
+    /// need not be the drive's), and shrinking
     /// so far that the RDB area itself no longer fits the disk
     /// ([`EditError::ClaimsBlocksPastEndOfDisk`]). Growing past the block
     /// count the source reported is refused by the same variant; when
@@ -5120,8 +5246,15 @@ impl RdbEditor {
             });
         }
         let hi_cylinder = cylinders.saturating_sub(1);
+        let total = (cylinders as u64).saturating_mul(cyl_blocks);
+        // In device blocks, for the reason [`EditError::PastEndOfDisk`]
+        // gives: a partition's own cylinder need not be the drive's, so
+        // comparing its `de_HighCyl` against the drive's new last
+        // cylinder can truncate a divergent-geometry partition while the
+        // guard reads as passed. Its last block against the medium's
+        // block count is the comparison that means something.
         for (index, p) in self.rdb.partitions.iter().enumerate() {
-            if p.block_len != 0 && p.high_cyl > hi_cylinder {
+            if p.block_len != 0 && p.start_lba.saturating_add(p.block_len) > total {
                 return Err(EditError::CylindersBelowPartition {
                     index,
                     name: p.name.clone(),
@@ -5130,7 +5263,6 @@ impl RdbEditor {
                 });
             }
         }
-        let total = (cylinders as u64).saturating_mul(cyl_blocks);
         // The area is inside the disk or the disk is not the disk. This
         // also disposes of `cylinders == 0`, whose zero blocks cannot
         // hold an area that always has at least block 0 in it.
@@ -5182,18 +5314,53 @@ impl RdbEditor {
             .min(self.rdb.cylinders.saturating_sub(1))
     }
 
-    /// The first cylinder a partition may start on: `rdb_LoCylinder`, or
-    /// the cylinder after the one holding `rdb_RDBBlocksHi` when the
-    /// `RDSK` understates its own area.
+    /// How many device blocks the drive geometry says the medium has:
+    /// [`last_cylinder`](Self::last_cylinder) plus one, times the
+    /// *drive's* `rdb_Heads * rdb_Sectors`.
+    ///
+    /// Blocks rather than cylinders because a cylinder is not one unit
+    /// on an RDB: `de_Surfaces` and `de_BlocksPerTrack` are per
+    /// partition and are allowed to disagree with the drive's, so
+    /// "cylinder 100" means a different block on a partition with a
+    /// divergent geometry than it does on the drive. Comparing the two
+    /// numbers directly — which this crate used to do — lets such a
+    /// partition extend past the end of the medium while every check
+    /// passes. Device blocks are the unit both sides genuinely share,
+    /// and the one [`Rdb::validate`] already thinks in.
+    fn disk_blocks_from_geometry(&self) -> u64 {
+        let cyl_blocks = self.rdb.heads as u64 * self.rdb.sectors as u64;
+        (self.last_cylinder() as u64 + 1).saturating_mul(cyl_blocks)
+    }
+
+    /// The first device block a partition may claim: `rdb_LoCylinder`
+    /// in the *drive's* cylinders, or the block after `rdb_RDBBlocksHi`
+    /// when the `RDSK` understates its own area.
+    ///
+    /// In blocks for [`disk_blocks_from_geometry`](Self::disk_blocks_from_geometry)'s
+    /// reason: `rdb_LoCylinder` is a drive cylinder and the extent being
+    /// checked may measure cylinders differently, so the floor is
+    /// converted to the extent's own unit only where it is *reported*.
+    fn first_partition_block(&self) -> u64 {
+        let drive_cyl_blocks = self.rdb.heads as u64 * self.rdb.sectors as u64;
+        (self.rdb.lo_cylinder as u64)
+            .saturating_mul(drive_cyl_blocks)
+            .max(self.rdb.rdb_blocks_hi as u64 + 1)
+    }
+
+    /// [`first_partition_block`](Self::first_partition_block) rounded up
+    /// into cylinders of `cyl_blocks` blocks — the number an error
+    /// message about a `de_LowCyl` has to be in to mean anything.
     fn first_partition_cylinder(&self, cyl_blocks: u64) -> u32 {
         if cyl_blocks == 0 {
             return self.rdb.lo_cylinder;
         }
         // `div_ceil` would say this, but it is newer than the MSRV.
-        let after_area = (self.rdb.rdb_blocks_hi as u64 + cyl_blocks) / cyl_blocks;
-        self.rdb
-            .lo_cylinder
-            .max(after_area.min(u32::MAX as u64) as u32)
+        // The addition saturates: `cyl_blocks` is two parsed longwords
+        // multiplied together and can sit within a block of the top of
+        // the range.
+        let first = self.first_partition_block();
+        let cylinder = first.saturating_add(cyl_blocks - 1) / cyl_blocks;
+        cylinder.min(u32::MAX as u64) as u32
     }
 
     /// Does this extent reach into the RDB area? The same arithmetic
@@ -5216,20 +5383,33 @@ impl RdbEditor {
         if high_cyl < low_cyl {
             return Err(EditError::CylindersInverted { low_cyl, high_cyl });
         }
-        let last_cylinder = self.last_cylinder();
-        if high_cyl > last_cylinder {
-            return Err(EditError::PastEndOfDisk {
-                high_cyl,
-                last_cylinder,
-            });
-        }
         let start_lba = (low_cyl as u64).saturating_mul(cyl_blocks);
         let block_len = (high_cyl as u64 - low_cyl as u64 + 1).saturating_mul(cyl_blocks);
-        let lo_cylinder = self.first_partition_cylinder(cyl_blocks);
-        if low_cyl < lo_cylinder || self.overlaps_rdb_area(start_lba, block_len) {
+        // In blocks, not cylinders: `cyl_blocks` is the *extent's* own
+        // cylinder and the drive's may be a different size entirely, so
+        // `high_cyl` and `rdb_Cylinders - 1` are not comparable
+        // quantities. The reported `last_cylinder` is therefore the last
+        // cylinder *this extent's geometry* can reach on the medium,
+        // derived from the block count — which is the same number the
+        // drive's own last cylinder is, whenever the two geometries
+        // agree.
+        let disk_blocks = self.disk_blocks_from_geometry();
+        if start_lba.saturating_add(block_len) > disk_blocks {
+            let last_cylinder = (disk_blocks / cyl_blocks).saturating_sub(1);
+            return Err(EditError::PastEndOfDisk {
+                high_cyl,
+                last_cylinder: last_cylinder.min(u32::MAX as u64) as u32,
+            });
+        }
+        // The low end is the same question in the same unit: the floor
+        // `rdb_LoCylinder` sets is a *drive* cylinder, so an extent
+        // measured in cylinders of another size is compared to it as
+        // blocks and only reported in cylinders.
+        if start_lba < self.first_partition_block() || self.overlaps_rdb_area(start_lba, block_len)
+        {
             return Err(EditError::OverlapsRdbArea {
                 low_cyl,
-                lo_cylinder,
+                lo_cylinder: self.first_partition_cylinder(cyl_blocks),
             });
         }
         for (index, p) in self.rdb.partitions.iter().enumerate() {
@@ -5273,8 +5453,23 @@ impl RdbEditor {
     ///
     /// The count is **floored**, as on create: a size is a ceiling, and
     /// below one cylinder there is no partition to write.
+    ///
+    /// `cyl_blocks` comes from two parsed longwords and so is only
+    /// bounded by `u32::MAX * u32::MAX`: a hostile `rdb_Heads` and
+    /// `rdb_Sectors` make a cylinder larger than the address space.
+    /// The multiplication saturates rather than overflowing (a debug
+    /// panic, and worse in release: a wrap to zero and then a division
+    /// by it), which lands such a geometry in
+    /// [`EditError::PartitionTooSmall`] — the honest answer, since no
+    /// size a caller can express reaches one of those cylinders.
     fn place_by_size(&self, bytes: u64, cyl_blocks: u64) -> Result<(u32, u32), EditError> {
-        let cylinder_bytes = cyl_blocks * self.block_size as u64;
+        if cyl_blocks == 0 {
+            return Err(EditError::UnusableGeometry {
+                heads: self.rdb.heads,
+                sectors: self.rdb.sectors,
+            });
+        }
+        let cylinder_bytes = cyl_blocks.saturating_mul(self.block_size as u64);
         let want = bytes / cylinder_bytes;
         if want == 0 {
             return Err(EditError::PartitionTooSmall {
@@ -5411,8 +5606,7 @@ impl RdbEditor {
         fill_part_fields(&mut bytes, &spec, &name, range, CHAIN_END, ctx);
         // The block is sealed by `prepare`, like every other block a
         // commit writes; sealing it here as well would be dead work.
-        let parsed =
-            parse_part::<()>(&bytes, UNPLACED_BLOCK).map_err(|_| EditError::UnreadableBlock)?;
+        let parsed = parse_part(&bytes, UNPLACED_BLOCK);
         self.parts.push(RawBlock {
             lba: UNPLACED_BLOCK,
             bytes,
@@ -5761,18 +5955,32 @@ impl RdbEditor {
     /// # Where the blocks go
     ///
     /// Every structure keeps the block it was found on when that block
-    /// is inside the area, so an edit that changes no structure *count*
-    /// moves nothing. Each block is self-describing and sealed, so an
-    /// interrupted commit leaves a mixture of old and new blocks on an
-    /// unchanged chain, every one of them valid: there is no
-    /// intermediate state in which a chain leads into garbage.
+    /// is inside the area **and its chain pointers do not change**, so a
+    /// metadata edit moves nothing at all. A block whose `Next` (or, for
+    /// an `FSHD`, whose seg-list head) would differ is relocated
+    /// instead: it is the still-published `RDSK` that walks through that
+    /// block until the flip, and rewriting it there would splice the new
+    /// table into the old one. The rule cascades back along the chain —
+    /// re-pointing a predecessor is itself a pointer change — so a
+    /// structural edit typically relocates the whole chain and zeroes
+    /// what it vacated, afterwards.
+    ///
+    /// The result is that an interrupted commit leaves *either the old
+    /// table or the new one*, never a mixture of the two: each block is
+    /// self-describing and sealed, no live block is overwritten by a
+    /// different structure, and no live block changes what it points at.
+    /// Metadata is the one thing a prefix can show early — the old chain
+    /// reading a renamed partition is old-or-new per field on a table
+    /// whose shape did not change — and every partition is still there,
+    /// whole, exactly once.
     ///
     /// A structure that has nowhere to go — one added by
     /// [`add_partition`](Self::add_partition),
     /// [`add_filesystem`](Self::add_filesystem) or
-    /// [`set_bad_blocks`](Self::set_bad_blocks), or one found *outside*
-    /// the area, the damaged-by-construction case
-    /// [`ValidationIssue::BlockOutsideRdbArea`] reports — is allocated
+    /// [`set_bad_blocks`](Self::set_bad_blocks), one found *outside*
+    /// the area (the damaged-by-construction case
+    /// [`ValidationIssue::BlockOutsideRdbArea`] reports), or one the
+    /// pointer rule above evicted — is allocated
     /// in two tiers. First choice is the lowest block **neither** layout
     /// uses: a hole an earlier edit left, or headroom below
     /// `rdb_RDBBlocksHi`. That keeps the old chains walkable right up to
@@ -5877,12 +6085,61 @@ impl RdbEditor {
     ///
     /// **Minimal motion**: a structure already inside the area stays
     /// exactly where it is, and only a structure that has nowhere (a
-    /// block outside the area, or — once adding lands — a structure that
-    /// did not exist before) is allocated the lowest block the current
-    /// layout does not occupy. Nothing live is ever overwritten by a
-    /// *different* structure, which is what makes the crash shape hold:
-    /// the only blocks rewritten in place are the ones being rewritten
-    /// as themselves.
+    /// block outside the area, a structure that did not exist before,
+    /// or one the rule below evicts) is allocated the lowest block the
+    /// current layout does not occupy. Nothing live is ever overwritten
+    /// by a *different* structure, which is half of what makes the crash
+    /// shape hold: the only blocks rewritten in place are the ones being
+    /// rewritten as themselves.
+    ///
+    /// # The other half: a kept block may not change where it points
+    ///
+    /// Rewriting a block as itself is safe only while the *old* chain
+    /// still means what it meant. A block written before the `RDSK`
+    /// flip is a block the old, still-published `RDSK` walks through, so
+    /// changing its `Next` splices the new structure into the old table:
+    /// interrupt the commit there and the disk carries a chain that is
+    /// neither the old table nor the new one but a checksum-valid
+    /// mixture of both — a deleted partition still at the head, a new
+    /// one overlapping it spliced in behind. Every block of it sealed,
+    /// every extent mutually destructive.
+    ///
+    /// So a kept block whose successors change is **relocated** instead:
+    /// it is written at a block the old layout does not use, its old
+    /// block is left alone until the zeroing pass, and the old chain
+    /// walks through untouched bytes right up to the flip. Successors
+    /// means both pointers a block can carry — `Next`, and an `FSHD`'s
+    /// `fhb_SegListBlocks`. Since relocating a block changes what its
+    /// predecessor must point at, the rule cascades back along the
+    /// chain; the loop below runs it to a fixed point, which terminates
+    /// because a structure is only ever added to the relocated set.
+    ///
+    /// **A change that is not a pointer stays in place.** A renamed
+    /// partition, a new `de_DosType`, a different `boot_pri`: the old
+    /// chain reads the new metadata, which is a per-field old-or-new
+    /// answer on a table whose *shape* did not change, and every
+    /// partition is still there, whole, exactly once. That is the
+    /// interruption this crate has always promised, and it needs no
+    /// motion.
+    ///
+    /// The property survives only while the *first* allocation tier has
+    /// blocks: falling back to a block the old layout is vacating
+    /// overwrites the old table by definition. That is the documented
+    /// cost of a full area, and the reason [`commit`](Self::commit)
+    /// never shrinks the lease.
+    /// Was `lba` part of the layout [`open`](Self::open) found? Blocks
+    /// that were are off-limits to the first allocation tier and are
+    /// zeroed if nothing lands on them.
+    fn was_original(&self, lba: u64) -> bool {
+        self.original.iter().any(|b| b.lba == lba)
+    }
+
+    /// What the block at `lba` pointed at when it was read, or `None`
+    /// if the published layout does not use that block at all.
+    fn original_links(&self, lba: u64) -> Option<OriginalLinks> {
+        self.original.iter().copied().find(|b| b.lba == lba)
+    }
+
     fn plan<E>(&self) -> Result<CommitPlan, CommitError<E>> {
         let lo = self.rdb.rdb_blocks_lo as u64;
         let hi = self.rdb.rdb_blocks_hi as u64;
@@ -5918,66 +6175,129 @@ impl RdbEditor {
             current.push(b.lba);
         }
 
-        // `taken` is linear-scanned rather than a set: it is bounded by
-        // the area's block count, which is a few dozen blocks plus
-        // whatever driver payload the image carries, and pulling in a
-        // hash map would mean a dependency this crate does not have.
-        let mut taken: Vec<u64> = alloc::vec![rdsk];
-        let mut assigned: Vec<u64> = alloc::vec![0; current.len()];
-        let mut placed: Vec<bool> = alloc::vec![false; current.len()];
-        for (i, &lba) in current.iter().enumerate() {
-            if (lo..=hi).contains(&lba) && !taken.contains(&lba) {
+        // Who follows whom, as flat indices into `current`: the new
+        // chain shape, which is what every `Next` in `prepare` is
+        // written from. Built once, from the same flattening.
+        let parts_n = self.parts.len();
+        let mut next_of: Vec<Option<usize>> = alloc::vec![None; current.len()];
+        let mut seg_of: Vec<Option<usize>> = alloc::vec![None; current.len()];
+        for i in 1..parts_n {
+            next_of[i - 1] = Some(i);
+        }
+        let mut at = parts_n;
+        let mut fshd_positions: Vec<usize> = Vec::with_capacity(self.fshds.len());
+        for chain in &self.lsegs {
+            fshd_positions.push(at);
+            if !chain.is_empty() {
+                seg_of[at] = Some(at + 1);
+            }
+            for j in 1..chain.len() {
+                next_of[at + j] = Some(at + j + 1);
+            }
+            at += 1 + chain.len();
+        }
+        for w in fshd_positions.windows(2) {
+            next_of[w[0]] = Some(w[1]);
+        }
+        for i in at + 1..current.len() {
+            next_of[i - 1] = Some(i);
+        }
+
+        // Structures the chain-shape rule has evicted from the block
+        // they were found on. Never cleared, only added to, which is
+        // what makes the loop below terminate.
+        let mut relocate: Vec<bool> = alloc::vec![false; current.len()];
+        let (assigned, taken) = loop {
+            // `taken` is linear-scanned rather than a set: it is bounded
+            // by the area's block count, which is a few dozen blocks
+            // plus whatever driver payload the image carries, and
+            // pulling in a hash map would mean a dependency this crate
+            // does not have.
+            let mut taken: Vec<u64> = alloc::vec![rdsk];
+            let mut assigned: Vec<u64> = alloc::vec![0; current.len()];
+            let mut placed: Vec<bool> = alloc::vec![false; current.len()];
+            for (i, &lba) in current.iter().enumerate() {
+                if !relocate[i] && (lo..=hi).contains(&lba) && !taken.contains(&lba) {
+                    assigned[i] = lba;
+                    placed[i] = true;
+                    taken.push(lba);
+                }
+            }
+            // Allocation is two tiers, and the order is the crash shape.
+            //
+            // A structure with nowhere to go takes the lowest block that
+            // *neither* layout uses — a hole a previous edit left, or
+            // headroom below `rdb_RDBBlocksHi` — so the old chains stay
+            // walkable right up to the `RDSK` flip and the swap is
+            // genuinely atomic. That is §7.4's option (b), and it is why
+            // the area is never shrunk.
+            //
+            // Only when no such block is left does it fall back to a
+            // block the old layout is *vacating* in this same commit.
+            // Still correct — the new `RDSK` publishes the new chains,
+            // and the zeroing pass runs after it — but from the moment
+            // such a block is overwritten the *old* table can no longer
+            // be walked past it. That is the honest cost of a full area,
+            // not something to hide: the alternative is refusing an edit
+            // the format allows.
+            let mut fresh = lo;
+            let mut vacated = lo;
+            for i in 0..assigned.len() {
+                if placed[i] {
+                    continue;
+                }
+                while fresh <= hi && (taken.contains(&fresh) || self.was_original(fresh)) {
+                    fresh += 1;
+                }
+                let lba = if fresh <= hi {
+                    fresh
+                } else {
+                    while vacated <= hi && taken.contains(&vacated) {
+                        vacated += 1;
+                    }
+                    if vacated > hi {
+                        let needed = current.len() as u64 + u64::from(rdsk >= lo);
+                        return Err(CommitError::RdbAreaTooSmall {
+                            needed,
+                            available: hi - lo + 1,
+                            lo,
+                            hi,
+                        });
+                    }
+                    vacated
+                };
                 assigned[i] = lba;
                 placed[i] = true;
                 taken.push(lba);
             }
-        }
-        // Allocation is two tiers, and the order is the crash shape.
-        //
-        // A structure with nowhere to go takes the lowest block that
-        // *neither* layout uses — a hole a previous edit left, or
-        // headroom below `rdb_RDBBlocksHi` — so the old chains stay
-        // walkable right up to the `RDSK` flip and the swap is genuinely
-        // atomic. That is §7.4's option (b), and it is why the area is
-        // never shrunk.
-        //
-        // Only when no such block is left does it fall back to a block
-        // the old layout is *vacating* in this same commit. Still
-        // correct — the new `RDSK` publishes the new chains, and the
-        // zeroing pass runs after it — but from the moment such a block
-        // is overwritten the *old* table can no longer be walked past
-        // it. That is the honest cost of a full area, not something to
-        // hide: the alternative is refusing an edit the format allows.
-        let mut fresh = lo;
-        let mut vacated = lo;
-        for i in 0..assigned.len() {
-            if placed[i] {
-                continue;
-            }
-            while fresh <= hi && (taken.contains(&fresh) || self.original.contains(&fresh)) {
-                fresh += 1;
-            }
-            let lba = if fresh <= hi {
-                fresh
-            } else {
-                while vacated <= hi && taken.contains(&vacated) {
-                    vacated += 1;
-                }
-                if vacated > hi {
-                    let needed = current.len() as u64 + u64::from(rdsk >= lo);
-                    return Err(CommitError::RdbAreaTooSmall {
-                        needed,
-                        available: hi - lo + 1,
-                        lo,
-                        hi,
-                    });
-                }
-                vacated
+
+            // The chain-shape rule, run to a fixed point: a block kept
+            // where the old table has it must be written with the
+            // pointers the old table reads there, or the old table stops
+            // being the old table the moment it lands.
+            let pointer = |slot: Option<usize>| match slot {
+                Some(k) => assigned[k] as u32,
+                None => CHAIN_END,
             };
-            assigned[i] = lba;
-            placed[i] = true;
-            taken.push(lba);
-        }
+            let mut changed = false;
+            for i in 0..current.len() {
+                if relocate[i] || assigned[i] != current[i] {
+                    continue;
+                }
+                // A block the old layout never used is not on the old
+                // chain, so nothing reads it before the flip and its
+                // pointers are free to say anything.
+                if let Some(old) = self.original_links(assigned[i]) {
+                    if old.next != pointer(next_of[i]) || old.seg_list != pointer(seg_of[i]) {
+                        relocate[i] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break (assigned, taken);
+            }
+        };
 
         // Back into the shapes, in the order they were flattened.
         let mut at = 0usize;
@@ -6016,7 +6336,7 @@ impl RdbEditor {
         let mut zeroed: Vec<u64> = self
             .original
             .iter()
-            .copied()
+            .map(|b| b.lba)
             .filter(|lba| (lo..=hi).contains(lba) && !taken.contains(lba))
             .collect();
         zeroed.sort_unstable();
@@ -6759,6 +7079,56 @@ mod tests {
         assert_eq!(Rdb::parse(&mut disk).unwrap_err(), RdbError::NoRdsk);
     }
 
+    /// A source that declines to say how many blocks it has, and runs
+    /// out before the scan does, is `NoRdsk` — not the `Io` its own
+    /// end-of-medium produced.
+    ///
+    /// `block_count() == None` is legitimate (a raw device that will not
+    /// answer), and such a source can only signal its end by failing a
+    /// read. The probe is a search: it stops when the medium does, and
+    /// reports what it was looking for and did not find.
+    #[test]
+    fn a_short_source_that_will_not_say_its_size_is_no_rdsk() {
+        struct EndlessProbe {
+            data: Vec<u8>,
+        }
+        impl BlockSource for EndlessProbe {
+            type Error = &'static str;
+            fn block_size(&self) -> usize {
+                512
+            }
+            fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+                let off = lba as usize * 512;
+                if off + 512 > self.data.len() {
+                    return Err("past the end of the medium");
+                }
+                buf.copy_from_slice(&self.data[off..off + 512]);
+                Ok(())
+            }
+            fn block_count(&self) -> Option<u64> {
+                None
+            }
+        }
+
+        let mut disk = EndlessProbe {
+            data: vec![0u8; 4 * 512],
+        };
+        assert_eq!(Rdb::parse(&mut disk), Err(RdbError::NoRdsk));
+
+        // But a read failure *after* the RDSK is found is still an
+        // error: the probe's tolerance ends where the parse begins.
+        let mut disk = EndlessProbe {
+            data: one_partition_image(3),
+        };
+        // The RDSK is on block 3 and its PART chain leads to block 4,
+        // which the medium no longer has.
+        disk.data.truncate(4 * 512);
+        assert_eq!(
+            Rdb::parse(&mut disk),
+            Err(RdbError::Io("past the end of the medium"))
+        );
+    }
+
     /// An `RDSK` ID with a bad checksum must be skipped, not trusted —
     /// this is the stale-copy-shadows-live-RDB case.
     #[test]
@@ -6862,6 +7232,102 @@ mod tests {
             // clamping bounds the read, it does not suppress it.
             assert_eq!(p.boot_blocks, Some(2));
         }
+    }
+
+    /// A `de_TableSize` too short to reach `de_DosType` is *tolerated*:
+    /// the partition is parsed with what the envec declares, the fields
+    /// below the declaration read as zero however tempting the bytes at
+    /// their offsets are, and [`Rdb::validate`] is where the damage is
+    /// reported. One short envec must never cost a recovery tool the
+    /// rest of the table.
+    #[test]
+    fn a_short_envec_is_a_validation_issue_not_a_parse_failure() {
+        // 9 reaches de_LowCyl and stops: no HighCyl, no DosType, and the
+        // geometry longwords below it still there.
+        for table_size in [0u32, 9, 15] {
+            let mut disk = MemDisk::new(one_partition_image_envec(2, 512, table_size));
+            let rdb = Rdb::parse(&mut disk).unwrap_or_else(|e| {
+                panic!("de_TableSize {table_size} failed the whole parse: {e:?}")
+            });
+            assert_eq!(rdb.partitions.len(), 1);
+            let p = &rdb.partitions[0];
+            assert_eq!(p.name, "DH0", "the block still parses as itself");
+            assert_eq!(p.envec_raw.len(), table_size as usize + 1);
+            // Absent is zero: de_DosType is above every one of these
+            // table sizes, and a partition missing either half of its
+            // range has no extent at all — the inverted case's answer.
+            assert_eq!(p.dos_type, 0);
+            assert_eq!(
+                p.low_cyl,
+                if table_size as usize >= de::LOW_CYL {
+                    2
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                p.high_cyl,
+                if table_size as usize >= de::HIGH_CYL {
+                    9
+                } else {
+                    0
+                }
+            );
+            assert_eq!(p.block_len, if table_size == 15 { 8 * 32 } else { 0 });
+            // A `de_LowCyl` without its `de_HighCyl` is also an
+            // inverted range, and validate says both.
+            let mut expected = Vec::new();
+            if p.low_cyl > p.high_cyl {
+                expected.push(ValidationIssue::PartitionCylindersInverted {
+                    index: 0,
+                    name: String::from("DH0"),
+                    low_cyl: p.low_cyl,
+                    high_cyl: p.high_cyl,
+                });
+            }
+            expected.push(ValidationIssue::EnvecTooShort {
+                index: 0,
+                name: String::from("DH0"),
+                table_size,
+            });
+            assert_eq!(rdb.validate(), expected);
+        }
+    }
+
+    /// And the editor round-trips such a partition: the block is
+    /// preserved whole, so an edit to another partition leaves the short
+    /// envec exactly as short as it was.
+    #[test]
+    fn a_short_envec_partition_round_trips_through_an_edit() {
+        let bs = 512;
+        let mut image = one_partition_image_envec(2, bs, 9);
+        // A second, sound partition to edit, so the commit has a reason
+        // to rewrite the chain at all.
+        write_part(&mut image, bs, 4, CHAIN_END, "DH1", 128, (5, 7), 16);
+        put32(&mut image, bs, 3, chain::NEXT, 4);
+        seal(&mut image, bs, 3, 64);
+        put32(&mut image, bs, 2, rdsk::HIGH_RDSK_BLOCK, 4);
+        seal(&mut image, bs, 2, 64);
+
+        let before = image.clone();
+        let mut disk = MemDisk::new(image);
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.set_boot_priority(1, 5).unwrap();
+        let report = editor.commit(&mut disk).unwrap();
+
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.partitions.len(), 2);
+        assert_eq!(rdb.partitions[0].envec_raw.len(), 10);
+        assert_eq!(rdb.partitions[1].boot_pri, 5);
+        assert!(rdb.validate().contains(&ValidationIssue::EnvecTooShort {
+            index: 0,
+            name: String::from("DH0"),
+            table_size: 9,
+        }));
+        // Neither pointer changed, so nothing moved and the short block
+        // is byte for byte what it was.
+        assert_eq!(report.part_blocks, vec![3, 4]);
+        assert_eq!(&disk.data[3 * bs..4 * bs], &before[3 * bs..4 * bs]);
     }
 
     /// The same clamp on a 4 KB block, where the *declared* size is the
@@ -7480,6 +7946,40 @@ mod tests {
                 put_be32(&mut block, 0, id::RDSK);
                 assert!(!checksum_ok(&block));
             }
+        }
+
+        // And the arithmetic loophole: with `SummedLongs` below the
+        // floor the sum does not cover `ChkSum`, so a block whose *other*
+        // longwords happen to add to zero would pass a naive check while
+        // carrying any `ChkSum` at all. The count is the reason to
+        // reject it, not the sum.
+        for (longs, first) in [(1u32, 0u32), (2, 0xFFFF_FFFEu32)] {
+            let mut block = [0u8; 512];
+            put_be32(&mut block, 0, first);
+            put_be32(&mut block, 4, longs);
+            put_be32(&mut block, 8, 0xDEAD_BEEF);
+            let sum: u32 =
+                (0..longs).fold(0u32, |a, i| a.wrapping_add(be32(&block, i as usize * 4)));
+            assert_eq!(sum, 0, "the fixture must be the loophole case");
+            assert!(!checksum_ok(&block));
+        }
+    }
+
+    /// [`checksum_ok`] takes whatever slice a caller has, so a slice too
+    /// short to hold the header longwords it reads must be `false`
+    /// rather than an index panic — the same no-panic-on-data rule the
+    /// parse side follows.
+    #[test]
+    fn checksum_of_a_fragment_is_false_not_a_panic() {
+        let full = {
+            let mut b = vec![0u8; 512];
+            put_be32(&mut b, 0, id::RDSK);
+            seal_checksum(&mut b, 64).unwrap();
+            b
+        };
+        assert!(checksum_ok(&full));
+        for len in 0..16usize {
+            assert!(!checksum_ok(&full[..len]), "a {len}-byte slice checked out");
         }
     }
 
@@ -10280,13 +10780,19 @@ mod tests {
 
     /// **The fidelity test of this chunk**: a partition is *added* to a
     /// foreign image and every pre-existing structure comes back byte
-    /// for byte.
+    /// for byte — the whole block, every unmodelled longword of it,
+    /// only ever moved and re-chained, never rebuilt.
     ///
-    /// Exactly two things may move — the new `PART` block, and the
-    /// `pb_Next` (plus its checksum) of the block that now chains to it.
-    /// The `RDSK` does not even change: the new block lands *below*
-    /// `rdb_HighRDSKBlock` in a hole the layout was not using, and the
-    /// chain head is still the same block.
+    /// Adding to the tail of the `PART` chain changes what the last
+    /// block points at, and a block whose pointers change may not be
+    /// rewritten where the still-published `RDSK` walks through it (see
+    /// [`RdbEditor::plan`]), so the chain is *relocated* into blocks the
+    /// old layout was not using and the old blocks are zeroed after the
+    /// flip. What must not change is the content: each `PART` block
+    /// arrives at its new home identical apart from `pb_Next` and the
+    /// checksum that covers it, and the structures whose chains did not
+    /// change — the `FSHD`, its `LSEG`s, the `BADB`s — do not move at
+    /// all.
     #[test]
     fn adding_a_partition_leaves_every_other_structure_byte_identical() {
         let before = foreign_image();
@@ -10304,26 +10810,50 @@ mod tests {
         assert_eq!(editor.partitions()[2].part_block, UNPLACED_BLOCK);
 
         let report = editor.commit(&mut disk).unwrap();
-        // The lowest block neither layout uses.
-        assert_eq!(report.part_blocks, vec![F_PART0 as u64, F_PART1 as u64, 0]);
+        // The whole chain relocates, into the lowest blocks *neither*
+        // layout uses — 1 is the `RDSK`, 3 and 5 are the blocks being
+        // vacated — and the vacated pair is zeroed after the flip.
+        assert_eq!(report.part_blocks, vec![0, 2, 4]);
         assert_eq!(report.high_rdsk_block, F_HIGH_RDSK);
         assert_eq!(report.rdb_blocks_hi, F_BLOCKS_HI);
-        assert!(report.blocks_zeroed.is_empty());
+        // Sorted, so `F_PART1` (3) before `F_PART0` (5).
+        assert_eq!(report.blocks_zeroed, vec![F_PART1 as u64, F_PART0 as u64]);
 
-        let next = F_PART1 * 512 + chain::NEXT;
-        let chk = F_PART1 * 512 + hdr::CHK_SUM;
-        for off in differing_offsets(&before, &disk.data) {
-            assert!(
-                off < 512 || (next..next + 4).contains(&off) || (chk..chk + 4).contains(&off),
-                "byte {off} changed, which adding a partition did not ask for"
+        // Each moved block is its old self, apart from the one pointer
+        // that had to change and the checksum over it.
+        for (from, to) in [(F_PART0, 0usize), (F_PART1, 2)] {
+            for off in 0..512 {
+                if (chain::NEXT..chain::NEXT + 4).contains(&off)
+                    || (hdr::CHK_SUM..hdr::CHK_SUM + 4).contains(&off)
+                {
+                    continue;
+                }
+                assert_eq!(
+                    before[from * 512 + off],
+                    disk.data[to * 512 + off],
+                    "byte {off} of the PART block moved from {from} to {to} changed"
+                );
+            }
+        }
+        // Everything whose chain did not change stayed exactly put.
+        for block in [F_FSHD, F_LSEG, F_LSEG + 1, F_BADB, F_BADB + 1] {
+            assert_eq!(
+                &disk.data[block * 512..(block + 1) * 512],
+                &before[block * 512..(block + 1) * 512],
+                "block {block} moved, which adding a partition did not ask for"
             );
         }
+        // And nothing outside the RDB area was touched at all.
+        assert_eq!(
+            &disk.data[(F_BLOCKS_HI as usize + 1) * 512..],
+            &before[(F_BLOCKS_HI as usize + 1) * 512..]
+        );
 
         let rdb = Rdb::parse(&mut disk).unwrap();
         assert!(rdb.validate().is_empty());
         assert_eq!(rdb.partitions.len(), 3);
         let p = &rdb.partitions[2];
-        assert_eq!(p.part_block, 0);
+        assert_eq!(p.part_block, 4);
         assert_eq!(p.name, "EXTRA");
         assert_eq!((p.low_cyl, p.high_cyl), (9, 9));
         assert_eq!(p.start_lba, 9 * 32);
@@ -10351,6 +10881,131 @@ mod tests {
             .unwrap();
         // DH0 and DH1 are taken by the fixture.
         assert_eq!(editor.partitions()[2].name, "DH2");
+    }
+
+    /// An image whose partition's cylinder is *not* the drive's, which
+    /// the format allows: `de_Surfaces * de_BlocksPerTrack` is a per
+    /// partition number and may disagree with `rdb_Heads *
+    /// rdb_Sectors`.
+    ///
+    /// The drive is 10 cylinders of 32 blocks — 320 blocks — and DH0's
+    /// own cylinder is 64 blocks, so its cylinder 4 ends where the
+    /// drive's cylinder 9 does. Comparing the two numbers as if they
+    /// were the same unit is the bug these fixtures exist to catch.
+    fn divergent_geometry_disk() -> MemDisk {
+        let bs = 512;
+        let mut d = one_partition_image(2);
+        let e = part::ENVIRONMENT;
+        put32(&mut d, bs, 3, e + de::SURFACES * 4, 2);
+        put32(&mut d, bs, 3, e + de::BLOCKS_PER_TRACK * 4, 32);
+        put32(&mut d, bs, 3, e + de::LOW_CYL * 4, 1);
+        put32(&mut d, bs, 3, e + de::HIGH_CYL * 4, 2);
+        seal(&mut d, bs, 3, 64);
+
+        let mut disk = MemDisk::new(d);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.partitions[0].cylinder_blocks, 64);
+        assert_eq!(rdb.partitions[0].start_lba, 64);
+        assert_eq!(rdb.partitions[0].block_len, 128);
+        assert!(rdb.validate().is_empty(), "the fixture is a clean layout");
+        disk
+    }
+
+    /// **End of disk is a question about blocks, not cylinders.** A
+    /// partition whose cylinder is twice the drive's runs off the
+    /// medium at *its* cylinder 5, less than half the drive's cylinder
+    /// count — and an extent check that compared `de_HighCyl` against
+    /// `rdb_Cylinders - 1` waved it through.
+    #[test]
+    fn an_extent_past_the_medium_is_refused_in_the_partitions_own_cylinders() {
+        let mut disk = divergent_geometry_disk();
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+
+        // Cylinders 1..=4 of 64 blocks each end at block 320, which is
+        // exactly the medium's last block.
+        editor.resize_partition(0, 4).unwrap();
+        assert_eq!(editor.partitions()[0].start_lba, 64);
+        assert_eq!(editor.partitions()[0].block_len, 4 * 64);
+
+        // One more of its cylinders is 64 blocks past the end, though
+        // the drive still has cylinders 6..=9 by its own reckoning.
+        assert_eq!(
+            editor.resize_partition(0, 5).unwrap_err(),
+            EditError::PastEndOfDisk {
+                high_cyl: 5,
+                last_cylinder: 4,
+            }
+        );
+        assert_eq!(
+            editor.set_extent(0, 4, 9).unwrap_err(),
+            EditError::PastEndOfDisk {
+                high_cyl: 9,
+                last_cylinder: 4,
+            }
+        );
+        // And an *added* partition goes through the same check, in its
+        // own cylinders — which here are the drive's 32-block ones.
+        assert_eq!(
+            editor
+                .add_partition(PartitionSpec::by_cylinders(10, 10))
+                .unwrap_err(),
+            EditError::PastEndOfDisk {
+                high_cyl: 10,
+                last_cylinder: 9,
+            }
+        );
+        // The drive's own geometry is unchanged by any of it.
+        assert_eq!(editor.partitions()[0].high_cyl, 4);
+    }
+
+    /// The same unit confusion on the shrink guard: `INIT NEWGEO`
+    /// downwards must not truncate a partition, and whether it does is
+    /// decided by the partition's last *block* against the medium's.
+    #[test]
+    fn shrinking_the_geometry_is_refused_in_blocks_not_cylinders() {
+        let mut disk = divergent_geometry_disk();
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+
+        // DH0 ends at block 192; six drive cylinders of 32 blocks are
+        // exactly that, so this fits and the one below it does not —
+        // even though DH0's `de_HighCyl` is 2, far below either.
+        assert_eq!(
+            editor.set_geometry_cylinders(5).unwrap_err(),
+            EditError::CylindersBelowPartition {
+                index: 0,
+                name: String::from("DH0"),
+                high_cyl: 2,
+                cylinders: 5,
+            }
+        );
+        editor.set_geometry_cylinders(6).unwrap();
+        assert_eq!(editor.rdb().cylinders, 6);
+        assert_eq!(editor.rdb().hi_cylinder, 5);
+    }
+
+    /// A geometry whose cylinder is larger than the address space must
+    /// refuse a sized placement, not overflow computing how big it is —
+    /// a debug panic, and in release a wrap to zero and then a division
+    /// by it.
+    #[test]
+    fn a_by_size_add_refuses_an_absurd_cylinder_instead_of_panicking() {
+        let bs = 512;
+        let mut d = one_partition_image(2);
+        put32(&mut d, bs, 2, rdsk::HEADS, 1 << 28);
+        put32(&mut d, bs, 2, rdsk::SECTORS, 1 << 28);
+        seal(&mut d, bs, 2, 64);
+
+        let mut disk = MemDisk::new(d);
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        assert_eq!(
+            editor
+                .add_partition(PartitionSpec::by_size(1 << 40))
+                .unwrap_err(),
+            EditError::PartitionTooSmall {
+                bytes: 1 << 40,
+                cylinder_bytes: u64::MAX,
+            }
+        );
     }
 
     /// Delete: the block is unchained *and zeroed*, the chain that is
@@ -10445,22 +11100,31 @@ mod tests {
         assert_eq!(report.blocks_zeroed, vec![1]);
         assert_eq!(&disk.data[512..1024], &vec![0u8; 512][..]);
 
-        // The hole is the lowest free block in the area, so the next
-        // structure takes it — no compaction, no growth, no scan of the
-        // disk: the layout is what the chains say and the gaps are
-        // usable.
+        // The hole is the lowest free block in the area, so the commit
+        // takes it — no compaction, no growth, no scan of the disk: the
+        // layout is what the chains say and the gaps are usable.
+        //
+        // *Which* structure takes it is the chain-shape rule's answer,
+        // not the add's: chaining a second partition on changes the
+        // survivor's `pb_Next`, and a block the published `RDSK` still
+        // walks through may not be rewritten with a new pointer, so the
+        // survivor relocates into the hole and the new partition takes
+        // the next free block. Block 2, vacated by that move, is zeroed
+        // after the flip and is the hole the *next* edit will use.
         let mut editor = RdbEditor::open(&mut disk).unwrap();
         editor
             .add_partition(PartitionSpec::by_size(2 * 1024 * 1024).named("NEW"))
             .unwrap();
         let report = editor.commit(&mut disk).unwrap();
-        assert_eq!(report.part_blocks, vec![2, 1]);
+        assert_eq!(report.part_blocks, vec![1, 3]);
+        assert_eq!(report.blocks_zeroed, vec![2]);
 
         let rdb = Rdb::parse(&mut disk).unwrap();
         assert!(rdb.validate().is_empty());
         assert_eq!(rdb.partitions.len(), 2);
+        assert_eq!(rdb.partitions[0].part_block, 1);
         assert_eq!(rdb.partitions[1].name, "NEW");
-        assert_eq!(rdb.partitions[1].part_block, 1);
+        assert_eq!(rdb.partitions[1].part_block, 3);
     }
 
     /// Every way an add can be refused, and the sink is untouched in
@@ -10865,13 +11529,17 @@ mod tests {
     /// one — cut off after every possible number of writes.
     ///
     /// The RDB always parses, always validates clean, its driver always
-    /// reassembles, and every partition it lists is one of the three
-    /// this test knows about, whole: never a torn block, never a chain
-    /// into garbage. What a prefix may legitimately show is a *mixture*
-    /// of tables — the old chain with the new partition already on the
-    /// end of it, the new block having landed in space the old layout
-    /// was not using. That is the price of publishing at the `RDSK`
-    /// flip, and it is a readable disk either way.
+    /// reassembles — and the table it carries is **either exactly the
+    /// old one or exactly the new one**, at every single truncation
+    /// point. Not "the old one with the new partition already appended",
+    /// which is what this test used to allow and what
+    /// [`RdbEditor::plan`]'s chain-shape rule now rules out: such a
+    /// mixture is a checksum-valid table listing a deleted partition
+    /// beside the one that replaced it, and the two can overlap.
+    ///
+    /// The whole point of writing the `RDSK` last is that the flip is
+    /// what publishes the change; this asserts that nothing published it
+    /// early.
     #[test]
     fn commit_truncated_at_every_write_survives_a_structural_edit() {
         struct FlakySink {
@@ -10950,18 +11618,19 @@ mod tests {
             let fs = &rdb.filesystems[0];
             let loaded = rdb.load_filesystem(fs, &mut disk).unwrap();
             assert_eq!(&loaded[..driver.len()], &driver[..]);
-            for p in &rdb.partitions {
-                let known = [("DOOMED", 1, 100), ("KEPT", 200, 300), ("FRESH", 400, 500)];
-                assert!(
-                    known.contains(&(p.name.as_str(), p.low_cyl, p.high_cyl)),
-                    "truncated at {fail_after} left {} on {}..={}",
-                    p.name,
-                    p.low_cyl,
-                    p.high_cyl
-                );
-            }
-            // The partition that is being kept is always there.
-            assert!(rdb.partitions.iter().any(|p| p.name == "KEPT"));
+            // Old or new, whole, with nothing of the other in it.
+            let table: Vec<(&str, u32, u32)> = rdb
+                .partitions
+                .iter()
+                .map(|p| (p.name.as_str(), p.low_cyl, p.high_cyl))
+                .collect();
+            let old = vec![("DOOMED", 1, 100), ("KEPT", 200, 300)];
+            let new = vec![("KEPT", 200, 300), ("FRESH", 400, 500)];
+            assert!(
+                table == old || table == new,
+                "truncated at {fail_after} left a table that is neither the old \
+                 one nor the new one: {table:?}"
+            );
         }
 
         // And the finished article is the new table exactly.
@@ -10970,6 +11639,103 @@ mod tests {
         let rdb = Rdb::parse(&mut disk).unwrap();
         let names: Vec<&str> = rdb.partitions.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, vec!["KEPT", "FRESH"]);
+    }
+
+    /// The failure the chain-shape rule exists for, in its destructive
+    /// form: the new partition takes the *deleted* one's cylinders.
+    ///
+    /// A commit that rewrote a kept block in place with a new `pb_Next`
+    /// would leave a window in which the published `RDSK` walks the old
+    /// head into the new structure — a checksum-valid table carrying
+    /// the deleted partition *and* the one that replaced it, claiming
+    /// the same blocks, each filesystem free to destroy the other. Every
+    /// prefix of the commit must parse as exactly one of the two tables,
+    /// and must validate clean: an overlap in the result is the mixture,
+    /// caught.
+    #[test]
+    fn commit_never_publishes_a_table_mixing_a_delete_with_its_replacement() {
+        struct FlakySink {
+            data: Vec<u8>,
+            writes: usize,
+            fail_after: usize,
+        }
+        impl BlockSink for FlakySink {
+            type Error = ();
+            fn block_size(&self) -> usize {
+                512
+            }
+            fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
+                if self.writes == self.fail_after {
+                    return Err(());
+                }
+                self.writes += 1;
+                let off = lba as usize * 512;
+                self.data[off..off + 512].copy_from_slice(buf);
+                Ok(())
+            }
+            fn block_count(&self) -> Option<u64> {
+                Some(self.data.len() as u64 / 512)
+            }
+        }
+
+        let mut disk = MemDisk {
+            data: vec![0u8; TEN_MIB_BLOCKS * 512],
+            block_size: 512,
+        };
+        RdbBuilder::for_size(TEN_MIB, 512)
+            .unwrap()
+            .partition(PartitionSpec::by_cylinders(1, 100).named("DOOMED"))
+            .partition(PartitionSpec::by_cylinders(200, 300).named("KEPT"))
+            .build(&mut disk)
+            .unwrap();
+        let before = disk.data.clone();
+
+        // The head of the chain goes, and the new partition lands on
+        // cylinders the old one still claims.
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.remove_partition(0).unwrap();
+        editor
+            .add_partition(PartitionSpec::by_cylinders(50, 150).named("REUSED"))
+            .unwrap();
+
+        let total = editor
+            .commit(&mut TrackingSink {
+                data: before.clone(),
+                writes: Vec::new(),
+            })
+            .unwrap()
+            .blocks_written
+            .len();
+
+        for fail_after in 0..=total {
+            let mut sink = FlakySink {
+                data: before.clone(),
+                writes: 0,
+                fail_after,
+            };
+            let _ = editor.commit(&mut sink);
+
+            let mut disk = MemDisk::new(sink.data);
+            let rdb = Rdb::parse(&mut disk).unwrap_or_else(|e| {
+                panic!("truncated at {fail_after} left no readable RDB: {e:?}")
+            });
+            let table: Vec<(&str, u32, u32)> = rdb
+                .partitions
+                .iter()
+                .map(|p| (p.name.as_str(), p.low_cyl, p.high_cyl))
+                .collect();
+            let old = vec![("DOOMED", 1, 100), ("KEPT", 200, 300)];
+            let new = vec![("KEPT", 200, 300), ("REUSED", 50, 150)];
+            assert!(
+                table == old || table == new,
+                "truncated at {fail_after} published a mixture: {table:?}"
+            );
+            assert!(
+                rdb.validate().is_empty(),
+                "truncated at {fail_after}: {:?}",
+                rdb.validate()
+            );
+        }
     }
 
     // ---- milestone 3: AmiPart as a second differential oracle -------
@@ -11322,7 +12088,7 @@ mod tests {
     /// in this crate holds to.
     #[test]
     fn editor_errors_display_as_one_useful_line() {
-        let edits: [(EditError, &str); 18] = [
+        let edits: [(EditError, &str); 17] = [
             (
                 EditError::NoSuchPartition { index: 3, count: 2 },
                 "there is no partition 3: the RDB has 2 of them",
@@ -11445,10 +12211,6 @@ mod tests {
                     disk_blocks: 320,
                 },
                 "block 320 is past the end of a disk of 320 blocks",
-            ),
-            (
-                EditError::UnreadableBlock,
-                "a block this crate had just built did not parse back",
             ),
         ];
         for (e, expected) in edits {
