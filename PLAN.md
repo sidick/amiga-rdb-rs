@@ -410,6 +410,16 @@ want.
 
 The risky stage, gated on the differential suite existing first.
 
+**Complete**, bar `PartitionSink` — the one item below still unticked,
+and unticked *deliberately*: it is an API with no caller, and building it
+now would be guessing. Everything else here has landed: the whole
+`RdbEditor` operation set, the four properties the AmiPart survey turned
+up (preserve unmodelled fields, zero what we stop using, free-block
+management, never-touch), refuse-over-overlap in both halves, both area
+levers plus `set_geometry_cylinders`, the crash-shape ordering with its
+exhaustive truncation tests, and AmiPart running as a second
+differential oracle.
+
 - [ ] **`PartitionSink`** — the writing counterpart to
       `PartitionSource`, deferred here on purpose rather than built
       alongside `BlockSink` in milestone 2. Nothing in milestone 2 needs
@@ -707,7 +717,7 @@ The risky stage, gated on the differential suite existing first.
       and there is no `ENFORCESIZE`-style opt-out or silent clamp
       (AmiPart clamps a too-large `HIGH` by default, §2). Every refusal
       has a test asserting the sink, or the editor, is untouched.
-- [ ] **`set_geometry_cylinders(n)`** — AmiPart's `INIT NEWGEO`, the
+- [x] **`set_geometry_cylinders(n)`** — AmiPart's `INIT NEWGEO`, the
       disk-got-bigger case: keep `rdb_Heads`/`rdb_Sectors` and
       `rdb_LoCylinder`, raise `rdb_Cylinders`/`rdb_HiCylinder`. Named in
       survey §7.2 and *not* in the structural-edit chunk that landed —
@@ -715,12 +725,104 @@ The risky stage, gated on the differential suite existing first.
       items below (both are disk-level rewrites of the `RDSK` alone) and
       needs the same predicate in reverse: shrinking the geometry under
       an existing partition is the refusal case.
-- [ ] **Expand the RDB area**: grow `rdb_RDBBlocksHi` (and
+
+      **Landed as specified**, with `rdb_HiCylinder = cylinders - 1`.
+      Three refusals: `EditError::CylindersBelowPartition` names the
+      partition whose `de_HighCyl` the new count does not reach;
+      `EditError::ClaimsBlocksPastEndOfDisk` covers both a geometry
+      shrunk so far that the RDB area no longer fits inside the disk it
+      describes (which also disposes of `cylinders == 0`, since an area
+      always contains at least one block) and a geometry claiming more
+      blocks than the source reported at `open`;
+      `EditError::UnusableGeometry` for a zero-block cylinder.
+
+      **`rdb_Park`, `rdb_WritePreComp` and `rdb_ReducedWrite` are left
+      alone**, though creation tools commonly set all three to the
+      cylinder count and AmiPart rewrites them here. That is the
+      preserve-unmodelled-fields rule applied to fields we *do* model:
+      an edit changes what it was asked to change, and all three are
+      public on `Rdb` for a caller who wants them to track.
+
+      **The disk-size check is asymmetric with `expand_rdb_area`, on
+      purpose.** Growing the geometry is checked against
+      `BlockSource::block_count` when the source gave one and taken at
+      its word when it did not — a claim about the medium is exactly
+      what the call *is*, and the realistic flow (clone onto a bigger
+      disk, then `NEWGEO`) has the bigger disk in hand. Growing the
+      *area* is checked against the lower of `block_count` and the
+      geometry's own total, because that one decides where this crate
+      will write.
+- [x] **Expand the RDB area**: grow `rdb_RDBBlocksHi` (and
       `rdb_HighRDSKBlock`) when — and only when — validation proves the
       blocks being claimed are not inside any partition's extent. The
       realistic enabler for editing old images created with the
       historically tiny default area; pairs with the user resizing or
       moving the first partition to free the space.
+
+      **Both levers, per survey §7.3.** `expand_rdb_area(new_hi)` raises
+      `rdb_RDBBlocksHi`; `set_lo_cylinder(n)` raises `rdb_LoCylinder`.
+      They are genuinely different operations — the first can often be
+      done with no partition change at all, when the first partition
+      starts above the area, which is the common case — and AmiPart only
+      has the second because for it the reserved area simply *is*
+      everything below `lo_cyl`.
+
+      **The predicate is AmiPart's, stated in blocks.** An expansion is
+      permitted iff the newly claimed blocks `old_hi + 1 ..= new_hi`
+      intersect no partition's `start_lba..start_lba + block_len` — the
+      same arithmetic `ValidationIssue::PartitionOverlapsRdbArea`
+      performs, so an expansion is refused exactly when a parse of the
+      result would have complained, and no edit can produce a layout
+      `validate()` would then flag. Only the *newly claimed* blocks are
+      checked: a partition already overlapping the old area is damage
+      this crate did not cause and will not deepen, and requiring it to
+      be repaired first would block the expansion that is very often how
+      it gets repaired. `EditError::RdbAreaBlocked` names the blocking
+      partition **and the cylinder it would have to move to** (in that
+      partition's own `de_Surfaces`/`de_BlocksPerTrack` cylinders, which
+      need not be the drive's), modelled on
+      `MSG_PV_OVERFLOW_BLOCKED`: "there is no room" alone is a dead end
+      for whoever has to act on it. `set_lo_cylinder` refuses on the same
+      shape, `EditError::LoCylinderBlocked` naming the partition that
+      starts below the new boundary; *lowering* it passes the predicate
+      trivially and is allowed, since where partitions may actually start
+      is floored by the cylinder after `rdb_RDBBlocksHi` anyway.
+
+      **Never the other way**: a `new_hi` below the current one is
+      `EditError::RdbAreaWouldShrink`, not a shrink — the declared area
+      is a lease. Equal is a no-op and succeeds.
+      `rdb_HighRDSKBlock` is *not* touched here: it is the high-water
+      mark of what the layout occupies and the commit recomputes it.
+      Expanding makes room; it does not itself use any.
+
+      **`CommitError::RdbAreaTooSmall` now names the remedy** —
+      "grow it with expand_rdb_area" — which is the whole point of the
+      item: the same `add_filesystem` that was refused succeeds after an
+      expansion, and its blocks land in the space the expansion claimed.
+
+      **The lease follows the NEW `Hi` on the commit that grows it, and
+      that is the subtle part.** `LeasedSink` takes its ceiling from the
+      editor's `rdb_RDBBlocksHi`, so an expanding commit may write above
+      the *old* one — before the `RDSK` flip publishes the larger area,
+      because `RDSK`-last is the crash-shape rule. Leasing the old
+      ceiling instead would refuse every write the expansion exists to
+      enable, so the inversion is not a compromise but the operation
+      itself. It is safe because the expansion is validated *first*: the
+      claimed blocks were proved to belong to no partition and to lie
+      inside the disk (`EditError::ClaimsBlocksPastEndOfDisk` against the
+      source at edit time, `CommitError::RdbAreaPastEndOfDisk` against
+      the sink at commit time — the sink being the only authority present
+      when the writing happens). So the blocks written above the old
+      ceiling are owned by nobody, and the never-touch guarantee still
+      holds in the sense that matters: no partition's contents are
+      reachable.
+
+      **The commit-time disk check runs only when this editor moved the
+      ceiling.** An editor that did not is not re-litigated — it writes
+      nowhere it was not already entitled to write, and refusing an image
+      whose stored `rdb_RDBBlocksHi` was always past the end of its own
+      medium would break the no-op commit's byte-identity on exactly the
+      damaged images this crate exists to repair.
 - [x] **Crash-shape discipline**: order writes so an interrupted edit
       leaves the *old* chain intact (write new blocks first, flip the
       chain pointer last). The format has no journal; ordering is all
@@ -748,8 +850,8 @@ The risky stage, gated on the differential suite existing first.
       is no intermediate state in which a chain leads into garbage, and
       the in-place repack of option (a) is never needed — a layout that
       does not fit is refused (`CommitError::RdbAreaTooSmall`, which
-      names the shortfall and says that growing the area is not
-      implemented yet) rather than packed destructively.
+      names the shortfall and points at `expand_rdb_area`) rather than
+      packed destructively.
 
       **`commit_truncated_at_every_write_leaves_a_readable_rdb`** is the
       test the survey demands: a sink that fails after *n* writes, for
@@ -758,6 +860,24 @@ The risky stage, gated on the differential suite existing first.
       carries both partitions, its `BADB` entries and its `rdb_DriveInit`,
       the driver always reassembles, and the edited partition is either
       its old self or its new one — never a mixture.
+
+      **Extended to an expanding commit**
+      (`an_expanding_commit_truncated_at_every_write_leaves_a_readable_rdb`):
+      expand the area, add a driver that only fits because of it, and cut
+      the commit off after every write. The old-or-new property holds
+      throughout, and the test pins the one subtlety an expansion brings.
+      *A truncated expanding commit can leave blocks written above the
+      **old** published `rdb_RDBBlocksHi`, which the `RDSK` still on disk
+      does not claim.* That is harmless and it is the price of the
+      operation: those blocks are referenced by nothing (the old chains
+      live entirely below the old ceiling), owned by nothing (the
+      expansion proved no partition holds them), and are either
+      overwritten by the next successful commit or left as unreferenced
+      bytes in reserved space. The test asserts that exactly rather than
+      loosening the property — every issue `validate()` and
+      `validate_seg_lists()` report across the interrupted states is a
+      `BlockOutsideRdbArea` for a block in the claimed-but-unpublished
+      region, and once the `RDSK` has landed there are none at all.
 
       **One deliberate difference from the survey's sketch: the `RDSK`
       is never moved.** AmiPart normalises it to `rdb_RDBBlocksLo`; we
@@ -776,7 +896,7 @@ The risky stage, gated on the differential suite existing first.
       read-back verification pass (survey §5) is the thing that *would*
       want the source back, and it is a separate decision from this
       one.
-- [ ] **AmiPart as second differential oracle**: once mutation lands,
+- [x] **AmiPart as second differential oracle**: once mutation lands,
       apply the same edit in both tools and compare the results — a
       second independent implementation alongside the xdftool round-trip
       diff from milestone 2, and one whose source can legally be
@@ -793,6 +913,85 @@ The risky stage, gated on the differential suite existing first.
       both images with this crate and compare the models on the fields
       both tools claim to own. `docs/amipart-survey.md` §1c and §6 list
       the divergences to expect.
+
+      **It builds on macOS, with three small local patches.** AmiPart
+      ships a native host CLI (`host/`, plain `gcc`, no dependencies,
+      `make -C host`) that shares `src/rdb.c` and the whole engine with
+      the m68k binary and operates on `.hdf` images — exactly what the
+      survey said it would. Three things stopped it, none of them deep:
+      `host/amiga_shim.c` includes `<linux/fs.h>` for `BLKGETSIZE64`/
+      `BLKSSZGET` (raw-device path only; guarded behind `__linux__`, and
+      the existing `lseek(SEEK_END)` fallback covers the rest);
+      eleven shim entry points — `PutStr`, `Output`, `Input`, `Flush`,
+      `FGetC`, `PrintFault`, `ExamineFH`, `Delay`, `SetSignal`,
+      `Inhibit`, `ColdReboot` — are defined in `amiga_shim.c` but
+      declared nowhere, which is a warning under gcc and a hard error
+      under clang 16+ (declarations added to `host/amiga_compat.h`,
+      copied from the definitions — `Output`/`Input` return `BPTR`, so
+      implicit `int` would have been wrong as well as noisy); and
+      `src/partclone.c` passes a `MoveProgressFn` where an
+      `FFS_ProgressFn` is wanted, again a gcc warning and a clang error
+      (`-Wno-incompatible-function-pointer-types`, since it is in the
+      partition-move path this crate has no business in).
+
+      Two further host-build facts worth recording, both found by
+      running it: `SetFileSize` is a stub returning 0, so AmiPart's own
+      `CREATE SIZE=` cannot make the image (the tests write the zeros
+      themselves and use `INIT NEW`); and `IMAGE=` is capped at **58
+      characters** (`src/cli.c:resolve_target`), an AmigaDOS-sized limit
+      that a macOS `$TMPDIR` path blows through on its own, so the
+      helper runs `amipart` with its working directory set to the
+      image's and hands it a bare file name.
+
+      **Three env-gated tests** (`AMIGA_RDB_AMIPART=1`, binary from
+      `AMIGA_RDB_AMIPART_BIN` or `amipart` on `PATH`), all comparing
+      *semantically*: parse both images with this crate and compare
+      partitions (name, `de_LowCyl`/`de_HighCyl`, `start_lba`,
+      `block_len`, dostype, the bootable/automount flag bits, `de_BootPri`
+      — sorted by `de_LowCyl`, which normalises away the chain-order
+      divergence) and filesystems (dostype, version, and the driver bytes
+      an `LSEG` walk gives back).
+
+      - `amipart_and_this_crate_agree_on_an_added_partition` — AmiPart
+        `INIT NEW` + `ADDPART DH0`, copied twice, then `ADDPART WORK`
+        via its CLI on one copy and `add_partition` via `RdbEditor` on
+        the other.
+      - `amipart_and_this_crate_agree_on_an_added_filesystem` — the same
+        shape with `ADDFS` against `add_filesystem`, over a 2564-byte
+        driver so the partial final `LSEG` block is part of what is
+        compared. The driver bytes are the sharp end: they prove the
+        chain, the payload split and the block order agree with a second
+        implementation in a way no field assertion could.
+      - `this_crate_preserves_an_image_amipart_wrote` — open an
+        AmiPart-written image with two partitions and a driver, commit
+        with no edits, assert the disk is **byte-identical**. The
+        preserve-unmodelled-fields property against a foreign *writer*
+        rather than a fixture, `de_TableSize` 19 and all.
+
+      **What the differential found: agreement on every compared field,
+      and one structural consequence worth having.** AmiPart shrinks
+      `rdb_RDBBlocksHi` to `rdb_HighRDSKBlock` on every write, so the
+      area it leaves behind is exactly full — an `add_partition` on an
+      AmiPart-written image is `CommitError::RdbAreaTooSmall` until
+      `expand_rdb_area` is called. The first test asserts
+      `rdb_blocks_hi == high_rdsk_block` on the image it was handed and
+      then expands, which is the area lever exercised against a real
+      foreign writer rather than a fixture, and is precisely the
+      "historically tiny area" case the item above was written for.
+
+      **Deliberately not in CI.** AmiPart is a macOS-local oracle: its
+      host build is an unpackaged `gcc` target, and putting it on the
+      runner would mean pinning a third-party git revision plus the
+      patch set above. `rdbtool` stays the CI differential. The recipe,
+      for the record:
+
+      ```
+      git clone https://github.com/ChuckyGang/AmiPart
+      # apply the three patches described above, then
+      make -C AmiPart/host
+      AMIGA_RDB_AMIPART=1 AMIGA_RDB_AMIPART_BIN=$PWD/AmiPart/host/amipart \
+          cargo test amipart
+      ```
 
 ## Cross-cutting
 
@@ -812,6 +1011,24 @@ The risky stage, gated on the differential suite existing first.
       ends of every extent. Every `Result` is discarded on purpose — an
       `Err` is the specified behaviour, so only a panic or a sanitizer
       report counts.
+
+      **The editor is in the target too**, added with milestone 3's last
+      chunk. After a successful parse it runs `RdbEditor::open` on the
+      same image, applies a handful of edits steered by the selector
+      byte — `set_boot_priority`, `set_name`, `set_rdb_flags`,
+      `set_lo_cylinder`, `set_geometry_cylinders`, `expand_rdb_area`,
+      `remove_partition`, `add_filesystem` — and commits to a `VecSink`
+      holding a copy of the image. That is where the crate's arithmetic
+      is densest (block allocation over an attacker-chosen
+      `rdb_RDBBlocksLo`/`Hi`, cylinder extents, area expansion), so it is
+      where an overflow or an index panic would live. Every edit's
+      `Result` is discarded, as on the read side. **Two things are
+      asserted rather than discarded**, because they are the write path's
+      contract: the sink panics on any write above `rdb_RDBBlocksHi`,
+      which is the never-touch guarantee checked from *outside* the
+      crate rather than by `LeasedSink` checking itself; and an image a
+      commit reported success on must parse back. 3.1 million runs on the
+      committed corpus, clean.
 
       **Input mapping.** The image sits at offset 0 and the *last* byte
       is a block-size selector, `512 << (sel % 7)`, covering all seven

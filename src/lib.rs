@@ -3901,6 +3901,86 @@ pub enum EditError {
         /// `rdb_Sectors`, or the partition's `de_BlocksPerTrack`.
         sectors: u32,
     },
+    /// [`RdbEditor::expand_rdb_area`] was asked for a *lower*
+    /// `rdb_RDBBlocksHi` than the RDB already declares.
+    ///
+    /// The declared area is a lease and this crate never shrinks it: a
+    /// block below the old ceiling may hold a structure some other tool
+    /// wrote, and handing it back is how an image loses the headroom
+    /// that makes the atomic-swap placement possible in the first place
+    /// (`docs/amipart-survey.md` §7.1). Shrinking is refused rather than
+    /// ignored, because a caller who asked for it wanted *something* to
+    /// happen.
+    RdbAreaWouldShrink {
+        /// `rdb_RDBBlocksHi` as it stands.
+        hi: u32,
+        /// The value asked for — below `hi`, which is the issue.
+        new_hi: u32,
+    },
+    /// A partition already owns blocks the RDB area is being expanded
+    /// into.
+    ///
+    /// AmiPart's `MSG_PV_OVERFLOW_BLOCKED` is the model for the message:
+    /// name the partition in the way and the cylinder it would have to
+    /// move to, because "the area is too small" without that is a dead
+    /// end for the user. The predicate is stated in *blocks* rather than
+    /// AmiPart's cylinders — the same arithmetic
+    /// [`ValidationIssue::PartitionOverlapsRdbArea`] reports with, so an
+    /// expansion is refused exactly when a parse of the result would
+    /// have complained.
+    RdbAreaBlocked {
+        /// Index of the partition in the way.
+        index: usize,
+        /// Its `pb_DriveName`.
+        name: String,
+        /// The `rdb_RDBBlocksHi` asked for.
+        new_hi: u32,
+        /// The first cylinder clear of the new area, in the *blocking
+        /// partition's* own `de_Surfaces`/`de_BlocksPerTrack` cylinders:
+        /// move it to at least here and the expansion is permitted.
+        move_to_cylinder: u32,
+    },
+    /// A partition starts below the `rdb_LoCylinder`
+    /// [`RdbEditor::set_lo_cylinder`] was asked for, so raising the
+    /// boundary would swallow it.
+    LoCylinderBlocked {
+        /// Index of the partition in the way.
+        index: usize,
+        /// Its `pb_DriveName`.
+        name: String,
+        /// Its `de_LowCyl` — below `lo_cylinder`, which is the issue.
+        low_cyl: u32,
+        /// The `rdb_LoCylinder` asked for.
+        lo_cylinder: u32,
+    },
+    /// [`RdbEditor::set_geometry_cylinders`] would leave a partition's
+    /// last cylinder past the end of the disk.
+    CylindersBelowPartition {
+        /// Index of the partition that would be cut off.
+        index: usize,
+        /// Its `pb_DriveName`.
+        name: String,
+        /// Its `de_HighCyl`, which the new cylinder count does not reach.
+        high_cyl: u32,
+        /// The `rdb_Cylinders` asked for.
+        cylinders: u32,
+    },
+    /// A disk-level edit would claim a block the disk does not have.
+    ///
+    /// Raised by [`RdbEditor::expand_rdb_area`] for an area reaching
+    /// past the medium, and by
+    /// [`RdbEditor::set_geometry_cylinders`] both ways — for a geometry
+    /// describing more disk than there is, and for one shrunk so far
+    /// that the RDB area itself no longer fits inside it.
+    ClaimsBlocksPastEndOfDisk {
+        /// The last block the edit would claim, inclusive.
+        last_block: u64,
+        /// How many blocks the disk has: what the [`BlockSource`]
+        /// reported to [`RdbEditor::open`], or — when it reported
+        /// nothing — the RDB geometry's own
+        /// `rdb_Cylinders * rdb_Heads * rdb_Sectors`.
+        disk_blocks: u64,
+    },
     /// A block this crate had just built did not parse back.
     ///
     /// Unreachable by construction — every such block carries
@@ -3981,6 +4061,47 @@ impl core::fmt::Display for EditError {
                 f,
                 "a cylinder of {heads} heads by {sectors} sectors holds no blocks"
             ),
+            EditError::RdbAreaWouldShrink { hi, new_hi } => write!(
+                f,
+                "RDBBlocksHi {hi} is never shrunk: {new_hi} is below it"
+            ),
+            EditError::RdbAreaBlocked {
+                index,
+                name,
+                new_hi,
+                move_to_cylinder,
+            } => write!(
+                f,
+                "partition {index} ({name:?}) is inside the blocks an RDBBlocksHi of \
+                 {new_hi} would claim: move it to cylinder {move_to_cylinder} or above first"
+            ),
+            EditError::LoCylinderBlocked {
+                index,
+                name,
+                low_cyl,
+                lo_cylinder,
+            } => write!(
+                f,
+                "partition {index} ({name:?}) starts at cylinder {low_cyl}, \
+                 below the LoCylinder {lo_cylinder} asked for"
+            ),
+            EditError::CylindersBelowPartition {
+                index,
+                name,
+                high_cyl,
+                cylinders,
+            } => write!(
+                f,
+                "a disk of {cylinders} cylinders does not reach cylinder {high_cyl}, \
+                 where partition {index} ({name:?}) ends"
+            ),
+            EditError::ClaimsBlocksPastEndOfDisk {
+                last_block,
+                disk_blocks,
+            } => write!(
+                f,
+                "block {last_block} is past the end of a disk of {disk_blocks} blocks"
+            ),
             EditError::UnreadableBlock => {
                 write!(f, "a block this crate had just built did not parse back")
             }
@@ -4041,11 +4162,13 @@ pub enum CommitError<E> {
     },
     /// The RDB area cannot hold the blocks the new layout needs.
     ///
-    /// Growing the area — raising `rdb_RDBBlocksHi` into space no
-    /// partition claims — is the *expand the RDB area* item and is not
-    /// implemented yet, so this is where an image with a historically
-    /// tiny area stops. The area is never shrunk either, so the shortfall
-    /// here is real rather than self-inflicted.
+    /// The remedy is [`RdbEditor::expand_rdb_area`], which raises
+    /// `rdb_RDBBlocksHi` into blocks no partition claims — the usual way
+    /// out for an image created with the historically tiny default area.
+    /// When a partition is in the way, that call names it and the
+    /// cylinder it would have to move to
+    /// ([`EditError::RdbAreaBlocked`]). The area is never shrunk, so the
+    /// shortfall here is real rather than self-inflicted.
     RdbAreaTooSmall {
         /// Blocks the new layout needs inside the area.
         needed: u64,
@@ -4055,6 +4178,26 @@ pub enum CommitError<E> {
         lo: u64,
         /// `rdb_RDBBlocksHi`, inclusive.
         hi: u64,
+    },
+    /// The RDB area this editor *expanded* reaches past the end of the
+    /// sink.
+    ///
+    /// Raised only when [`RdbEditor::expand_rdb_area`] moved
+    /// `rdb_RDBBlocksHi` during this editor's life, and only when the
+    /// sink reports a [`block_count`](BlockSink::block_count): the
+    /// expansion was already checked against what the *source* said at
+    /// [`open`](RdbEditor::open), and this is the same check against the
+    /// only authority present at commit time. An editor that did not
+    /// touch the ceiling does not perform it — it writes nowhere it was
+    /// not already entitled to write, and refusing an image whose stored
+    /// `rdb_RDBBlocksHi` was always past the end of its own medium would
+    /// break the no-op commit's byte-identity on exactly the damaged
+    /// images this crate exists to repair.
+    RdbAreaPastEndOfDisk {
+        /// `rdb_RDBBlocksHi` as the expansion set it.
+        hi: u32,
+        /// [`BlockSink::block_count`], so `hi` had to be below it.
+        block_count: u64,
     },
     /// A block would have been written outside `0..=rdb_RDBBlocksHi`.
     ///
@@ -4110,7 +4253,12 @@ impl<E: core::fmt::Display> core::fmt::Display for CommitError<E> {
             } => write!(
                 f,
                 "the RDB area {lo}..={hi} holds {available} blocks but the new layout \
-                 needs {needed}; growing RDBBlocksHi is not implemented yet"
+                 needs {needed}; grow it with expand_rdb_area"
+            ),
+            CommitError::RdbAreaPastEndOfDisk { hi, block_count } => write!(
+                f,
+                "the expanded RDB area ends at block {hi}, past the {block_count} \
+                 blocks the sink has"
             ),
             CommitError::OutsideRdbArea { lba, hi } => write!(
                 f,
@@ -4197,6 +4345,30 @@ struct CommitPlan {
 /// legally sit below the area it declares (a disk carrying a foreign
 /// boot sector puts `rdb_RDBBlocksLo` at 1 and the `RDSK` behind it),
 /// and rewriting the `RDSK` where it was found is not a violation.
+///
+/// # The lease follows the *new* ceiling on an expanding commit
+///
+/// [`RdbEditor::expand_rdb_area`] raises `rdb_RDBBlocksHi` in the
+/// editor's model, so the commit that carries the expansion leases the
+/// **new**, larger window — and writes into the newly claimed blocks
+/// happen *before* the `RDSK` flip publishes the larger area. That
+/// inversion is deliberate and it is the whole point of the operation:
+/// an expansion exists precisely so that this commit may write above the
+/// old ceiling, and the `RDSK`-last rule means the block that announces
+/// the new ceiling is the last one out. Leasing the *old* ceiling
+/// instead would refuse every write the expansion was performed to
+/// enable.
+///
+/// It is safe because the expansion is validated before any of it: the
+/// claimed blocks were proved to intersect no partition's extent
+/// ([`EditError::RdbAreaBlocked`]) and to lie inside the disk
+/// ([`EditError::ClaimsBlocksPastEndOfDisk`], re-checked against the
+/// sink as [`CommitError::RdbAreaPastEndOfDisk`]). So the blocks written
+/// above the old ceiling belong to nobody: not to a partition, not to
+/// the old chains. If the commit is interrupted before the `RDSK`
+/// lands, they are simply unreferenced bytes in space the old table
+/// never claimed — see [`RdbEditor::commit`] for what that costs, which
+/// is nothing.
 struct LeasedSink<'a, S: BlockSink> {
     sink: &'a mut S,
     hi: u64,
@@ -4338,6 +4510,15 @@ pub struct RdbEditor {
     /// is gone from the lists above, and the blocks a commit must zero
     /// are exactly the ones this holds and the new layout does not.
     original: Vec<u64>,
+    /// [`BlockSource::block_count`] as `open` found it, when the source
+    /// said — the disk-size authority [`expand_rdb_area`](Self::expand_rdb_area)
+    /// and [`set_geometry_cylinders`](Self::set_geometry_cylinders)
+    /// check a claim against.
+    disk_blocks: Option<u64>,
+    /// `rdb_RDBBlocksHi` as `open` found it, so a commit can tell
+    /// whether this editor moved the ceiling — the one case in which the
+    /// sink's own block count is checked.
+    opened_rdb_blocks_hi: u32,
 }
 
 impl RdbEditor {
@@ -4396,6 +4577,8 @@ impl RdbEditor {
             .collect();
 
         Ok(Self {
+            disk_blocks: disk.block_count(),
+            opened_rdb_blocks_hi: rdb.rdb_blocks_hi,
             rdb,
             block_size,
             rdsk,
@@ -4739,6 +4922,237 @@ impl RdbEditor {
         self.rdb.controller_vendor = padded_ascii(&self.rdsk, rdsk::CONTROLLER_VENDOR);
         self.rdb.controller_product = padded_ascii(&self.rdsk, rdsk::CONTROLLER_PRODUCT);
         self.rdb.controller_revision = padded_ascii(&self.rdsk, rdsk::CONTROLLER_REVISION);
+    }
+
+    // ---- disk-level edits: the geometry and the RDB area ------------
+
+    /// How many blocks the disk has, for an edit that claims some of
+    /// them: what the [`BlockSource`] reported to
+    /// [`open`](Self::open), the RDB geometry's own
+    /// `rdb_Cylinders * rdb_Heads * rdb_Sectors`, or the lower of the
+    /// two when both are known.
+    ///
+    /// `None` only when the source declined to say *and* the geometry
+    /// multiplies out to nothing, in which case there is no bound to
+    /// check against and the edit is taken at its word.
+    fn disk_block_limit(&self) -> Option<u64> {
+        let geometry = (self.rdb.cylinders as u64)
+            .saturating_mul(self.rdb.heads as u64)
+            .saturating_mul(self.rdb.sectors as u64);
+        match (self.disk_blocks, geometry) {
+            (Some(n), 0) => Some(n),
+            (Some(n), g) => Some(n.min(g)),
+            (None, 0) => None,
+            (None, g) => Some(g),
+        }
+    }
+
+    /// Grow the RDB area: raise `rdb_RDBBlocksHi` to `new_hi`.
+    ///
+    /// The realistic way to edit an old image, whose RDB area is one
+    /// cylinder or less and cannot hold a modern filesystem driver at
+    /// all. It is the answer to
+    /// [`CommitError::RdbAreaTooSmall`]: expand, then re-try the add.
+    ///
+    /// # The predicate
+    ///
+    /// Permitted **iff the blocks being claimed — `old_hi + 1 ..=
+    /// new_hi` — intersect no partition's extent**. That is AmiPart's
+    /// rule (`docs/amipart-survey.md` §7.3) stated in device blocks
+    /// rather than its cylinders, using the same arithmetic
+    /// [`ValidationIssue::PartitionOverlapsRdbArea`] reports with — so
+    /// an expansion is refused exactly when a parse of the result would
+    /// have complained about it, and no edit can produce a layout
+    /// `validate()` would then flag. On refusal
+    /// [`EditError::RdbAreaBlocked`] names the partition in the way
+    /// *and* the cylinder it would have to move to, AmiPart's
+    /// `MSG_PV_OVERFLOW_BLOCKED` being the model: "there is no room" on
+    /// its own is a dead end for whoever has to act on it.
+    ///
+    /// Only the *newly claimed* blocks are checked. A partition already
+    /// overlapping the old area is damage this crate did not cause and
+    /// will not deepen — [`Rdb::validate`] is where a consumer sees it —
+    /// and requiring it to be repaired first would block the expansion
+    /// that is very often how it gets repaired.
+    ///
+    /// The area may not reach past the end of the disk either
+    /// ([`EditError::ClaimsBlocksPastEndOfDisk`]) — the bound being the
+    /// lower of the [`BlockSource::block_count`] reported to
+    /// [`open`](Self::open) and the RDB geometry's own total — and
+    /// [`commit`](Self::commit) checks the same thing again against the
+    /// sink.
+    ///
+    /// # What it does not touch
+    ///
+    /// `rdb_HighRDSKBlock` — the high-water mark of what the layout
+    /// actually occupies, which a commit recomputes. Expanding the area
+    /// makes room; it does not itself use any of it. And
+    /// `rdb_LoCylinder`, which is the *other* lever
+    /// ([`set_lo_cylinder`](Self::set_lo_cylinder)): the two are
+    /// independent, and on the common layout — a first partition
+    /// starting well above the area — this one alone is enough.
+    ///
+    /// # Never the other way
+    ///
+    /// A `new_hi` below the current one is
+    /// [`EditError::RdbAreaWouldShrink`], not a shrink: the declared
+    /// area is a lease. Equal is a no-op and succeeds.
+    pub fn expand_rdb_area(&mut self, new_hi: u32) -> Result<(), EditError> {
+        let hi = self.rdb.rdb_blocks_hi;
+        if new_hi < hi {
+            return Err(EditError::RdbAreaWouldShrink { hi, new_hi });
+        }
+        if new_hi == hi {
+            return Ok(());
+        }
+        if let Some(disk_blocks) = self.disk_block_limit() {
+            if new_hi as u64 >= disk_blocks {
+                return Err(EditError::ClaimsBlocksPastEndOfDisk {
+                    last_block: new_hi as u64,
+                    disk_blocks,
+                });
+            }
+        }
+
+        // The blocks being claimed, inclusive at both ends.
+        let (claim_lo, claim_hi) = (hi as u64 + 1, new_hi as u64);
+        for (index, p) in self.rdb.partitions.iter().enumerate() {
+            // An inverted range claims no blocks, which every overlap
+            // check in this crate already skips.
+            if p.block_len == 0 {
+                continue;
+            }
+            let end = p.start_lba.saturating_add(p.block_len);
+            if p.start_lba <= claim_hi && end > claim_lo {
+                // Where it would have to start instead, in its own
+                // cylinders — `de_Surfaces`/`de_BlocksPerTrack` are per
+                // partition and need not match the drive's. `max(1)`
+                // cannot bite: a zero-block cylinder gives a zero-block
+                // extent, which the `continue` above already took.
+                let cyl_blocks = p.cylinder_blocks.max(1);
+                let move_to_cylinder = ((claim_hi + cyl_blocks) / cyl_blocks) as u32;
+                return Err(EditError::RdbAreaBlocked {
+                    index,
+                    name: p.name.clone(),
+                    new_hi,
+                    move_to_cylinder,
+                });
+            }
+        }
+
+        put_be32(&mut self.rdsk, rdsk::RDB_BLOCKS_HI, new_hi);
+        self.rdb.rdb_blocks_hi = new_hi;
+        Ok(())
+    }
+
+    /// Set `rdb_LoCylinder`, the first cylinder available to partitions
+    /// — the *second* area lever.
+    ///
+    /// AmiPart handles a too-small area at this level rather than at
+    /// `rdb_RDBBlocksHi`, because for it the reserved area simply *is*
+    /// everything below `rdb_LoCylinder`
+    /// (`docs/amipart-survey.md` §7.3). Both levers exist here because
+    /// they are genuinely different operations:
+    /// [`expand_rdb_area`](Self::expand_rdb_area) can often be done with
+    /// no partition change at all, while this one is what a caller
+    /// reproducing another tool's layout — or one about to
+    /// [`add_partition`](Self::add_partition) and wanting the boundary
+    /// stated — reaches for. Raising both is the usual pair on an image
+    /// whose first partition starts immediately above a one-cylinder
+    /// area.
+    ///
+    /// Refused if any partition starts below the new value
+    /// ([`EditError::LoCylinderBlocked`], naming it): the boundary would
+    /// otherwise swallow a partition whole. *Lowering* it is permitted
+    /// and passes the same predicate trivially — it hands cylinders back
+    /// to the partition area, and where partitions may actually start is
+    /// still floored by the cylinder after `rdb_RDBBlocksHi`, which
+    /// [`add_partition`](Self::add_partition) computes rather than
+    /// trusting this field for.
+    pub fn set_lo_cylinder(&mut self, lo_cylinder: u32) -> Result<(), EditError> {
+        for (index, p) in self.rdb.partitions.iter().enumerate() {
+            if p.block_len != 0 && p.low_cyl < lo_cylinder {
+                return Err(EditError::LoCylinderBlocked {
+                    index,
+                    name: p.name.clone(),
+                    low_cyl: p.low_cyl,
+                    lo_cylinder,
+                });
+            }
+        }
+        put_be32(&mut self.rdsk, rdsk::LO_CYLINDER, lo_cylinder);
+        self.rdb.lo_cylinder = lo_cylinder;
+        Ok(())
+    }
+
+    /// Set `rdb_Cylinders`, and `rdb_HiCylinder` with it — AmiPart's
+    /// `INIT NEWGEO`, the disk-got-bigger case.
+    ///
+    /// The image was cloned onto a larger medium and the RDB still
+    /// describes the old one, so every cylinder past the old count is
+    /// unreachable. `rdb_Heads`, `rdb_Sectors` and `rdb_LoCylinder` are
+    /// kept — the geometry's *shape* is what makes existing extents mean
+    /// what they meant — and `rdb_HiCylinder` becomes `cylinders - 1`.
+    ///
+    /// **`rdb_Park`, `rdb_WritePreComp` and `rdb_ReducedWrite` are left
+    /// alone**, though tools that create an RDB commonly set all three
+    /// to the cylinder count. AmiPart rewrites them here; this crate does
+    /// not, on the same rule that keeps `rdb_DriveInit` and the
+    /// controller strings intact — an edit changes what it was asked to
+    /// change. [`Rdb`] exposes all three for a caller who wants them to
+    /// track.
+    ///
+    /// # What it refuses
+    ///
+    /// Shrinking below any partition's `de_HighCyl`
+    /// ([`EditError::CylindersBelowPartition`], naming it), and shrinking
+    /// so far that the RDB area itself no longer fits the disk
+    /// ([`EditError::ClaimsBlocksPastEndOfDisk`]). Growing past the block
+    /// count the source reported is refused by the same variant; when
+    /// the source declined to say, the new count is taken at its word,
+    /// since a claim about the medium is exactly what this call is.
+    pub fn set_geometry_cylinders(&mut self, cylinders: u32) -> Result<(), EditError> {
+        let cyl_blocks = self.rdb.heads as u64 * self.rdb.sectors as u64;
+        if cyl_blocks == 0 {
+            return Err(EditError::UnusableGeometry {
+                heads: self.rdb.heads,
+                sectors: self.rdb.sectors,
+            });
+        }
+        let hi_cylinder = cylinders.saturating_sub(1);
+        for (index, p) in self.rdb.partitions.iter().enumerate() {
+            if p.block_len != 0 && p.high_cyl > hi_cylinder {
+                return Err(EditError::CylindersBelowPartition {
+                    index,
+                    name: p.name.clone(),
+                    high_cyl: p.high_cyl,
+                    cylinders,
+                });
+            }
+        }
+        let total = (cylinders as u64).saturating_mul(cyl_blocks);
+        // The area is inside the disk or the disk is not the disk. This
+        // also disposes of `cylinders == 0`, whose zero blocks cannot
+        // hold an area that always has at least block 0 in it.
+        if total <= self.rdb.rdb_blocks_hi as u64 {
+            return Err(EditError::ClaimsBlocksPastEndOfDisk {
+                last_block: self.rdb.rdb_blocks_hi as u64,
+                disk_blocks: total,
+            });
+        }
+        if let Some(disk_blocks) = self.disk_blocks {
+            if total > disk_blocks {
+                return Err(EditError::ClaimsBlocksPastEndOfDisk {
+                    last_block: total - 1,
+                    disk_blocks,
+                });
+            }
+        }
+        put_be32(&mut self.rdsk, rdsk::CYLINDERS, cylinders);
+        put_be32(&mut self.rdsk, rdsk::HI_CYLINDER, hi_cylinder);
+        self.rdb.cylinders = cylinders;
+        self.rdb.hi_cylinder = hi_cylinder;
+        Ok(())
     }
 
     // ---- structural edits: add, remove, resize ---------------------
@@ -5374,8 +5788,27 @@ impl RdbEditor {
     /// # What it refuses
     ///
     /// Anything that does not fit the area, before writing a byte —
-    /// [`CommitError::RdbAreaTooSmall`]. The area is never grown (that
-    /// item is still to come) and never shrunk (that one is deliberate).
+    /// [`CommitError::RdbAreaTooSmall`], whose remedy is
+    /// [`expand_rdb_area`](Self::expand_rdb_area). The area is never
+    /// grown *by a commit* and never shrunk at all: growing it is an
+    /// explicit edit with a predicate of its own, because it claims
+    /// blocks, and nothing here claims blocks behind the caller's back.
+    ///
+    /// # An expanding commit
+    ///
+    /// When [`expand_rdb_area`](Self::expand_rdb_area) moved the
+    /// ceiling, this commit leases the **new** window and so may write
+    /// above the old one — which is the entire point of the operation,
+    /// and is safe because the expansion proved those blocks belong to
+    /// no partition. The `RDSK` still goes last, so there is a window in
+    /// which blocks above the *old* published `rdb_RDBBlocksHi` hold new
+    /// chain blocks that the old `RDSK` does not claim. If the commit is
+    /// interrupted there, those bytes are unreferenced: the old table is
+    /// intact and walks entirely within the old area, nothing points at
+    /// the new blocks, and no partition owns them either. Harmless, and
+    /// tidied by the next successful commit or by nothing at all.
+    /// [`CommitError::RdbAreaPastEndOfDisk`] is the one extra refusal an
+    /// expansion brings, checked before any write.
     pub fn commit<S: BlockSink>(
         &self,
         sink: &mut S,
@@ -5389,6 +5822,21 @@ impl RdbEditor {
                 rdb: self.block_size,
                 sink: block_size,
             });
+        }
+        // Only when *this* editor moved the ceiling: an expansion is a
+        // claim about how big the disk is, and the sink is the only
+        // authority on that present at commit time. An untouched
+        // ceiling is not re-litigated — see
+        // [`CommitError::RdbAreaPastEndOfDisk`].
+        if self.rdb.rdb_blocks_hi != self.opened_rdb_blocks_hi {
+            if let Some(block_count) = sink.block_count() {
+                if self.rdb.rdb_blocks_hi as u64 >= block_count {
+                    return Err(CommitError::RdbAreaPastEndOfDisk {
+                        hi: self.rdb.rdb_blocks_hi,
+                        block_count,
+                    });
+                }
+            }
         }
 
         // Everything above and below this pair of calls is arithmetic:
@@ -9320,8 +9768,8 @@ mod tests {
     }
 
     /// An area too small for the layout is refused before a byte is
-    /// written, naming the shortfall — and saying that growing the area
-    /// is not a thing this crate does yet.
+    /// written, naming the shortfall — and pointing at
+    /// `expand_rdb_area`, which is the way out.
     #[test]
     fn commit_refuses_an_area_that_cannot_hold_the_layout() {
         let bs = 512;
@@ -9392,6 +9840,384 @@ mod tests {
             editor.commit(&mut bad).unwrap_err(),
             CommitError::UnsupportedBlockSize { block_size: 768 }
         );
+    }
+
+    // ---- milestone 3: the area levers ------------------------------
+
+    /// Growing the area is permitted exactly when the blocks being
+    /// claimed belong to no partition, and refused with the blocking
+    /// partition and the cylinder it would have to move to.
+    ///
+    /// The fixture's area is 0..=15 and its first partition starts at
+    /// block 64 (cylinder 2 of 32 blocks), so blocks 16..=63 are the
+    /// space an expansion may take.
+    #[test]
+    fn expand_rdb_area_takes_only_blocks_no_partition_owns() {
+        let mut disk = MemDisk::new(foreign_image());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+
+        // Never backwards, and never by a commit's own decision.
+        assert_eq!(
+            editor.expand_rdb_area(14).unwrap_err(),
+            EditError::RdbAreaWouldShrink {
+                hi: F_BLOCKS_HI,
+                new_hi: 14
+            }
+        );
+        // Equal is a no-op that succeeds.
+        editor.expand_rdb_area(F_BLOCKS_HI).unwrap();
+        assert_eq!(editor.rdb().rdb_blocks_hi, F_BLOCKS_HI);
+
+        // One block into DH0's first cylinder, which starts at block 64.
+        assert_eq!(
+            editor.expand_rdb_area(64).unwrap_err(),
+            EditError::RdbAreaBlocked {
+                index: 0,
+                name: String::from("DH0"),
+                new_hi: 64,
+                // Its own 32-block cylinders: block 65 upward is
+                // cylinder 3, so cylinder 2 is where it may no longer be.
+                move_to_cylinder: 3,
+            }
+        );
+        // And past the end of the 320-block disk.
+        assert_eq!(
+            editor.expand_rdb_area(320).unwrap_err(),
+            EditError::ClaimsBlocksPastEndOfDisk {
+                last_block: 320,
+                disk_blocks: 320,
+            }
+        );
+        assert_eq!(
+            editor.rdb().rdb_blocks_hi,
+            F_BLOCKS_HI,
+            "a refused expansion changes nothing"
+        );
+
+        // The last block that is nobody's: 63, one below DH0.
+        editor.expand_rdb_area(63).unwrap();
+        assert_eq!(editor.rdb().rdb_blocks_hi, 63);
+        editor.commit(&mut disk).unwrap();
+
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.rdb_blocks_hi, 63);
+        // The lease grew; the high-water mark did not, because the
+        // expansion made room rather than using any of it.
+        assert_eq!(rdb.high_rdsk_block, F_HIGH_RDSK);
+        assert!(rdb.validate().is_empty());
+        assert_eq!(rdb.lo_cylinder, 2, "the other lever was not touched");
+    }
+
+    /// The expansion is what makes a previously impossible add possible:
+    /// the same `add_filesystem` that was `RdbAreaTooSmall` succeeds
+    /// after it, and its blocks land in the newly claimed space.
+    #[test]
+    fn an_add_that_did_not_fit_succeeds_after_expanding_the_area() {
+        // 8 blocks of the fixture's 0..=15 area are free, so a driver
+        // needing an FSHD plus twelve LSEG blocks cannot fit.
+        let driver: Vec<u8> = (0..12 * 492).map(|i| (i % 251) as u8).collect();
+
+        let before = foreign_image();
+        let mut disk = MemDisk::new(before.clone());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor
+            .add_filesystem(FileSystemSpec::new(0x444F_5301, driver.clone()))
+            .unwrap();
+        assert!(matches!(
+            editor.commit(&mut disk).unwrap_err(),
+            CommitError::RdbAreaTooSmall { .. }
+        ));
+        assert_eq!(disk.data, before, "a refused commit writes nothing");
+
+        editor.expand_rdb_area(63).unwrap();
+        let report = editor.commit(&mut disk).unwrap();
+        assert!(
+            report
+                .blocks_written
+                .iter()
+                .any(|&b| b > F_BLOCKS_HI as u64),
+            "the new blocks should be using the space the expansion claimed"
+        );
+        assert!(report.blocks_written.iter().all(|&b| b <= 63));
+
+        let mut disk = MemDisk::new(disk.data);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert!(rdb.validate().is_empty());
+        assert!(rdb.validate_seg_lists(&mut disk).unwrap().is_empty());
+        assert_eq!(rdb.filesystems.len(), 2);
+        let fs = &rdb.filesystems[1];
+        assert_eq!(fs.dos_type, 0x444F_5301);
+        assert_eq!(rdb.load_filesystem(fs, &mut disk).unwrap(), driver);
+        // The partition contents are still exactly where they were: the
+        // expansion stopped one block short of them.
+        assert_eq!(&disk.data[64 * 512..], &before[64 * 512..]);
+    }
+
+    /// An expansion is a claim about the disk's size, so the sink gets
+    /// to refuse it too — before a byte is written.
+    #[test]
+    fn commit_refuses_an_expanded_area_the_sink_cannot_hold() {
+        let before = foreign_image();
+        let mut disk = MemDisk::new(before.clone());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.expand_rdb_area(63).unwrap();
+
+        // A sink smaller than the ceiling the expansion claimed.
+        let mut small = MemDisk::new(before[..32 * 512].to_vec());
+        assert_eq!(
+            editor.commit(&mut small).unwrap_err(),
+            CommitError::RdbAreaPastEndOfDisk {
+                hi: 63,
+                block_count: 32,
+            }
+        );
+        assert_eq!(&small.data[..], &before[..32 * 512]);
+
+        // An editor that did *not* move the ceiling is not
+        // re-litigated: it writes nowhere it was not already entitled
+        // to, and the same undersized sink takes its commit.
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        let mut small = MemDisk::new(before[..32 * 512].to_vec());
+        editor.commit(&mut small).unwrap();
+    }
+
+    /// `rdb_LoCylinder` is the second lever: raised freely above the
+    /// last partition, refused when one starts below it, and lowered
+    /// without complaint.
+    #[test]
+    fn set_lo_cylinder_refuses_to_swallow_a_partition() {
+        let mut disk = MemDisk::new(foreign_image());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+
+        assert_eq!(
+            editor.set_lo_cylinder(3).unwrap_err(),
+            EditError::LoCylinderBlocked {
+                index: 0,
+                name: String::from("DH0"),
+                low_cyl: 2,
+                lo_cylinder: 3,
+            }
+        );
+        assert_eq!(editor.rdb().lo_cylinder, 2);
+
+        // Lowering hands cylinders back and passes the predicate.
+        editor.set_lo_cylinder(1).unwrap();
+        assert_eq!(editor.rdb().lo_cylinder, 1);
+
+        // Delete DH0 and the boundary may move up over its cylinders.
+        editor.remove_partition(0).unwrap();
+        editor.set_lo_cylinder(6).unwrap();
+        editor.commit(&mut disk).unwrap();
+
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.lo_cylinder, 6);
+        assert_eq!(rdb.partitions.len(), 1);
+        assert!(rdb.validate().is_empty());
+    }
+
+    /// `set_geometry_cylinders` is AmiPart's `INIT NEWGEO`: the disk got
+    /// bigger, `rdb_Heads`/`rdb_Sectors`/`rdb_LoCylinder` stay, and
+    /// shrinking under a partition — or under the RDB area — is refused.
+    #[test]
+    fn set_geometry_cylinders_grows_the_disk_and_refuses_to_cut_a_partition() {
+        // 640 blocks: twice the geometry the fixture declares, so the
+        // "cloned onto a larger medium" case is a real one here.
+        let mut image = foreign_image();
+        image.resize(640 * 512, 0);
+        let mut disk = MemDisk::new(image);
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+
+        // DH1 ends at cylinder 8, so 8 cylinders is one too few.
+        assert_eq!(
+            editor.set_geometry_cylinders(8).unwrap_err(),
+            EditError::CylindersBelowPartition {
+                index: 1,
+                name: String::from("DH1"),
+                high_cyl: 8,
+                cylinders: 8,
+            }
+        );
+        // Nothing at all is refused by the partition check while there
+        // are partitions, and by the area check once there are not:
+        // a disk of no blocks cannot hold an RDB area that always has
+        // at least one.
+        assert_eq!(
+            editor.set_geometry_cylinders(0).unwrap_err(),
+            EditError::CylindersBelowPartition {
+                index: 0,
+                name: String::from("DH0"),
+                high_cyl: 5,
+                cylinders: 0,
+            }
+        );
+        {
+            let mut bare = RdbEditor::open(&mut disk).unwrap();
+            bare.remove_partition(1).unwrap();
+            bare.remove_partition(0).unwrap();
+            assert_eq!(
+                bare.set_geometry_cylinders(0).unwrap_err(),
+                EditError::ClaimsBlocksPastEndOfDisk {
+                    last_block: F_BLOCKS_HI as u64,
+                    disk_blocks: 0,
+                }
+            );
+        }
+        // And more disk than the source reported is refused as well.
+        assert_eq!(
+            editor.set_geometry_cylinders(21).unwrap_err(),
+            EditError::ClaimsBlocksPastEndOfDisk {
+                last_block: 671,
+                disk_blocks: 640,
+            }
+        );
+        assert_eq!(editor.rdb().cylinders, 10);
+
+        editor.set_geometry_cylinders(20).unwrap();
+        assert_eq!(editor.rdb().cylinders, 20);
+        assert_eq!(editor.rdb().hi_cylinder, 19);
+        assert_eq!(editor.rdb().heads, 1);
+        assert_eq!(editor.rdb().sectors, 32);
+        assert_eq!(editor.rdb().lo_cylinder, 2);
+        // Left alone on purpose, where AmiPart rewrites them.
+        assert_eq!(editor.rdb().park, 10);
+        assert_eq!(editor.rdb().write_pre_comp, 4);
+
+        // The new cylinders are usable: a partition can be placed there.
+        let index = editor
+            .add_partition(PartitionSpec::by_size(5 * 32 * 512).named("NEW"))
+            .unwrap();
+        assert_eq!(editor.partitions()[index].low_cyl, 9);
+        assert_eq!(editor.partitions()[index].high_cyl, 13);
+        editor.commit(&mut disk).unwrap();
+
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.cylinders, 20);
+        assert_eq!(rdb.hi_cylinder, 19);
+        assert_eq!(rdb.partitions.len(), 3);
+        assert_eq!(rdb.partitions[2].name, "NEW");
+        assert!(rdb.validate().is_empty());
+    }
+
+    /// Crash shape over an *expanding* commit — the truncation test
+    /// above, run over the case that writes above the published ceiling.
+    ///
+    /// The subtlety this pins: a truncated expanding commit can leave
+    /// blocks written above the **old** `rdb_RDBBlocksHi`, which the old
+    /// `RDSK` still on disk does not claim. That is harmless and it is
+    /// the price of the operation. Those blocks are referenced by
+    /// nothing (the old chains live entirely below the old ceiling),
+    /// owned by nothing (the expansion proved no partition holds them),
+    /// and are either overwritten by the next successful commit or left
+    /// as unreferenced bytes in reserved space. The property that
+    /// matters — the RDB parses, validates clean, and is the old one or
+    /// the new one and never a mixture — holds throughout.
+    #[test]
+    fn an_expanding_commit_truncated_at_every_write_leaves_a_readable_rdb() {
+        struct FlakySink {
+            data: Vec<u8>,
+            writes: usize,
+            fail_after: usize,
+        }
+        impl BlockSink for FlakySink {
+            type Error = ();
+            fn block_size(&self) -> usize {
+                512
+            }
+            fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
+                if self.writes == self.fail_after {
+                    return Err(());
+                }
+                self.writes += 1;
+                let off = lba as usize * 512;
+                self.data[off..off + 512].copy_from_slice(buf);
+                Ok(())
+            }
+            fn block_count(&self) -> Option<u64> {
+                Some(self.data.len() as u64 / 512)
+            }
+        }
+
+        let driver: Vec<u8> = (0..12 * 492).map(|i| (i % 251) as u8).collect();
+        let before = foreign_image();
+        let mut disk = MemDisk::new(before.clone());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.expand_rdb_area(63).unwrap();
+        editor
+            .add_filesystem(FileSystemSpec::new(0x444F_5301, driver.clone()))
+            .unwrap();
+
+        let total = editor
+            .commit(&mut TrackingSink {
+                data: before.clone(),
+                writes: Vec::new(),
+            })
+            .unwrap()
+            .blocks_written
+            .len();
+        assert!(total > 13);
+
+        for fail_after in 0..=total {
+            let mut sink = FlakySink {
+                data: before.clone(),
+                writes: 0,
+                fail_after,
+            };
+            let result = editor.commit(&mut sink);
+            if fail_after < total {
+                assert_eq!(result.unwrap_err(), CommitError::Io(()));
+            } else {
+                result.unwrap();
+            }
+
+            let mut disk = MemDisk::new(sink.data);
+            let rdb = Rdb::parse(&mut disk).unwrap_or_else(|e| {
+                panic!("truncated at {fail_after} left no readable RDB: {e:?}")
+            });
+            assert_eq!(rdb.partitions.len(), 2);
+            assert_eq!(rdb.bad_blocks.len(), 3);
+            assert_eq!(rdb.drive_init, 0x0000_1234);
+
+            // Every issue either side reports is the *documented*
+            // one and nothing else: a chained block sitting in the
+            // region the expansion claimed but the `RDSK` on disk has
+            // not published yet. It is unreferenced by anything the
+            // old table needs and owned by no partition.
+            let issues: Vec<ValidationIssue> = rdb
+                .validate()
+                .into_iter()
+                .chain(rdb.validate_seg_lists(&mut disk).unwrap())
+                .collect();
+            for issue in &issues {
+                match issue {
+                    ValidationIssue::BlockOutsideRdbArea { lba, hi, .. }
+                        if *hi == F_BLOCKS_HI as u64 && *lba > F_BLOCKS_HI as u64 && *lba <= 63 => {
+                    }
+                    other => panic!("truncated at {fail_after}: unexpected {other:?}"),
+                }
+            }
+            if rdb.rdb_blocks_hi == 63 {
+                assert!(
+                    issues.is_empty(),
+                    "the published area covers its own blocks"
+                );
+            }
+
+            // Whatever was interrupted, every driver on the chain
+            // reassembles — the old one always, the new one whenever
+            // its `FSHD` has landed.
+            assert_eq!(
+                rdb.load_filesystem(&rdb.filesystems[0], &mut disk)
+                    .unwrap()
+                    .len(),
+                2 * 492
+            );
+            if let Some(added) = rdb.filesystems.get(1) {
+                assert_eq!(rdb.load_filesystem(added, &mut disk).unwrap(), driver);
+            }
+            // Nothing above the new ceiling was touched, in particular
+            // no partition's contents.
+            assert_eq!(&disk.data[64 * 512..], &before[64 * 512..]);
+        }
     }
 
     /// The editor works at 4 KB device blocks as it does at 512 —
@@ -9716,7 +10542,7 @@ mod tests {
 
         // And the area-is-full case, which only a commit can answer —
         // refused before a byte is written, naming the shortfall and
-        // saying that growing the area is not available yet.
+        // pointing at `expand_rdb_area`.
         let mut small = MemDisk {
             data: vec![0u8; TEN_MIB_BLOCKS * 512],
             block_size: 512,
@@ -10146,12 +10972,357 @@ mod tests {
         assert_eq!(names, vec!["KEPT", "FRESH"]);
     }
 
+    // ---- milestone 3: AmiPart as a second differential oracle -------
+    //
+    // A second independent implementation of the *mutation* path, and
+    // one whose source we may legally read (MIT) when the two disagree
+    // — which is what makes it worth having beside the `rdbtool`
+    // oracle, whose GPL we run but never consult.
+    //
+    // **The comparison is semantic, not a byte diff**, for the reason
+    // `docs/amipart-survey.md` §7.6 gives: AmiPart regenerates the whole
+    // RDB area from its own model on every write, so its output differs
+    // from ours *by construction*. Expected and deliberately not
+    // compared: chain order (it sorts partitions by `de_LowCyl`, we
+    // preserve the order the table had), `rdb_RDBBlocksHi` (it shrinks
+    // the area to `rdb_HighRDSKBlock`, we treat it as a lease and only
+    // ever grow it), `de_TableSize` (it forces 19, we preserve),
+    // `rdb_BadBlockList`/`rdb_DriveInit`/the controller identity strings
+    // (it zeroes them, we preserve), the dead geometry fields, and the
+    // `RDSK`'s location. What *is* compared is what both tools claim to
+    // own: every partition's name, extent, dostype and the `pb_Flags`
+    // bits the read side names (bootable, automount), and every
+    // filesystem's dostype, version and driver bytes.
+    //
+    // **Not wired into CI.** AmiPart is a macOS-local oracle for now:
+    // its host build is a plain `gcc` target with no packaging, and
+    // building it on the CI runner would mean pinning a git revision of
+    // a third-party repository plus the small patch set below. The
+    // `rdbtool` differential stays the CI gate; this one is run by hand
+    // (see PLAN.md for the exact recipe).
+
+    /// Is the AmiPart differential switched on? It is not a build
+    /// dependency and not on any CI runner, so it is opt-in.
+    #[cfg(feature = "std")]
+    fn amipart_enabled() -> bool {
+        std::env::var_os("AMIGA_RDB_AMIPART").is_some()
+    }
+
+    /// The AmiPart host binary: `AMIGA_RDB_AMIPART_BIN` if set,
+    /// otherwise whatever `amipart` is on `PATH`.
+    #[cfg(feature = "std")]
+    fn amipart_bin() -> std::ffi::OsString {
+        std::env::var_os("AMIGA_RDB_AMIPART_BIN")
+            .unwrap_or_else(|| std::ffi::OsString::from("amipart"))
+    }
+
+    /// Run the AmiPart host CLI over `image` and hand back its stdout.
+    ///
+    /// `FORCE` is always passed: every write command asks a Y/N question
+    /// otherwise, and a test that hung waiting on stdin would be worse
+    /// than one that failed.
+    ///
+    /// It runs *in the image's directory* and is handed the bare file
+    /// name, because `IMAGE=` is capped at 58 characters
+    /// (`src/cli.c:resolve_target`) — an AmigaDOS-sized limit carried
+    /// into the host build, and one that a macOS `$TMPDIR` path blows
+    /// through on its own.
+    #[cfg(feature = "std")]
+    fn amipart(image: &std::path::Path, args: &[&str]) -> String {
+        let mut arg = std::ffi::OsString::from("IMAGE=");
+        arg.push(image.file_name().expect("image has a file name"));
+        let out = std::process::Command::new(amipart_bin())
+            .current_dir(image.parent().expect("image has a directory"))
+            .arg(arg)
+            .args(args)
+            .arg("FORCE")
+            .output()
+            .expect("run amipart");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "amipart {args:?} failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    }
+
+    /// AmiPart's image geometry is fixed at 16 heads by 63 sectors of
+    /// 512 bytes, with `cylinders = filesize / (512 * 16 * 63)` — so a
+    /// shared fixture has to be a whole number of *its* cylinders or the
+    /// two tools would be comparing different disks.
+    #[cfg(feature = "std")]
+    const AMIPART_CYL_BYTES: usize = 512 * 16 * 63;
+    #[cfg(feature = "std")]
+    const AMIPART_CYLINDERS: usize = 40;
+
+    /// A fresh image with an AmiPart-written RDB and one AmiPart-written
+    /// partition, at `scratch(name)`.
+    ///
+    /// AmiPart's own `CREATE` cannot make the file — its host shim stubs
+    /// `SetFileSize` out — so the zeros are ours and only the RDB is
+    /// its.
+    #[cfg(feature = "std")]
+    fn amipart_image(name: &str) -> std::path::PathBuf {
+        let path = scratch(name);
+        std::fs::write(&path, vec![0u8; AMIPART_CYLINDERS * AMIPART_CYL_BYTES])
+            .expect("write blank image");
+        amipart(&path, &["INIT", "NEW"]);
+        amipart(
+            &path,
+            &[
+                "ADDPART",
+                "NAME=DH0",
+                "LOW=1",
+                "HIGH=20",
+                "TYPE=DOS3",
+                "BOOTABLE",
+                "BOOTPRI=3",
+            ],
+        );
+        path
+    }
+
+    /// The fields both tools claim to own, pulled out of a parsed image.
+    ///
+    /// Partitions are **sorted by `de_LowCyl`**, which normalises away
+    /// the one divergence that is pure bookkeeping: AmiPart writes the
+    /// `PART` chain in cylinder order, this crate preserves the order
+    /// the table already had. Everything else in the tuple is a real
+    /// claim about the disk that a disagreement would be a bug in.
+    #[cfg(feature = "std")]
+    #[allow(clippy::type_complexity)]
+    fn semantic_view(
+        image: &std::path::Path,
+    ) -> (
+        Vec<(String, u32, u32, u64, u64, u32, bool, bool, i32)>,
+        Vec<(u32, u16, u16, Vec<u8>)>,
+    ) {
+        let mut disk = MemDisk::new(std::fs::read(image).expect("read image"));
+        let rdb = Rdb::parse(&mut disk).expect("parse image");
+        assert!(
+            rdb.validate().is_empty(),
+            "{image:?} does not validate: {:?}",
+            rdb.validate()
+        );
+        assert!(rdb
+            .validate_seg_lists(&mut disk)
+            .expect("walk seg lists")
+            .is_empty());
+
+        let mut parts: Vec<(String, u32, u32, u64, u64, u32, bool, bool, i32)> = rdb
+            .partitions
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.low_cyl,
+                    p.high_cyl,
+                    p.start_lba,
+                    p.block_len,
+                    p.dos_type,
+                    p.bootable,
+                    p.no_automount,
+                    p.boot_pri,
+                )
+            })
+            .collect();
+        parts.sort_by_key(|p| p.1);
+
+        let filesystems = rdb
+            .filesystems
+            .iter()
+            .map(|f| {
+                (
+                    f.dos_type,
+                    f.version_major(),
+                    f.version_minor(),
+                    rdb.load_filesystem(f, &mut disk).expect("load driver"),
+                )
+            })
+            .collect();
+        (parts, filesystems)
+    }
+
+    /// The same partition added by both tools to copies of one image,
+    /// compared on the fields both of them own.
+    #[cfg(feature = "std")]
+    #[test]
+    fn amipart_and_this_crate_agree_on_an_added_partition() {
+        if !amipart_enabled() {
+            return;
+        }
+        let base = amipart_image("amipart-addpart-base.hdf");
+        let theirs = scratch("amipart-addpart-theirs.hdf");
+        let ours = scratch("amipart-addpart-ours.hdf");
+        std::fs::copy(&base, &theirs).expect("copy");
+        std::fs::copy(&base, &ours).expect("copy");
+
+        amipart(
+            &theirs,
+            &["ADDPART", "NAME=WORK", "LOW=21", "HIGH=39", "TYPE=PFS3"],
+        );
+
+        let mut disk = MemDisk::new(std::fs::read(&ours).expect("read"));
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        // AmiPart shrinks `rdb_RDBBlocksHi` to `rdb_HighRDSKBlock` on
+        // every write (survey §1c), so the area it leaves behind is
+        // exactly full and the add would be `RdbAreaTooSmall`. This is
+        // the expansion lever earning its keep on a real foreign image
+        // rather than on a fixture — and the divergence in
+        // `rdb_RDBBlocksHi` afterwards is expected, not compared.
+        assert_eq!(editor.rdb().rdb_blocks_hi, editor.rdb().high_rdsk_block);
+        editor.expand_rdb_area(15).unwrap();
+        editor
+            .add_partition(
+                PartitionSpec::by_cylinders(21, 39)
+                    .named("WORK")
+                    // PFS\3, which is what AmiPart's `TYPE=PFS3` means.
+                    .dos_type(0x5046_5303),
+            )
+            .unwrap();
+        editor.commit(&mut disk).unwrap();
+        std::fs::write(&ours, &disk.data).expect("write");
+
+        let (their_parts, their_fs) = semantic_view(&theirs);
+        let (our_parts, our_fs) = semantic_view(&ours);
+        assert_eq!(their_parts, our_parts);
+        assert_eq!(their_fs, our_fs);
+        assert_eq!(our_parts.len(), 2);
+        assert_eq!(our_parts[1].0, "WORK");
+
+        for p in [&base, &theirs, &ours] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// The same filesystem driver added by both tools, compared on the
+    /// `FSHD` fields and on the driver bytes an `LSEG` walk gives back.
+    ///
+    /// The driver bytes are the sharp end: they prove the chain, the
+    /// payload split and the block order agree with a second
+    /// implementation, in a way no field-by-field assertion could.
+    #[cfg(feature = "std")]
+    #[test]
+    fn amipart_and_this_crate_agree_on_an_added_filesystem() {
+        if !amipart_enabled() {
+            return;
+        }
+        // Not a multiple of the 492-byte payload, so the partial last
+        // block is part of what is being compared.
+        let driver = fake_driver(2564);
+        let driver_path = scratch("amipart-driver.bin");
+        std::fs::write(&driver_path, &driver).expect("write driver");
+
+        let base = amipart_image("amipart-addfs-base.hdf");
+        let theirs = scratch("amipart-addfs-theirs.hdf");
+        let ours = scratch("amipart-addfs-ours.hdf");
+        std::fs::copy(&base, &theirs).expect("copy");
+        std::fs::copy(&base, &ours).expect("copy");
+
+        // A bare name, since `amipart` runs in this directory.
+        let file_arg = alloc::format!(
+            "FILE={}",
+            driver_path.file_name().unwrap().to_string_lossy()
+        );
+        amipart(
+            &theirs,
+            &[
+                "ADDFS",
+                "TYPE=DOS7",
+                &file_arg,
+                // AmiPart's VERSION is the packed 32-bit word, not
+                // `major.minor`: 45.13.
+                "VERSION=0x002D000D",
+            ],
+        );
+
+        let mut disk = MemDisk::new(std::fs::read(&ours).expect("read"));
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        editor.expand_rdb_area(63).unwrap();
+        editor
+            .add_filesystem(FileSystemSpec::new(0x444F_5307, driver.clone()).version(45, 13))
+            .unwrap();
+        editor.commit(&mut disk).unwrap();
+        std::fs::write(&ours, &disk.data).expect("write");
+
+        let (their_parts, their_fs) = semantic_view(&theirs);
+        let (our_parts, our_fs) = semantic_view(&ours);
+        assert_eq!(their_parts, our_parts);
+        assert_eq!(their_fs.len(), 1);
+        assert_eq!(our_fs.len(), 1);
+        assert_eq!(
+            (their_fs[0].0, their_fs[0].1, their_fs[0].2),
+            (0x444F_5307, 45, 13)
+        );
+        // dostype, version and the driver bytes, all three.
+        assert_eq!(our_fs, their_fs);
+        // And the bytes really are the driver, not two tools agreeing on
+        // the same mistake: `LSEG` records no byte count, so both pad to
+        // a block and the prefix is what was asked for.
+        assert_eq!(&our_fs[0].3[..driver.len()], &driver[..]);
+
+        for p in [&base, &theirs, &ours, &driver_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// This crate opens an image AmiPart wrote and a no-op commit
+    /// preserves it **byte for byte**.
+    ///
+    /// The other direction of the preserve-unmodelled-fields property,
+    /// against a foreign writer rather than a fixture: whatever AmiPart
+    /// put in its `RDSK`, `PART` and `FSHD` blocks — including the
+    /// `de_TableSize` of 19 it forces and every field this crate does
+    /// not model — comes back unchanged.
+    #[cfg(feature = "std")]
+    #[test]
+    fn this_crate_preserves_an_image_amipart_wrote() {
+        if !amipart_enabled() {
+            return;
+        }
+        let driver = fake_driver(1500);
+        let driver_path = scratch("amipart-preserve-driver.bin");
+        std::fs::write(&driver_path, &driver).expect("write driver");
+
+        let path = amipart_image("amipart-preserve.hdf");
+        amipart(
+            &path,
+            &["ADDPART", "NAME=WORK", "LOW=21", "HIGH=39", "TYPE=PFS3"],
+        );
+        // A bare name, since `amipart` runs in this directory.
+        let file_arg = alloc::format!(
+            "FILE={}",
+            driver_path.file_name().unwrap().to_string_lossy()
+        );
+        amipart(&path, &["ADDFS", "TYPE=DOS7", &file_arg]);
+
+        let before = std::fs::read(&path).expect("read");
+        let mut disk = MemDisk::new(before.clone());
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        let report = editor.commit(&mut disk).unwrap();
+        assert_eq!(
+            disk.data, before,
+            "a no-op commit changed an AmiPart-written image"
+        );
+        // Every write landed inside the area AmiPart declared, which is
+        // exactly full: minimal motion moved nothing.
+        for &lba in &report.blocks_written {
+            assert!(lba <= report.rdb_blocks_hi as u64);
+        }
+        assert!(report.blocks_zeroed.is_empty());
+
+        for p in [&path, &driver_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     /// Both editor error types render one line fit to show a user, in
     /// `no_std` as much as `std` — the contract every other error type
     /// in this crate holds to.
     #[test]
     fn editor_errors_display_as_one_useful_line() {
-        let edits: [(EditError, &str); 13] = [
+        let edits: [(EditError, &str); 18] = [
             (
                 EditError::NoSuchPartition { index: 3, count: 2 },
                 "there is no partition 3: the RDB has 2 of them",
@@ -10235,6 +11406,47 @@ mod tests {
                 "a cylinder of 0 heads by 32 sectors holds no blocks",
             ),
             (
+                EditError::RdbAreaWouldShrink { hi: 63, new_hi: 15 },
+                "RDBBlocksHi 63 is never shrunk: 15 is below it",
+            ),
+            (
+                EditError::RdbAreaBlocked {
+                    index: 0,
+                    name: String::from("DH0"),
+                    new_hi: 64,
+                    move_to_cylinder: 3,
+                },
+                "partition 0 (\"DH0\") is inside the blocks an RDBBlocksHi of 64 \
+                 would claim: move it to cylinder 3 or above first",
+            ),
+            (
+                EditError::LoCylinderBlocked {
+                    index: 0,
+                    name: String::from("DH0"),
+                    low_cyl: 2,
+                    lo_cylinder: 3,
+                },
+                "partition 0 (\"DH0\") starts at cylinder 2, below the \
+                 LoCylinder 3 asked for",
+            ),
+            (
+                EditError::CylindersBelowPartition {
+                    index: 1,
+                    name: String::from("DH1"),
+                    high_cyl: 8,
+                    cylinders: 6,
+                },
+                "a disk of 6 cylinders does not reach cylinder 8, \
+                 where partition 1 (\"DH1\") ends",
+            ),
+            (
+                EditError::ClaimsBlocksPastEndOfDisk {
+                    last_block: 320,
+                    disk_blocks: 320,
+                },
+                "block 320 is past the end of a disk of 320 blocks",
+            ),
+            (
                 EditError::UnreadableBlock,
                 "a block this crate had just built did not parse back",
             ),
@@ -10243,7 +11455,7 @@ mod tests {
             assert_eq!(alloc::format!("{e}"), expected);
         }
 
-        let commits: [(CommitError<&str>, &str); 6] = [
+        let commits: [(CommitError<&str>, &str); 7] = [
             (
                 CommitError::Io("device is read-only"),
                 "writing a block failed: device is read-only",
@@ -10275,7 +11487,14 @@ mod tests {
                     hi: 6,
                 },
                 "the RDB area 0..=6 holds 7 blocks but the new layout needs 8; \
-                 growing RDBBlocksHi is not implemented yet",
+                 grow it with expand_rdb_area",
+            ),
+            (
+                CommitError::RdbAreaPastEndOfDisk {
+                    hi: 400,
+                    block_count: 320,
+                },
+                "the expanded RDB area ends at block 400, past the 320 blocks the sink has",
             ),
             (
                 CommitError::OutsideRdbArea { lba: 99, hi: 15 },
