@@ -65,8 +65,12 @@ Everything the format can say, surfaced. Nothing here writes a byte.
       stay in *device* blocks, documented loudly, since a
       device-block/filesystem-block confusion is exactly where a
       corruption goes silent. (Two independent knobs: `rdb_BlockBytes`
-      is the device's block size, `de_SizeBlock` the filesystem's per
-      partition — a 4 KB-block disk can carry a 32 KB-block FFS.)
+      is the device's block size, `de_SizeBlock` the filesystem's *per
+      partition* — and per partition means exactly that: one 512-byte
+      RDB disk can carry a 32 KB-block partition and a 4 KB-block
+      partition side by side. A synthetic mixed-`SizeBlock` fixture
+      goes in the test suite so nothing ever assumes one value per
+      disk.)
 - [ ] **Overlap validation** (`Rdb::validate()` or similar): report (a)
       any chained block — PART, FSHD, LSEG, BADB — lying outside
       `rdb_RDBBlocksLo..=Hi`, and (b) any partition extent overlapping
