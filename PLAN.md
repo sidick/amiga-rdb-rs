@@ -44,7 +44,7 @@ Everything the format can say, surfaced. Nothing here writes a byte.
       reading proves the layout understanding that writing will need.
 - [ ] **BADB chain**: bad-block lists. Nearly extinct in practice, in
       the format forever; read them so a repartitioner can preserve them.
-- [ ] **Non-512 `rdb_BlockBytes` is required, not optional.** The
+- [x] **Non-512 `rdb_BlockBytes` is required, not optional.** The
       survey answered itself with arithmetic: every RDB block count and
       cylinder field is 32-bit, so 512-byte device blocks cap the
       addressable disk at 2 TB. Larger `BlockBytes` is how the format

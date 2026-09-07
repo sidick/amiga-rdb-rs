@@ -8,12 +8,20 @@
 //! `devices/hardblocks.h` and `dos/filehandler.h`.
 //!
 //! This crate is pure format logic. I/O comes in through one trait —
-//! [`BlockSource`], "read me 512-byte block N" — so the same code
-//! serves an emulator holding an image file, a tool holding a raw
-//! device, and a test holding a `Vec<u8>`. What is *inside* a partition
-//! is out of scope by design: one filesystem family per crate, composed
-//! through an adapter that offsets a partition's LBAs into the parent
-//! device.
+//! [`BlockSource`], "read me block N" — so the same code serves an
+//! emulator holding an image file, a tool holding a raw device, and a
+//! test holding a `Vec<u8>`. What is *inside* a partition is out of
+//! scope by design: one filesystem family per crate, composed through
+//! an adapter that offsets a partition's LBAs into the parent device.
+//!
+//! Every LBA in this crate's API — chain pointers, [`Partition`]
+//! extents, [`PartitionSource`] addressing — is a *device* block of the
+//! source's [`block_size`](BlockSource::block_size), which the RDB's
+//! `rdb_BlockBytes` must match. That is deliberately not the same thing
+//! as a partition's *filesystem* block size (`de_SizeBlock`), which is
+//! per-partition and frequently larger; conflating the two is exactly
+//! where silent corruption comes from, so this crate never speaks
+//! filesystem blocks.
 //!
 //! Everything on disk is big-endian; all multi-byte reads go through
 //! [`be32`]/[`be16`] rather than any `#[repr(C)]` overlay, so the crate
@@ -26,16 +34,31 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// Anything that can produce 512-byte blocks by LBA.
+/// Anything that can produce fixed-size blocks by LBA.
 ///
 /// The one seam between this crate and the world. Implementations are
 /// expected to be cheap to call repeatedly with the same LBA; the crate
 /// does not cache.
+///
+/// The block size is a runtime property of the source — a real device
+/// knows its sector size, an image container knows (or is told) what it
+/// holds. 512 bytes is the classic value, but the format's 32-bit block
+/// and cylinder fields cap a 512-byte-block disk at 2 TB; larger
+/// `rdb_BlockBytes` is how RDB reaches modern media (4 KB → 16 TB), and
+/// such disks are in live use. Supported sizes are powers of two in
+/// [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`].
 pub trait BlockSource {
     type Error;
 
-    /// Read block `lba` into `buf`.
-    fn read_block(&mut self, lba: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), Self::Error>;
+    /// Bytes per device block. Must be constant for the source's
+    /// lifetime and a power of two in
+    /// [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`]; [`Rdb::parse`]
+    /// rejects anything else rather than misreading geometry.
+    fn block_size(&self) -> usize;
+
+    /// Read block `lba` into `buf`, whose length is exactly
+    /// [`block_size`](Self::block_size).
+    fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error>;
 
     /// Total number of blocks, if known. `None` is legitimate (a raw
     /// character device may not know); only operations that need the
@@ -45,13 +68,12 @@ pub trait BlockSource {
     }
 }
 
-/// The block size this crate speaks.
-///
-/// `rdb_BlockBytes` can in principle name other sizes, but 512 is what
-/// every shipped tool writes and what the initial version supports;
-/// [`Rdb::parse`] reports anything else as
-/// [`RdbError::UnsupportedBlockBytes`] rather than misreading geometry.
-pub const BLOCK_SIZE: usize = 512;
+/// Smallest supported device block size (and the classic Amiga value).
+pub const MIN_BLOCK_SIZE: usize = 512;
+
+/// Largest supported device block size. 32 KB blocks put the format's
+/// 32-bit block addressing at 256 TB, comfortably past current media.
+pub const MAX_BLOCK_SIZE: usize = 32 * 1024;
 
 /// How many blocks from the start of the disk the `RDSK` block may
 /// legally sit in (`RDB_LOCATION_LIMIT`, NDK `devices/hardblocks.h`).
@@ -77,6 +99,12 @@ pub mod id {
 /// later in the first sixteen.
 pub const CHAIN_END: u32 = 0xFFFF_FFFF;
 
+/// Is `size` a device block size this crate accepts?
+#[inline]
+pub fn block_size_ok(size: usize) -> bool {
+    size.is_power_of_two() && (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&size)
+}
+
 /// Read a big-endian u32 at byte offset `off`.
 #[inline]
 pub fn be32(block: &[u8], off: usize) -> u32 {
@@ -96,9 +124,9 @@ pub fn be16(block: &[u8], off: usize) -> u16 {
 /// big-endian longwords of the block sum to zero with 32-bit wrapping
 /// arithmetic. Returns `false` for a `SummedLongs` that doesn't fit the
 /// block — a malformed count must fail the check, not panic the host.
-pub fn checksum_ok(block: &[u8; BLOCK_SIZE]) -> bool {
+pub fn checksum_ok(block: &[u8]) -> bool {
     let longs = be32(block, 4) as usize;
-    if longs == 0 || longs > BLOCK_SIZE / 4 {
+    if longs == 0 || longs > block.len() / 4 {
         return false;
     }
     let mut sum: u32 = 0;
@@ -113,6 +141,9 @@ pub fn checksum_ok(block: &[u8; BLOCK_SIZE]) -> bool {
 pub enum RdbError<E> {
     /// The underlying [`BlockSource`] failed.
     Io(E),
+    /// The source's [`block_size`](BlockSource::block_size) is not a
+    /// power of two in [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`].
+    UnsupportedBlockSize { block_size: usize },
     /// No valid `RDSK` block in the first [`RDB_LOCATION_LIMIT`] blocks.
     ///
     /// Not necessarily damage: RDB-less images (a bare filesystem from
@@ -133,14 +164,24 @@ pub enum RdbError<E> {
     /// A chain revisited a block — a cycle. Without this check a
     /// crafted or corrupted image loops the parser forever.
     ChainCycle { lba: u64 },
-    /// `rdb_BlockBytes` was not 512.
-    UnsupportedBlockBytes { block_bytes: u32 },
+    /// `rdb_BlockBytes` disagrees with the source's
+    /// [`block_size`](BlockSource::block_size). Every LBA in the RDB is
+    /// in `rdb_BlockBytes` units; reading them through a differently
+    /// sized source would silently address the wrong bytes, so the
+    /// mismatch is an error, not a guess. (An image of a 4 KB-sector
+    /// disk must be presented by a source that says 4096.)
+    BlockBytesMismatch { block_bytes: u32, block_size: usize },
     /// A `PART` block's `DosEnvec` was too short to contain the fields
     /// this crate needs (`de_TableSize` below `DE_DOSTYPE`).
     EnvecTooShort { lba: u64, table_size: u32 },
 }
 
 /// One partition, as read from a `PART` block.
+///
+/// All block quantities (`start_lba`, `block_len`, `cylinder_blocks`)
+/// are *device* blocks of the parent source's size — never
+/// `de_SizeBlock` filesystem blocks, which may be larger and vary per
+/// partition on one disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Partition {
     /// LBA of the `PART` block this came from.
@@ -151,9 +192,9 @@ pub struct Partition {
     pub bootable: bool,
     /// `pb_Flags` bit 1: present but not to be mounted automatically.
     pub no_automount: bool,
-    /// First block of the partition, in disk LBAs.
+    /// First block of the partition, in disk device-block LBAs.
     pub start_lba: u64,
-    /// Number of blocks in the partition.
+    /// Number of device blocks in the partition.
     pub block_len: u64,
     /// `de_DosType` — e.g. `0x444F5303` (`DOS\x03`).
     pub dos_type: u32,
@@ -163,8 +204,8 @@ pub struct Partition {
     pub max_transfer: u32,
     /// `de_Mask`.
     pub mask: u32,
-    /// Blocks per cylinder (`de_Surfaces * de_BlocksPerTrack`), kept
-    /// because filesystems and repartitioners both need it.
+    /// Device blocks per cylinder (`de_Surfaces * de_BlocksPerTrack`),
+    /// kept because filesystems and repartitioners both need it.
     pub cylinder_blocks: u64,
     /// `de_LowCyl`/`de_HighCyl`, inclusive.
     pub low_cyl: u32,
@@ -174,6 +215,8 @@ pub struct Partition {
     pub num_buffers: u32,
     pub buf_mem_type: u32,
     /// `de_SizeBlock` in longwords (128 == 512-byte filesystem blocks).
+    /// Per partition: one disk can carry differently sized filesystem
+    /// blocks side by side.
     pub size_block_longs: u32,
 }
 
@@ -186,6 +229,11 @@ pub struct Partition {
 pub struct Rdb {
     /// LBA the `RDSK` block was found at (0..16).
     pub rdsk_block: u64,
+    /// `rdb_BlockBytes` — bytes per device block. Always equal to the
+    /// source's [`block_size`](BlockSource::block_size) after a
+    /// successful parse; carried so consumers can do byte math without
+    /// the source in hand.
+    pub block_bytes: u32,
     /// `rdb_Flags`.
     pub flags: u32,
     /// Disk geometry as the RDB declares it.
@@ -251,9 +299,15 @@ impl Rdb {
     /// whose checksum passes (both conditions: an `RDSK` ID with a bad
     /// sum is skipped, matching what the ROM does, so a stale copy at a
     /// lower LBA cannot shadow the live RDB), then walks the `PART`
-    /// chain.
+    /// chain. `rdb_BlockBytes` must match the source's
+    /// [`block_size`](BlockSource::block_size) — see
+    /// [`RdbError::BlockBytesMismatch`].
     pub fn parse<S: BlockSource>(disk: &mut S) -> Result<Self, RdbError<S::Error>> {
-        let mut buf = [0u8; BLOCK_SIZE];
+        let block_size = disk.block_size();
+        if !block_size_ok(block_size) {
+            return Err(RdbError::UnsupportedBlockSize { block_size });
+        }
+        let mut buf = alloc::vec![0u8; block_size];
 
         let mut rdsk_at = None;
         let scan_end = match disk.block_count() {
@@ -270,12 +324,16 @@ impl Rdb {
         let rdsk_at = rdsk_at.ok_or(RdbError::NoRdsk)?;
 
         let block_bytes = be32(&buf, rdsk::BLOCK_BYTES);
-        if block_bytes as usize != BLOCK_SIZE {
-            return Err(RdbError::UnsupportedBlockBytes { block_bytes });
+        if block_bytes as usize != block_size {
+            return Err(RdbError::BlockBytesMismatch {
+                block_bytes,
+                block_size,
+            });
         }
 
         let mut rdb = Rdb {
             rdsk_block: rdsk_at,
+            block_bytes,
             flags: be32(&buf, rdsk::FLAGS),
             cylinders: be32(&buf, rdsk::CYLINDERS),
             heads: be32(&buf, rdsk::HEADS),
@@ -306,7 +364,11 @@ impl Rdb {
             disk.read_block(lba, &mut buf).map_err(RdbError::Io)?;
             let found = be32(&buf, 0);
             if found != id::PART {
-                return Err(RdbError::WrongId { lba, expected: id::PART, found });
+                return Err(RdbError::WrongId {
+                    lba,
+                    expected: id::PART,
+                    found,
+                });
             }
             if !checksum_ok(&buf) {
                 return Err(RdbError::BadChecksum { lba });
@@ -320,7 +382,7 @@ impl Rdb {
     }
 }
 
-fn parse_part<E>(buf: &[u8; BLOCK_SIZE], lba: u64) -> Result<Partition, RdbError<E>> {
+fn parse_part<E>(buf: &[u8], lba: u64) -> Result<Partition, RdbError<E>> {
     let envec = |i: usize| be32(buf, part::ENVIRONMENT + i * 4);
 
     // de_TableSize counts longwords *after itself*; DOS_TYPE is the
@@ -365,8 +427,10 @@ fn parse_part<E>(buf: &[u8; BLOCK_SIZE], lba: u64) -> Result<Partition, RdbError
 }
 
 /// A [`BlockSource`] view of one partition: LBA 0 here is
-/// `partition.start_lba` on the parent. This is the composition seam
-/// with filesystem crates — they mount one of these, never the disk.
+/// `partition.start_lba` on the parent, in the parent's device blocks
+/// (the block size passes through unchanged — this adapter never speaks
+/// `de_SizeBlock` filesystem blocks). This is the composition seam with
+/// filesystem crates — they mount one of these, never the disk.
 pub struct PartitionSource<'a, S: BlockSource> {
     parent: &'a mut S,
     start_lba: u64,
@@ -395,9 +459,16 @@ impl<'a, S: BlockSource> PartitionSource<'a, S> {
 impl<'a, S: BlockSource> BlockSource for PartitionSource<'a, S> {
     type Error = PartitionSourceError<S::Error>;
 
-    fn read_block(&mut self, lba: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), Self::Error> {
+    fn block_size(&self) -> usize {
+        self.parent.block_size()
+    }
+
+    fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
         if lba >= self.block_len {
-            return Err(PartitionSourceError::OutOfRange { lba, len: self.block_len });
+            return Err(PartitionSourceError::OutOfRange {
+                lba,
+                len: self.block_len,
+            });
         }
         self.parent
             .read_block(self.start_lba + lba, buf)
@@ -411,25 +482,47 @@ impl<'a, S: BlockSource> BlockSource for PartitionSource<'a, S> {
 
 #[cfg(feature = "std")]
 mod std_support {
-    use super::{BlockSource, BLOCK_SIZE};
+    use super::{block_size_ok, BlockSource, MIN_BLOCK_SIZE};
     use std::io::{Read, Seek, SeekFrom};
 
     /// A [`BlockSource`] over anything `Read + Seek` — a `File`, a
     /// `Cursor<Vec<u8>>`. The convenience the `std` feature exists for.
+    ///
+    /// A byte stream carries no sector size of its own, so the caller
+    /// supplies it: [`new`](Self::new) assumes the classic 512, and
+    /// [`with_block_size`](Self::with_block_size) takes the size of the
+    /// device the image was taken from.
     pub struct SeekBlockSource<T: Read + Seek> {
         inner: T,
+        block_size: usize,
         blocks: Option<u64>,
     }
 
     impl<T: Read + Seek> SeekBlockSource<T> {
-        /// `blocks` from the stream length; a stream whose length is
-        /// not a block multiple keeps its trailing fragment invisible,
-        /// the same as a real disk with a partial final sector.
-        pub fn new(mut inner: T) -> std::io::Result<Self> {
+        /// A 512-byte-block view of `inner`.
+        pub fn new(inner: T) -> std::io::Result<Self> {
+            Self::with_block_size(inner, MIN_BLOCK_SIZE)
+        }
+
+        /// A view of `inner` with the given device block size.
+        ///
+        /// `block_count` comes from the stream length; a stream whose
+        /// length is not a block multiple keeps its trailing fragment
+        /// invisible, the same as a real disk with a partial final
+        /// sector. An unsupported `block_size` is
+        /// `std::io::ErrorKind::InvalidInput`.
+        pub fn with_block_size(mut inner: T, block_size: usize) -> std::io::Result<Self> {
+            if !block_size_ok(block_size) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsupported block size {block_size}"),
+                ));
+            }
             let len = inner.seek(SeekFrom::End(0))?;
             Ok(Self {
                 inner,
-                blocks: Some(len / BLOCK_SIZE as u64),
+                block_size,
+                blocks: Some(len / block_size as u64),
             })
         }
     }
@@ -437,8 +530,13 @@ mod std_support {
     impl<T: Read + Seek> BlockSource for SeekBlockSource<T> {
         type Error = std::io::Error;
 
-        fn read_block(&mut self, lba: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), Self::Error> {
-            self.inner.seek(SeekFrom::Start(lba * BLOCK_SIZE as u64))?;
+        fn block_size(&self) -> usize {
+            self.block_size
+        }
+
+        fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            self.inner
+                .seek(SeekFrom::Start(lba * self.block_size as u64))?;
             self.inner.read_exact(buf)
         }
 
@@ -456,88 +554,123 @@ mod tests {
     use super::*;
     use alloc::vec;
 
-    /// In-memory disk for tests.
-    struct MemDisk(Vec<u8>);
+    /// In-memory disk for tests, with a configurable block size.
+    struct MemDisk {
+        data: Vec<u8>,
+        block_size: usize,
+    }
+
+    impl MemDisk {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                block_size: 512,
+            }
+        }
+    }
 
     impl BlockSource for MemDisk {
         type Error = ();
 
-        fn read_block(&mut self, lba: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), ()> {
-            let off = lba as usize * BLOCK_SIZE;
-            if off + BLOCK_SIZE > self.0.len() {
+        fn block_size(&self) -> usize {
+            self.block_size
+        }
+
+        fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), ()> {
+            let off = lba as usize * self.block_size;
+            if off + self.block_size > self.data.len() {
                 return Err(());
             }
-            buf.copy_from_slice(&self.0[off..off + BLOCK_SIZE]);
+            buf.copy_from_slice(&self.data[off..off + self.block_size]);
             Ok(())
         }
 
         fn block_count(&self) -> Option<u64> {
-            Some((self.0.len() / BLOCK_SIZE) as u64)
+            Some((self.data.len() / self.block_size) as u64)
         }
     }
 
-    fn put32(disk: &mut [u8], block: usize, off: usize, v: u32) {
-        let o = block * BLOCK_SIZE + off;
+    fn put32(disk: &mut [u8], bs: usize, block: usize, off: usize, v: u32) {
+        let o = block * bs + off;
         disk[o..o + 4].copy_from_slice(&v.to_be_bytes());
     }
 
     /// Compute and store a valid checksum over `longs` longwords.
-    fn seal(disk: &mut [u8], block: usize, longs: u32) {
-        put32(disk, block, 4, longs);
-        put32(disk, block, 8, 0);
-        let base = block * BLOCK_SIZE;
+    fn seal(disk: &mut [u8], bs: usize, block: usize, longs: u32) {
+        put32(disk, bs, block, 4, longs);
+        put32(disk, bs, block, 8, 0);
+        let base = block * bs;
         let mut sum: u32 = 0;
         for i in 0..longs as usize {
             sum = sum.wrapping_add(u32::from_be_bytes(
                 disk[base + i * 4..base + i * 4 + 4].try_into().unwrap(),
             ));
         }
-        put32(disk, block, 8, sum.wrapping_neg());
+        put32(disk, bs, block, 8, sum.wrapping_neg());
     }
 
-    /// Build a minimal valid image: RDSK at `rdsk_block`, one PART.
-    fn one_partition_image(rdsk_block: usize) -> Vec<u8> {
+    /// Build a minimal valid image with the given device block size:
+    /// RDSK at `rdsk_block`, one PART. Geometry: 10 cylinders of 32
+    /// blocks, regardless of block size.
+    fn one_partition_image_bs(rdsk_block: usize, bs: usize) -> Vec<u8> {
         // Sized to the geometry it declares: 10 cylinders of 32 blocks.
-        let mut d = vec![0u8; 320 * BLOCK_SIZE];
+        let mut d = vec![0u8; 320 * bs];
         let part_block = rdsk_block + 1;
 
-        put32(&mut d, rdsk_block, 0, id::RDSK);
-        put32(&mut d, rdsk_block, rdsk::BLOCK_BYTES, 512);
-        put32(&mut d, rdsk_block, rdsk::BAD_BLOCK_LIST, CHAIN_END);
-        put32(&mut d, rdsk_block, rdsk::PARTITION_LIST, part_block as u32);
-        put32(&mut d, rdsk_block, rdsk::FILESYS_HEADER_LIST, CHAIN_END);
-        put32(&mut d, rdsk_block, rdsk::CYLINDERS, 10);
-        put32(&mut d, rdsk_block, rdsk::SECTORS, 32);
-        put32(&mut d, rdsk_block, rdsk::HEADS, 1);
-        seal(&mut d, rdsk_block, 64);
+        put32(&mut d, bs, rdsk_block, 0, id::RDSK);
+        put32(&mut d, bs, rdsk_block, rdsk::BLOCK_BYTES, bs as u32);
+        put32(&mut d, bs, rdsk_block, rdsk::BAD_BLOCK_LIST, CHAIN_END);
+        put32(
+            &mut d,
+            bs,
+            rdsk_block,
+            rdsk::PARTITION_LIST,
+            part_block as u32,
+        );
+        put32(&mut d, bs, rdsk_block, rdsk::FILESYS_HEADER_LIST, CHAIN_END);
+        put32(&mut d, bs, rdsk_block, rdsk::CYLINDERS, 10);
+        put32(&mut d, bs, rdsk_block, rdsk::SECTORS, 32);
+        put32(&mut d, bs, rdsk_block, rdsk::HEADS, 1);
+        seal(&mut d, bs, rdsk_block, 64);
 
-        put32(&mut d, part_block, 0, id::PART);
-        put32(&mut d, part_block, part::NEXT, CHAIN_END);
-        put32(&mut d, part_block, part::FLAGS, 1); // bootable
+        put32(&mut d, bs, part_block, 0, id::PART);
+        put32(&mut d, bs, part_block, part::NEXT, CHAIN_END);
+        put32(&mut d, bs, part_block, part::FLAGS, 1); // bootable
         let name = b"DH0";
-        d[part_block * BLOCK_SIZE + part::DRIVE_NAME] = name.len() as u8;
-        d[part_block * BLOCK_SIZE + part::DRIVE_NAME + 1
-            ..part_block * BLOCK_SIZE + part::DRIVE_NAME + 1 + name.len()]
+        d[part_block * bs + part::DRIVE_NAME] = name.len() as u8;
+        d[part_block * bs + part::DRIVE_NAME + 1
+            ..part_block * bs + part::DRIVE_NAME + 1 + name.len()]
             .copy_from_slice(name);
         let e = part::ENVIRONMENT;
-        put32(&mut d, part_block, e + de::TABLE_SIZE * 4, 16);
-        put32(&mut d, part_block, e + de::SIZE_BLOCK * 4, 128);
-        put32(&mut d, part_block, e + de::SURFACES * 4, 1);
-        put32(&mut d, part_block, e + de::BLOCKS_PER_TRACK * 4, 32);
-        put32(&mut d, part_block, e + de::LOW_CYL * 4, 2);
-        put32(&mut d, part_block, e + de::HIGH_CYL * 4, 9);
-        put32(&mut d, part_block, e + de::BOOT_PRI * 4, 0);
-        put32(&mut d, part_block, e + de::DOS_TYPE * 4, 0x444F_5303);
-        seal(&mut d, part_block, 64);
+        put32(&mut d, bs, part_block, e + de::TABLE_SIZE * 4, 16);
+        put32(
+            &mut d,
+            bs,
+            part_block,
+            e + de::SIZE_BLOCK * 4,
+            (bs / 4) as u32,
+        );
+        put32(&mut d, bs, part_block, e + de::SURFACES * 4, 1);
+        put32(&mut d, bs, part_block, e + de::BLOCKS_PER_TRACK * 4, 32);
+        put32(&mut d, bs, part_block, e + de::LOW_CYL * 4, 2);
+        put32(&mut d, bs, part_block, e + de::HIGH_CYL * 4, 9);
+        put32(&mut d, bs, part_block, e + de::BOOT_PRI * 4, 0);
+        put32(&mut d, bs, part_block, e + de::DOS_TYPE * 4, 0x444F_5303);
+        seal(&mut d, bs, part_block, 64);
 
         d
     }
 
+    fn one_partition_image(rdsk_block: usize) -> Vec<u8> {
+        one_partition_image_bs(rdsk_block, 512)
+    }
+
     #[test]
     fn parses_a_minimal_image() {
-        let mut disk = MemDisk(one_partition_image(2));
+        let mut disk = MemDisk::new(one_partition_image(2));
         let rdb = Rdb::parse(&mut disk).unwrap();
         assert_eq!(rdb.rdsk_block, 2);
+        assert_eq!(rdb.block_bytes, 512);
         assert_eq!(rdb.partitions.len(), 1);
         let p = &rdb.partitions[0];
         assert_eq!(p.name, "DH0");
@@ -548,9 +681,55 @@ mod tests {
         assert_eq!(p.block_len, 256); // cyls 2..=9
     }
 
+    /// A 4 KB-block disk parses identically: same LBAs, same extents —
+    /// everything is in device blocks, whatever their size.
+    #[test]
+    fn parses_a_4k_block_image() {
+        let mut disk = MemDisk {
+            data: one_partition_image_bs(2, 4096),
+            block_size: 4096,
+        };
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.rdsk_block, 2);
+        assert_eq!(rdb.block_bytes, 4096);
+        let p = &rdb.partitions[0];
+        assert_eq!(p.start_lba, 64);
+        assert_eq!(p.block_len, 256);
+        assert_eq!(p.size_block_longs, 1024); // 4 KB filesystem blocks
+    }
+
+    /// A 4 KB-sector image read through a 512-byte source must fail
+    /// loudly, not misaddress every chained block.
+    #[test]
+    fn block_bytes_mismatch_is_an_error() {
+        // RDSK at 0 so the 512-byte scan still lands on it.
+        let mut disk = MemDisk::new(one_partition_image_bs(0, 4096));
+        assert_eq!(
+            Rdb::parse(&mut disk).unwrap_err(),
+            RdbError::BlockBytesMismatch {
+                block_bytes: 4096,
+                block_size: 512
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_source_block_size_is_an_error() {
+        for bad in [0usize, 256, 768, 65536] {
+            let mut disk = MemDisk {
+                data: vec![0u8; 4 * 65536],
+                block_size: bad,
+            };
+            assert_eq!(
+                Rdb::parse(&mut disk).unwrap_err(),
+                RdbError::UnsupportedBlockSize { block_size: bad }
+            );
+        }
+    }
+
     #[test]
     fn no_rdsk_is_reported_not_invented() {
-        let mut disk = MemDisk(vec![0u8; 32 * BLOCK_SIZE]);
+        let mut disk = MemDisk::new(vec![0u8; 32 * 512]);
         assert_eq!(Rdb::parse(&mut disk).unwrap_err(), RdbError::NoRdsk);
     }
 
@@ -560,10 +739,10 @@ mod tests {
     fn bad_checksum_rdsk_is_skipped_in_the_scan() {
         let mut img = one_partition_image(3);
         // Plant a checksummed-wrong RDSK *earlier* than the real one.
-        put32(&mut img, 1, 0, id::RDSK);
-        put32(&mut img, 1, 4, 64);
-        put32(&mut img, 1, 8, 0xDEAD_BEEF);
-        let mut disk = MemDisk(img);
+        put32(&mut img, 512, 1, 0, id::RDSK);
+        put32(&mut img, 512, 1, 4, 64);
+        put32(&mut img, 512, 1, 8, 0xDEAD_BEEF);
+        let mut disk = MemDisk::new(img);
         let rdb = Rdb::parse(&mut disk).unwrap();
         assert_eq!(rdb.rdsk_block, 3);
     }
@@ -572,9 +751,9 @@ mod tests {
     fn part_chain_cycle_is_an_error_not_a_hang() {
         let mut img = one_partition_image(0);
         // PART at 1 points to itself.
-        put32(&mut img, 1, part::NEXT, 1);
-        seal(&mut img, 1, 64);
-        let mut disk = MemDisk(img);
+        put32(&mut img, 512, 1, part::NEXT, 1);
+        seal(&mut img, 512, 1, 64);
+        let mut disk = MemDisk::new(img);
         assert_eq!(
             Rdb::parse(&mut disk).unwrap_err(),
             RdbError::ChainCycle { lba: 1 }
@@ -584,9 +763,9 @@ mod tests {
     #[test]
     fn part_chain_past_disk_end_is_an_error() {
         let mut img = one_partition_image(0);
-        put32(&mut img, 0, rdsk::PARTITION_LIST, 1000);
-        seal(&mut img, 0, 64);
-        let mut disk = MemDisk(img);
+        put32(&mut img, 512, 0, rdsk::PARTITION_LIST, 1000);
+        seal(&mut img, 512, 0, 64);
+        let mut disk = MemDisk::new(img);
         assert_eq!(
             Rdb::parse(&mut disk).unwrap_err(),
             RdbError::ChainOutOfRange { lba: 1000 }
@@ -595,14 +774,15 @@ mod tests {
 
     #[test]
     fn partition_source_offsets_and_bounds() {
-        let mut disk = MemDisk(one_partition_image(2));
+        let mut disk = MemDisk::new(one_partition_image(2));
         // Stamp a marker at the partition's first block (LBA 64).
-        disk.0[64 * BLOCK_SIZE] = 0xAB;
+        disk.data[64 * 512] = 0xAB;
         let rdb = Rdb::parse(&mut disk).unwrap();
         let p = rdb.partitions[0].clone();
         let mut ps = PartitionSource::new(&mut disk, &p);
         assert_eq!(ps.block_count(), Some(256));
-        let mut buf = [0u8; BLOCK_SIZE];
+        assert_eq!(ps.block_size(), 512);
+        let mut buf = [0u8; 512];
         ps.read_block(0, &mut buf).unwrap();
         assert_eq!(buf[0], 0xAB);
         assert!(matches!(
@@ -613,7 +793,7 @@ mod tests {
 
     #[test]
     fn checksum_rejects_hostile_summed_longs() {
-        let mut b = [0u8; BLOCK_SIZE];
+        let mut b = [0u8; 512];
         b[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
         assert!(!checksum_ok(&b));
         b[4..8].copy_from_slice(&0u32.to_be_bytes());
