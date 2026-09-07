@@ -12,6 +12,11 @@ repository = "https://github.com/sidick/amiga-rdb-rs"
 keywords = ["amiga", "rdb", "partition", "retrocomputing"]
 categories = ["filesystem", "no-std", "parser-implementations"]
 
+[package.metadata.docs.rs]
+# Build docs with every feature on, so the std-only items
+# (std::error::Error impls, SeekBlockSource) are documented too.
+all-features = true
+
 [dependencies]
 # Deliberately none. This crate is pure format logic over the
 # `BlockSource` trait; consumers bring their own I/O.
