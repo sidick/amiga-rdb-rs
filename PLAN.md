@@ -99,14 +99,118 @@ target, read it straight back, compare. The API external consumers
 (Copperline's dynamic drive creation, amibake's image builds) actually
 want.
 
-- [ ] **`BlockSink`** (or `write_block` on a paired trait): the write
-      seam, mirroring `BlockSource`. Decide one-trait-or-two once, here.
-- [ ] **Checksum sealing**: the inverse of `checksum_ok`, shared by
-      every block writer.
-- [ ] **Geometry synthesis**: size-in-bytes → cylinders/heads/sectors
-      the way real tools do it (and document *which* real tool's
-      convention we follow, because they differ; amibake/amitools'
-      choice is the pragmatic target since its images are our fixtures).
+- [x] **`BlockSink`**: the write seam, mirroring `BlockSource` —
+      `block_size()`, `write_block(&mut self, lba, &[u8])`, optional
+      `block_count()`.
+
+      **Decided: two traits, not one.** Read-only sources are the
+      common case and nearly all of this crate's work — a file opened
+      for reading, a mapped image, a `&[u8]`, an emulator's read-only
+      medium — and folding `write_block` into `BlockSource` would force
+      every one of them to supply a method that can only fail at
+      runtime, throwing away a compile-time truth. Split, "this code
+      writes" is visible in the bound: `S: BlockSource + BlockSink`
+      where both are needed, `S: BlockSource` where they are not, and a
+      read-only source cannot be handed to a writer by accident. The
+      cost is `block_size`/`block_count` on both traits — accepted;
+      a type implementing both has them agree trivially, and making
+      `BlockSink: BlockSource` instead would rule out a write-only
+      target (a fresh image streamed out) for no gain.
+
+      `SeekBlockSource` keeps its name and gains
+      `impl BlockSink for SeekBlockSource<T> where T: Read + Write +
+      Seek` — one type, both directions, so a read view and a write
+      view of one file cannot disagree about the block size. A
+      read-only `T` simply does not get the impl, which is the split
+      earning its keep. The test `MemDisk` grew the matching impl and
+      refuses a write past its end, so "the layout runs off the disk"
+      surfaces instead of the sink silently growing.
+
+      **`PartitionSink` deliberately not built** — see milestone 3.
+- [x] **Checksum sealing**: `seal_checksum(block: &mut [u8],
+      summed_longs: u32) -> Result<(), SealError>`, the exact inverse of
+      `checksum_ok` and the shared seal for every block writer. Stores
+      `SummedLongs` at byte 4, zeroes `ChkSum` at 8, sums that many
+      big-endian longwords with wrapping arithmetic and stores the
+      negation at 8.
+
+      **Signature notes.** `summed_longs` is the caller's rather than
+      inferred, because the count is part of what the *structure* says
+      about itself and differs per block type (64 for RDSK/PART/FSHD
+      whatever the device block size, `block_size / 4` for LSEG,
+      header-plus-entries for BADB) — there is nothing in a half-built
+      block to derive it from. It **errors rather than clamps** on a
+      count no block could satisfy: clamping would seal a different
+      number of longwords than asked for, leaving the block's own
+      header disagreeing with the layout the caller was writing —
+      better to fail where the arithmetic was done than to write a
+      self-consistent lie. Two variants, `SummedLongsTooShort` (below
+      `MIN_SUMMED_LONGS` = 3, so the sum would not cover `ChkSum`
+      itself and *no* stored value could zero it — its own test proves
+      that) and `SummedLongsTooLong`, which also catches a block too
+      small to hold the header, so no length panics. Comes with
+      `put_be32`, the public inverse of `be32`.
+
+      The test-local `seal()` helper is now a three-line address-
+      arithmetic wrapper over the public function, so every fixture in
+      the suite — several hundred blocks — exercises the production
+      sealer, and the round-trip property is proved incidentally
+      everywhere on top of the deliberate sweep
+      (`seal_then_checksum_ok_round_trips`: all seven block sizes ×
+      six content patterns × six longword counts).
+- [x] **Geometry synthesis**: `synthesize_geometry(total_bytes: u64,
+      block_size: usize) -> Result<Geometry, GeometryError>`.
+
+      **Convention: amitools' `rdbtool`, pinned against 0.8.1.** Tools
+      differ and there is no right answer — geometry is invented on any
+      modern medium — so interoperability decides it: amitools' images
+      are this crate's fixtures and `xdftool` is the differential
+      oracle the round-trip item below diffs against, so a *different*
+      geometry for the same size would make every such comparison a
+      false positive.
+
+      **What it does**, established empirically by creating images at a
+      spread of sizes and reading back what `rdbtool` chose. Two
+      candidates, the one wasting fewer bytes wins, first wins an exact
+      tie:
+
+      1. *PC-ish*: 63 sectors; heads from the classic BIOS breakpoints
+         applied to the **requested byte size** (≤ 504 MiB → 16, then
+         32, 64, 128 at each doubling, 256 above 4032 MiB).
+      2. *Amiga-ish*: 32 sectors, 1 head, then while cylinders > 65535,
+         halve cylinders and double heads.
+
+      Both compute `cylinders = (bytes / block_size) / (heads *
+      sectors)`, **rounding down** — a geometry describes at most the
+      disk asked for and the trailing partial cylinder is
+      unaddressable, which is the only safe direction (rounding up puts
+      a partition's last cylinder past the end of the medium).
+      Candidate 2 wins almost everywhere, its cylinder being 16 KiB
+      against candidate 1's ~504 KiB; the exceptions are sizes that are
+      an exact multiple of candidate 1's cylinder, where both waste
+      nothing and the tie hands it over — which is why `rdbtool` emits
+      63 sectors for exactly 51 609 600 bytes and 32 sectors for
+      10 MiB. Head and sector choices do **not** depend on block size
+      (candidate 1's table is byte-based, candidate 2's start values
+      fixed); only the cylinder count scales, and with it where the
+      halving bites.
+
+      **One deliberate deviation**: a candidate whose fields would not
+      fit `rdb_Cylinders`/`rdb_Heads`/`rdb_CylBlocks` is discarded, and
+      `GeometryError::TooLarge` returned if that leaves none.
+      `rdbtool` is Python, whose integers do not wrap, so it has no
+      answer here at all; a wrapped geometry describing a disk that is
+      not there — with every partition placed against it pointing
+      somewhere real and wrong — is the one outcome this crate will not
+      produce. The threshold is petabytes past any medium. Below one
+      32-block cylinder is `TooSmall` (16 383 bytes at 512 fails,
+      16 384 succeeds, matching `rdbtool` exactly).
+
+      The observed triples are unit tests
+      (`geometry_matches_rdbtool_0_8_1`, 35 cases). Beyond those, the
+      implementation was cross-checked against the live amitools
+      `DiskGeometry` on 430 randomized sizes across all seven supported
+      block sizes: zero mismatches. Run as an oracle, never copied.
 - [ ] **RDSK + PART writing**: builder API — add partitions by size or
       by cylinder range, auto or explicit `DriveName`, boot priority,
       dostype, the lot. Block allocation within `rdb_RDBBlocksLo..Hi`.
@@ -133,6 +237,19 @@ want.
 
 The risky stage, gated on the differential suite existing first.
 
+- [ ] **`PartitionSink`** — the writing counterpart to
+      `PartitionSource`, deferred here on purpose rather than built
+      alongside `BlockSink` in milestone 2. Nothing in milestone 2 needs
+      it: creating an RDB writes only inside `rdb_RDBBlocksLo..=Hi`, and
+      a partition's *contents* are out of scope by the crate's founding
+      non-goal — one filesystem family per crate, stopping at the
+      partition boundary. The consumer that wants it is a filesystem
+      crate formatting into a partition, and that consumer's needs
+      (does it want the bounds check on every write? a flush? a
+      grow-into-free-space story?) are unknown until one exists.
+      Building it now would be guessing at an API with no caller,
+      which is exactly the mistake `rdb_BlockBytes` taught us to avoid
+      in the other direction. Revisit when a real consumer asks.
 - [ ] **AmiPart survey first**: before designing the edit API, read
       AmiPart (MIT, so readable closely — unlike xdftool, which stays a
       run-only GPL oracle) to enumerate the operation set and its edge

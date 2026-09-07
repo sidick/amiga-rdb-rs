@@ -10,7 +10,9 @@
 //! This crate is pure format logic. I/O comes in through one trait —
 //! [`BlockSource`], "read me block N" — so the same code serves an
 //! emulator holding an image file, a tool holding a raw device, and a
-//! test holding a `Vec<u8>`. What is *inside* a partition is out of
+//! test holding a `Vec<u8>`. [`BlockSink`] is its write-side mirror,
+//! kept separate so that "this code only reads" is a fact the type
+//! system enforces. What is *inside* a partition is out of
 //! scope by design: one filesystem family per crate, composed through
 //! an adapter that offsets a partition's LBAs into the parent device.
 //!
@@ -69,15 +71,8 @@
 //! #     d[o..o + 4].copy_from_slice(&v.to_be_bytes());
 //! # }
 //! # fn seal(d: &mut [u8], block: usize) {
-//! #     put32(d, block, 4, 64);
-//! #     put32(d, block, 8, 0);
 //! #     let base = block * 512;
-//! #     let mut sum = 0u32;
-//! #     for i in 0..64 {
-//! #         let w = d[base + i * 4..base + i * 4 + 4].try_into().unwrap();
-//! #         sum = sum.wrapping_add(u32::from_be_bytes(w));
-//! #     }
-//! #     put32(d, block, 8, sum.wrapping_neg());
+//! #     amiga_rdb::seal_checksum(&mut d[base..base + 512], 64).unwrap();
 //! # }
 //! # fn image() -> Vec<u8> {
 //! #     let mut d = vec![0u8; 320 * 512];
@@ -176,6 +171,61 @@ pub trait BlockSource {
     /// Total number of blocks, if known. `None` is legitimate (a raw
     /// character device may not know); only operations that need the
     /// disk's end require it.
+    fn block_count(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// Anything that can accept fixed-size blocks by LBA — the write seam.
+///
+/// Deliberately a *second* trait rather than `write_block` bolted onto
+/// [`BlockSource`], because read-only sources are the common case and
+/// the majority of this crate's work: a `File` opened for reading, a
+/// memory-mapped image, a `&[u8]`, an emulator's read-only medium. A
+/// single trait would force every one of them to supply a `write_block`
+/// that can only fail at runtime, which is a compile-time truth thrown
+/// away. Splitting them means "this code writes" is visible in the
+/// bound: anything that reads *and* writes says `S: BlockSource +
+/// BlockSink`, and anything that only reads cannot be handed a sink by
+/// accident. The cost is [`block_size`](Self::block_size) and
+/// [`block_count`](Self::block_count) appearing on both traits — a
+/// deliberate duplication, since a type implementing both will have
+/// them agree trivially, and making `BlockSink: BlockSource` instead
+/// would rule out a write-only target (a fresh image being streamed
+/// out) for no gain.
+///
+/// The block size is a runtime property, on exactly the terms
+/// [`BlockSource`] describes: every LBA is a *device* block of
+/// [`block_size`](Self::block_size) bytes, and the RDB's
+/// `rdb_BlockBytes` must agree with it.
+pub trait BlockSink {
+    /// How this sink reports a failed write. No bound is imposed here,
+    /// as on [`BlockSource::Error`].
+    type Error;
+
+    /// Bytes per device block. Must be constant for the sink's
+    /// lifetime, a power of two in
+    /// [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`], and — for a type that
+    /// is also a [`BlockSource`] — equal to what that trait reports.
+    fn block_size(&self) -> usize;
+
+    /// Write `buf` to block `lba`. `buf`'s length is exactly
+    /// [`block_size`](Self::block_size); a sink may treat a different
+    /// length as a caller bug (this crate never passes one).
+    ///
+    /// Whether the write has reached stable storage when this returns
+    /// is the implementation's business — this crate never assumes it,
+    /// and a caller that needs durability flushes the underlying object
+    /// itself. Ordering, however, *is* this crate's business: the write
+    /// paths are ordered so an interruption leaves the previous
+    /// structure intact, which only holds if a sink does not reorder
+    /// writes behind the caller's back.
+    fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error>;
+
+    /// Total number of blocks, if known — `None` on the same terms as
+    /// [`BlockSource::block_count`]. A sink that knows its size lets a
+    /// writer refuse a layout that runs off the end *before* writing
+    /// the first block rather than halfway through.
     fn block_count(&self) -> Option<u64> {
         None
     }
@@ -303,6 +353,38 @@ pub fn be16(block: &[u8], off: usize) -> u16 {
     u16::from_be_bytes([block[off], block[off + 1]])
 }
 
+/// Write a big-endian u32 at byte offset `off` — the inverse of
+/// [`be32`], and the only way this crate puts a longword into a block.
+///
+/// Public for the same reason [`be32`] is: a consumer assembling or
+/// patching a block field this crate does not model needs the format's
+/// byte order without reaching for a `#[repr(C)]` overlay that would be
+/// wrong on a little-endian host.
+#[inline]
+pub fn put_be32(block: &mut [u8], off: usize, v: u32) {
+    block[off..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+/// Byte offsets into the five-longword header every RDB-family block
+/// begins with — `RDSK`, `PART`, `FSHD`, `LSEG` and `BADB` alike.
+///
+/// The first three are what [`checksum_ok`] and [`seal_checksum`] share;
+/// `HostID` and `Next` follow (the latter named in [`chain`]).
+mod hdr {
+    pub const ID: usize = 0;
+    pub const SUMMED_LONGS: usize = 4;
+    pub const CHK_SUM: usize = 8;
+}
+
+/// The smallest `SummedLongs` that can produce a passing checksum: the
+/// sum must cover `ChkSum` itself, which is the third longword.
+///
+/// A count below this is not merely unusual, it is unsatisfiable —
+/// storing a value at `ChkSum` that the sum does not include cannot
+/// change the sum — so [`checksum_ok`] rejects such a block and
+/// [`seal_checksum`] refuses to write one.
+pub const MIN_SUMMED_LONGS: u32 = (hdr::CHK_SUM / 4) as u32 + 1;
+
 /// Verify an RDB-family block checksum.
 ///
 /// Every RDB-family block carries `SummedLongs` (longword count, at
@@ -311,7 +393,7 @@ pub fn be16(block: &[u8], off: usize) -> u16 {
 /// arithmetic. Returns `false` for a `SummedLongs` that doesn't fit the
 /// block — a malformed count must fail the check, not panic the host.
 pub fn checksum_ok(block: &[u8]) -> bool {
-    let longs = be32(block, 4) as usize;
+    let longs = be32(block, hdr::SUMMED_LONGS) as usize;
     if longs == 0 || longs > block.len() / 4 {
         return false;
     }
@@ -320,6 +402,430 @@ pub fn checksum_ok(block: &[u8]) -> bool {
         sum = sum.wrapping_add(be32(block, i * 4));
     }
     sum == 0
+}
+
+/// Why [`seal_checksum`] refused to seal a block.
+///
+/// Both variants describe a `summed_longs` that no block could ever
+/// satisfy, so sealing anyway would produce a block [`checksum_ok`]
+/// rejects — the one outcome a *writer* must never have. Refusing is
+/// deliberately not clamping: clamping would silently seal a different
+/// number of longwords than the caller asked for, and since the caller
+/// derived that number from the structure it is writing (`SummedLongs`
+/// is 64 for `RDSK`/`PART`/`FSHD`, the whole block for `LSEG`, a
+/// function of the entry count for `BADB`), a clamp would mean the
+/// block's own header disagrees with its layout. Better to fail where
+/// the arithmetic was done than to write a self-consistent lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealError {
+    /// `summed_longs` is below [`MIN_SUMMED_LONGS`], so the sum would
+    /// not cover `ChkSum` and no stored value could make it zero.
+    SummedLongsTooShort {
+        /// The count that was asked for.
+        summed_longs: u32,
+    },
+    /// `summed_longs` longwords do not fit in the block — including the
+    /// case of a block too small to hold the header at all.
+    SummedLongsTooLong {
+        /// The count that was asked for.
+        summed_longs: u32,
+        /// How many longwords the block actually holds.
+        capacity: usize,
+    },
+}
+
+impl core::fmt::Display for SealError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SealError::SummedLongsTooShort { summed_longs } => write!(
+                f,
+                "SummedLongs {summed_longs} is below the {MIN_SUMMED_LONGS} needed \
+                 to cover ChkSum itself"
+            ),
+            SealError::SummedLongsTooLong {
+                summed_longs,
+                capacity,
+            } => write!(
+                f,
+                "SummedLongs {summed_longs} exceeds the {capacity} longwords the block holds"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SealError {}
+
+/// Seal an RDB-family block: store `summed_longs` and the `ChkSum` that
+/// makes the block check out — the exact inverse of [`checksum_ok`].
+///
+/// Writes `summed_longs` at byte 4, zeroes `ChkSum` at byte 8, sums the
+/// first `summed_longs` big-endian longwords with 32-bit wrapping
+/// arithmetic, and stores the negation of that sum at `ChkSum`. After
+/// this returns `Ok`, `checksum_ok(block)` is `true` — that round trip
+/// is the whole contract, and it is what every block writer in this
+/// crate depends on.
+///
+/// `summed_longs` is the caller's, not derived from the block, because
+/// the count is part of what the *structure* says about itself and
+/// differs per block type: 64 for `RDSK`, `PART` and `FSHD` (which sum
+/// their first 256 bytes whatever the device block size), `block_size /
+/// 4` for `LSEG` (the whole block is payload), and header-plus-entries
+/// for `BADB`. There is nothing in a half-built block to infer it from.
+///
+/// Fails rather than panics or clamps on a count that cannot work — see
+/// [`SealError`]. A block shorter than three longwords is
+/// [`SealError::SummedLongsTooLong`] by the same check, so no length is
+/// a panic.
+pub fn seal_checksum(block: &mut [u8], summed_longs: u32) -> Result<(), SealError> {
+    if summed_longs < MIN_SUMMED_LONGS {
+        return Err(SealError::SummedLongsTooShort { summed_longs });
+    }
+    let capacity = block.len() / 4;
+    let longs = summed_longs as usize;
+    if longs > capacity {
+        return Err(SealError::SummedLongsTooLong {
+            summed_longs,
+            capacity,
+        });
+    }
+
+    put_be32(block, hdr::SUMMED_LONGS, summed_longs);
+    put_be32(block, hdr::CHK_SUM, 0);
+    let mut sum: u32 = 0;
+    for i in 0..longs {
+        sum = sum.wrapping_add(be32(block, i * 4));
+    }
+    put_be32(block, hdr::CHK_SUM, sum.wrapping_neg());
+    Ok(())
+}
+
+/// A drive geometry: the cylinders/heads/sectors triple an `RDSK` block
+/// stores in `rdb_Cylinders`/`rdb_Heads`/`rdb_Sectors`, and which every
+/// partition's `de_LowCyl`/`de_HighCyl` is expressed in.
+///
+/// Geometry is a fiction on any drive made since the 1990s — the disk
+/// reports LBAs and invents whatever CHS the host asks for — but the RDB
+/// format has no other way to say where a partition starts, so *some*
+/// triple has to be chosen and every tool has to choose the same way for
+/// its images to be interchangeable. [`synthesize_geometry`] is where
+/// that choice is made and documented.
+///
+/// The block size rides along because a triple means nothing without it:
+/// the same cylinders/heads/sectors describe eight times the disk at
+/// 4096-byte blocks that they do at 512.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Geometry {
+    /// `rdb_Cylinders`.
+    pub cylinders: u32,
+    /// `rdb_Heads` — surfaces per cylinder.
+    pub heads: u32,
+    /// `rdb_Sectors` — device blocks per track.
+    pub sectors: u32,
+    /// Bytes per device block, matching the source or sink the geometry
+    /// is for and what `rdb_BlockBytes` will say.
+    pub block_size: usize,
+}
+
+impl Geometry {
+    /// Device blocks per cylinder — `heads * sectors`, which is what
+    /// `rdb_CylBlocks` and a partition's `de_Surfaces *
+    /// de_BlocksPerTrack` both hold.
+    ///
+    /// Saturating, because the fields are public and a hand-built
+    /// `Geometry` may hold anything; one from
+    /// [`synthesize_geometry`] never comes close.
+    pub fn cylinder_blocks(&self) -> u64 {
+        (self.heads as u64).saturating_mul(self.sectors as u64)
+    }
+
+    /// Device blocks the whole geometry describes, saturating on the
+    /// same terms.
+    pub fn total_blocks(&self) -> u64 {
+        (self.cylinders as u64).saturating_mul(self.cylinder_blocks())
+    }
+
+    /// Bytes the whole geometry describes, saturating on the same terms.
+    /// For a synthesized geometry this is at most the size asked for,
+    /// and short of it by less than one cylinder.
+    pub fn total_bytes(&self) -> u64 {
+        self.total_blocks().saturating_mul(self.block_size as u64)
+    }
+}
+
+/// Why [`synthesize_geometry`] could not produce a geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeometryError {
+    /// `block_size` is not a power of two in
+    /// [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`].
+    UnsupportedBlockSize {
+        /// The block size asked for.
+        block_size: usize,
+    },
+    /// The disk is smaller than one cylinder of the smallest geometry
+    /// the convention will produce, so there is nothing to describe.
+    TooSmall {
+        /// The size asked for.
+        total_bytes: u64,
+        /// The block size asked for.
+        block_size: usize,
+        /// The smallest size that does yield a geometry, in bytes.
+        minimum_bytes: u64,
+    },
+    /// The disk is so large that no candidate geometry's fields fit the
+    /// format's 32-bit `rdb_Cylinders`/`rdb_Heads`/`rdb_CylBlocks`.
+    ///
+    /// An error rather than a wrap on purpose: a wrapped cylinder count
+    /// describes a disk that is not there, and every partition placed
+    /// against it would point somewhere real and wrong. (The threshold
+    /// is far past any medium — petabytes at 512-byte blocks — but it is
+    /// reachable from a `u64` byte count, so it is answered rather than
+    /// assumed away.)
+    TooLarge {
+        /// The size asked for.
+        total_bytes: u64,
+        /// The block size asked for.
+        block_size: usize,
+    },
+}
+
+impl core::fmt::Display for GeometryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            GeometryError::UnsupportedBlockSize { block_size } => write!(
+                f,
+                "unsupported device block size {block_size}: \
+                 must be a power of two in {MIN_BLOCK_SIZE}..={MAX_BLOCK_SIZE}"
+            ),
+            GeometryError::TooSmall {
+                total_bytes,
+                block_size,
+                minimum_bytes,
+            } => write!(
+                f,
+                "{total_bytes} bytes is too small for a geometry in {block_size}-byte blocks: \
+                 at least {minimum_bytes} bytes are needed for one cylinder"
+            ),
+            GeometryError::TooLarge {
+                total_bytes,
+                block_size,
+            } => write!(
+                f,
+                "{total_bytes} bytes in {block_size}-byte blocks exceeds what the RDB's \
+                 32-bit geometry fields can describe"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for GeometryError {}
+
+/// Constants of the geometry convention this crate follows — amitools'
+/// `rdbtool`, whose images are this crate's fixtures and its
+/// differential oracle.
+///
+/// Two candidate geometries are generated and the one wasting fewer
+/// bytes wins; see [`synthesize_geometry`] for the whole story.
+mod geo {
+    /// The "PC-ish" candidate's fixed sector count: 63, the largest a
+    /// PC BIOS's six-bit sector field could hold, and so the number
+    /// every PC-derived geometry has used since.
+    pub const PC_SECTORS: u64 = 63;
+
+    /// `(inclusive upper bound in KiB, heads)`, in order. A size at
+    /// exactly a bound takes that row's head count; anything past the
+    /// last row takes [`PC_HEADS_ABOVE`].
+    ///
+    /// The bounds are the classic BIOS translation breakpoints — 504 MB,
+    /// then doubling — expressed in KiB because that is the unit the
+    /// comparison is made in, and the comparison is against the
+    /// *requested byte size*, not the block count, so it does not move
+    /// with the block size.
+    pub const PC_HEADS: [(u64, u64); 4] = [
+        (504 * 1024, 16),
+        (1008 * 1024, 32),
+        (2016 * 1024, 64),
+        (4032 * 1024, 128),
+    ];
+
+    /// Heads for anything past the last [`PC_HEADS`] row.
+    pub const PC_HEADS_ABOVE: u64 = 256;
+
+    /// The "Amiga-ish" candidate's fixed sector count: 32 blocks per
+    /// track, the value AmigaOS partitioning tools have always used.
+    pub const AMIGA_SECTORS: u64 = 32;
+
+    /// The cylinder ceiling the Amiga-ish candidate halves down to.
+    /// 65535, not 65536: an artefact of the 16-bit cylinder counts real
+    /// controllers had, kept because deviating from it would put this
+    /// crate's images a cylinder away from every other tool's.
+    pub const MAX_CYLINDERS: u64 = 65535;
+}
+
+/// Choose a cylinders/heads/sectors geometry for a disk of
+/// `total_bytes` in `block_size`-byte device blocks.
+///
+/// # Which convention, and why
+///
+/// **amitools' `rdbtool`, pinned against version 0.8.1.** Tools differ
+/// here and there is no right answer — geometry is invented on any
+/// modern medium — so the tie-breaker is interoperability: amitools'
+/// images are this crate's test fixtures and `xdftool` is the
+/// differential oracle milestone 2 diffs against, so producing a
+/// *different* geometry for the same size would make every such
+/// comparison a false positive. The behaviour below was pinned
+/// empirically, by creating images at a spread of sizes and reading back
+/// what `rdbtool` chose; the observed triples are unit tests.
+///
+/// # The convention
+///
+/// Two candidates are generated and the one wasting fewer bytes wins,
+/// with the first winning an exact tie:
+///
+/// 1. **PC-ish**: 63 sectors, heads from a table of the classic BIOS
+///    translation breakpoints applied to the *requested byte size*
+///    (≤ 504 MiB → 16 heads, then 32, 64, 128 at each doubling, 256
+///    above 4032 MiB).
+/// 2. **Amiga-ish**: 32 sectors, 1 head — then, while the cylinder count
+///    exceeds 65535, halve the cylinders and double the heads.
+///
+/// Both compute `cylinders = (total_bytes / block_size) / (heads *
+/// sectors)`, **rounding the cylinder count down**. A geometry therefore
+/// describes at most the size asked for and never more: the last partial
+/// cylinder of a disk whose size is not a whole number of them is simply
+/// unaddressable, which is what every real tool does and the only safe
+/// direction to round — rounding up would place a partition's last
+/// cylinder past the end of the medium.
+///
+/// In practice candidate 2 wins almost everywhere, its cylinders being
+/// 16 KiB apart at 512-byte blocks against candidate 1's ~504 KiB. The
+/// exceptions are sizes that are an exact multiple of candidate 1's
+/// cylinder size, where both waste nothing and the tie hands it to
+/// candidate 1 — which is why `rdbtool` emits a 63-sector geometry for
+/// (say) exactly 51 609 600 bytes and a 32-sector one for 10 MiB.
+///
+/// # Deviations, deliberately
+///
+/// A candidate whose fields would not fit the format's 32-bit
+/// `rdb_Cylinders`/`rdb_Heads`/`rdb_CylBlocks` is discarded rather than
+/// truncated, and [`GeometryError::TooLarge`] is returned if that leaves
+/// none. `rdbtool` is written in Python, whose integers do not wrap, and
+/// so has no answer here at all; a wrapped geometry describing a disk
+/// that is not there is the one outcome this crate will not produce. The
+/// threshold is petabytes away from any real medium, so this never
+/// changes the answer for a size anyone will ask for.
+///
+/// # Block size
+///
+/// The head and sector choices do *not* depend on `block_size` — the
+/// candidate-1 table is byte-based and candidate 2's start values are
+/// fixed — so only the cylinder count scales with it, which is what was
+/// observed. `block_size` still matters to the *result*, because it
+/// decides where the 65535-cylinder halving kicks in.
+pub fn synthesize_geometry(total_bytes: u64, block_size: usize) -> Result<Geometry, GeometryError> {
+    if !block_size_ok(block_size) {
+        return Err(GeometryError::UnsupportedBlockSize { block_size });
+    }
+    let bs = block_size as u64;
+    let total_blocks = total_bytes / bs;
+
+    // Candidate 2 with one head is the smallest geometry the convention
+    // can produce, so a disk short of one of its cylinders has no
+    // geometry at all — and candidate 1's cylinder is 31.5 times larger,
+    // so there is no size where it rescues one that fails here.
+    let minimum_bytes = geo::AMIGA_SECTORS * bs;
+    if total_blocks < geo::AMIGA_SECTORS {
+        return Err(GeometryError::TooSmall {
+            total_bytes,
+            block_size,
+            minimum_bytes,
+        });
+    }
+
+    // Candidate 1 first, because the waste comparison below keeps the
+    // incumbent on a tie and an exact tie must go to candidate 1.
+    let candidates = [
+        pc_geometry(total_bytes, total_blocks, block_size),
+        amiga_geometry(total_blocks, block_size),
+    ];
+    let mut best: Option<(Geometry, u64)> = None;
+    for g in candidates.into_iter().flatten() {
+        let waste = total_bytes - g.total_bytes();
+        let better = match best {
+            Some((_, incumbent)) => waste < incumbent,
+            None => true,
+        };
+        if better {
+            best = Some((g, waste));
+        }
+    }
+
+    match best {
+        Some((g, _)) => Ok(g),
+        None => Err(GeometryError::TooLarge {
+            total_bytes,
+            block_size,
+        }),
+    }
+}
+
+/// Candidate 1: 63 sectors, heads from the BIOS-breakpoint table.
+///
+/// The table is consulted with the *requested byte size*, not the block
+/// count — so a 4 KB-block disk of a given size picks the same head
+/// count as a 512-byte-block one of that size.
+fn pc_geometry(total_bytes: u64, total_blocks: u64, block_size: usize) -> Option<Geometry> {
+    let kib = total_bytes / 1024;
+    let mut heads = geo::PC_HEADS_ABOVE;
+    for &(limit_kib, h) in geo::PC_HEADS.iter() {
+        if kib <= limit_kib {
+            heads = h;
+            break;
+        }
+    }
+    let cylinders = total_blocks / (heads * geo::PC_SECTORS);
+    representable(cylinders, heads, geo::PC_SECTORS, block_size)
+}
+
+/// Candidate 2: 32 sectors, one head, halving cylinders and doubling
+/// heads until the cylinder count fits the 65535 ceiling.
+///
+/// The halving is applied to the *already floored* cylinder count, so an
+/// odd count loses a whole cylinder rather than half of one — matching
+/// what was observed, and the reason a 65537-cylinder disk ends up 16 KiB
+/// short where a 65536-cylinder one is exact.
+fn amiga_geometry(total_blocks: u64, block_size: usize) -> Option<Geometry> {
+    let mut heads: u64 = 1;
+    let mut cylinders = total_blocks / geo::AMIGA_SECTORS;
+    while cylinders > geo::MAX_CYLINDERS {
+        cylinders /= 2;
+        // Terminates: cylinders strictly decreases while above 65535,
+        // and `heads` is only checked against the u32 ceiling at the end
+        // because doubling it in a u64 cannot overflow first (the loop
+        // runs at most 64 times).
+        heads = heads.saturating_mul(2);
+    }
+    representable(cylinders, heads, geo::AMIGA_SECTORS, block_size)
+}
+
+/// A candidate geometry, or `None` if it describes nothing or does not
+/// fit the format's 32-bit fields.
+///
+/// `rdb_CylBlocks` is a single longword as much as `rdb_Heads` is, so
+/// `heads * sectors` is checked too and not just the factors.
+fn representable(cylinders: u64, heads: u64, sectors: u64, block_size: usize) -> Option<Geometry> {
+    let max = u32::MAX as u64;
+    if cylinders == 0 || cylinders > max || heads > max || sectors > max {
+        return None;
+    }
+    heads.checked_mul(sectors).filter(|&cb| cb <= max)?;
+    Some(Geometry {
+        cylinders: cylinders as u32,
+        heads: heads as u32,
+        sectors: sectors as u32,
+        block_size,
+    })
 }
 
 /// Errors from parsing an RDB.
@@ -1097,7 +1603,7 @@ where
         visited.push(next);
 
         disk.read_block(lba, buf).map_err(RdbError::Io)?;
-        let found = be32(buf, 0);
+        let found = be32(buf, hdr::ID);
         if found != expected {
             return Err(RdbError::WrongId {
                 lba,
@@ -1139,7 +1645,7 @@ impl Rdb {
         };
         for lba in 0..scan_end {
             disk.read_block(lba, &mut buf).map_err(RdbError::Io)?;
-            if be32(&buf, 0) == id::RDSK && checksum_ok(&buf) {
+            if be32(&buf, hdr::ID) == id::RDSK && checksum_ok(&buf) {
                 rdsk_at = Some(lba);
                 break;
             }
@@ -1483,7 +1989,7 @@ fn parse_fshd(buf: &[u8], lba: u64) -> FileSysHeader {
 /// that depends on a checksum passing is one refactor away from not
 /// being a bounds check.
 fn parse_badb(buf: &[u8], out: &mut Vec<BadBlockEntry>) {
-    let summed_longs = be32(buf, 4) as usize;
+    let summed_longs = be32(buf, hdr::SUMMED_LONGS) as usize;
     let entry_longs = summed_longs.saturating_sub(badb::HEADER_LONGS);
     let capacity_longs = (buf.len() - badb::ENTRIES) / 4;
     let pairs = entry_longs.min(capacity_longs) / 2;
@@ -1694,8 +2200,8 @@ impl<'a, S: BlockSource> BlockSource for PartitionSource<'a, S> {
 
 #[cfg(feature = "std")]
 mod std_support {
-    use super::{block_size_ok, BlockSource, MIN_BLOCK_SIZE};
-    use std::io::{Read, Seek, SeekFrom};
+    use super::{block_size_ok, BlockSink, BlockSource, MIN_BLOCK_SIZE};
+    use std::io::{Read, Seek, SeekFrom, Write};
 
     /// A [`BlockSource`] over anything `Read + Seek` — a `File`, a
     /// `Cursor<Vec<u8>>`. The convenience the `std` feature exists for.
@@ -1704,6 +2210,15 @@ mod std_support {
     /// supplies it: [`new`](Self::new) assumes the classic 512, and
     /// [`with_block_size`](Self::with_block_size) takes the size of the
     /// device the image was taken from.
+    ///
+    /// It is also a [`BlockSink`] when — and only when — the inner type
+    /// is `Write` as well. One type serves both directions rather than a
+    /// `SeekBlockSink` beside it: the seek-and-transfer logic is the
+    /// same and the block size must not be allowed to differ between a
+    /// read view and a write view of one file. A read-only `T` simply
+    /// does not get the [`BlockSink`] impl, so "this file was opened for
+    /// reading" stays a compile-time fact — which is the whole reason
+    /// [`BlockSink`] is a separate trait.
     pub struct SeekBlockSource<T: Read + Seek> {
         inner: T,
         block_size: usize,
@@ -1756,6 +2271,29 @@ mod std_support {
             self.blocks
         }
     }
+
+    impl<T: Read + Write + Seek> BlockSink for SeekBlockSource<T> {
+        type Error = std::io::Error;
+
+        fn block_size(&self) -> usize {
+            self.block_size
+        }
+
+        fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+            self.inner
+                .seek(SeekFrom::Start(lba * self.block_size as u64))?;
+            self.inner.write_all(buf)
+        }
+
+        /// The block count sampled when the source was constructed, and
+        /// so *not* updated by a write past the end that grows a file.
+        /// Deliberate: it describes the device this view was opened on,
+        /// and a writer asking "does my layout fit" wants that answer,
+        /// not one that moves as it writes.
+        fn block_count(&self) -> Option<u64> {
+            self.blocks
+        }
+    }
 }
 
 #[cfg(feature = "std")]
@@ -1802,23 +2340,49 @@ mod tests {
         }
     }
 
+    /// The same buffer, writable — the in-memory sink the write path is
+    /// developed against. It refuses a write past the end exactly as it
+    /// refuses a read past the end: a sink that silently grew would hide
+    /// the "layout runs off the disk" bug the checks exist to catch.
+    impl BlockSink for MemDisk {
+        type Error = ();
+
+        fn block_size(&self) -> usize {
+            self.block_size
+        }
+
+        fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
+            let off = lba as usize * self.block_size;
+            if off + self.block_size > self.data.len() {
+                return Err(());
+            }
+            self.data[off..off + self.block_size].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn block_count(&self) -> Option<u64> {
+            Some((self.data.len() / self.block_size) as u64)
+        }
+    }
+
     fn put32(disk: &mut [u8], bs: usize, block: usize, off: usize, v: u32) {
         let o = block * bs + off;
         disk[o..o + 4].copy_from_slice(&v.to_be_bytes());
     }
 
-    /// Compute and store a valid checksum over `longs` longwords.
+    /// Seal block `block` of a whole-disk buffer over `longs`
+    /// longwords.
+    ///
+    /// A thin address-arithmetic wrapper over the public
+    /// [`seal_checksum`] rather than a second implementation of it: the
+    /// fixtures below seal several hundred blocks between them, so the
+    /// production sealer gets exercised by every parse test in the file
+    /// — the round-trip property (`seal_checksum` then `checksum_ok`)
+    /// proved incidentally, everywhere, in addition to
+    /// [`seal_then_checksum_ok_round_trips`] proving it on purpose.
     fn seal(disk: &mut [u8], bs: usize, block: usize, longs: u32) {
-        put32(disk, bs, block, 4, longs);
-        put32(disk, bs, block, 8, 0);
         let base = block * bs;
-        let mut sum: u32 = 0;
-        for i in 0..longs as usize {
-            sum = sum.wrapping_add(u32::from_be_bytes(
-                disk[base + i * 4..base + i * 4 + 4].try_into().unwrap(),
-            ));
-        }
-        put32(disk, bs, block, 8, sum.wrapping_neg());
+        seal_checksum(&mut disk[base..base + bs], longs).unwrap();
     }
 
     /// Write a fixed-width, space-padded ASCII field (the RDSK
@@ -2783,5 +3347,389 @@ mod tests {
         assert!(!checksum_ok(&b));
         b[4..8].copy_from_slice(&0u32.to_be_bytes());
         assert!(!checksum_ok(&b));
+    }
+
+    /// The round-trip property in miniature, swept over every supported
+    /// block size, a spread of `SummedLongs` within each, and contents
+    /// chosen to make the wrapping arithmetic actually wrap: whatever
+    /// [`seal_checksum`] accepts, [`checksum_ok`] must then accept.
+    ///
+    /// Not a `proptest` — no new dependencies — but the same shape: the
+    /// generator is a cheap LCG over the block bytes, so each case is a
+    /// different pattern rather than the zeros a hand-written fixture
+    /// would have. The all-`0xFF` and all-zero patterns are included
+    /// explicitly because they are the two the sum degenerates on.
+    #[test]
+    fn seal_then_checksum_ok_round_trips() {
+        for bs in [512usize, 1024, 2048, 4096, 8192, 16384, 32768] {
+            let capacity = (bs / 4) as u32;
+            for pattern in 0u32..6 {
+                let mut block = vec![0u8; bs];
+                for (i, byte) in block.iter_mut().enumerate() {
+                    *byte = match pattern {
+                        0 => 0,
+                        1 => 0xFF,
+                        // A cheap LCG, so each pattern is a different
+                        // spread of longwords rather than a ramp that
+                        // sums to something tidy.
+                        p => {
+                            (((i as u32)
+                                .wrapping_mul(1_103_515_245)
+                                .wrapping_add(p * 12_345))
+                                >> 16) as u8
+                        }
+                    };
+                }
+                for longs in [
+                    MIN_SUMMED_LONGS,
+                    MIN_SUMMED_LONGS + 1,
+                    64,
+                    capacity / 2,
+                    capacity - 1,
+                    capacity,
+                ] {
+                    seal_checksum(&mut block, longs).unwrap();
+                    assert!(
+                        checksum_ok(&block),
+                        "bs {bs} pattern {pattern} longs {longs} did not check out"
+                    );
+                    // And the header says what was asked for, which is
+                    // the half a clamp would have quietly changed.
+                    assert_eq!(be32(&block, 4), longs);
+                }
+            }
+        }
+    }
+
+    /// Sealing refuses counts no block can satisfy rather than clamping
+    /// them, and refuses without touching the block.
+    #[test]
+    fn seal_refuses_impossible_summed_longs() {
+        let mut block = vec![0xAAu8; 512];
+        let untouched = block.clone();
+
+        for longs in 0..MIN_SUMMED_LONGS {
+            assert_eq!(
+                seal_checksum(&mut block, longs),
+                Err(SealError::SummedLongsTooShort {
+                    summed_longs: longs
+                })
+            );
+        }
+        for longs in [129u32, 1024, u32::MAX] {
+            assert_eq!(
+                seal_checksum(&mut block, longs),
+                Err(SealError::SummedLongsTooLong {
+                    summed_longs: longs,
+                    capacity: 128,
+                })
+            );
+        }
+        assert_eq!(block, untouched);
+
+        // A block too short to hold the header is the same refusal, not
+        // a panic — the property that matters is that no length panics.
+        let mut tiny = [0u8; 8];
+        assert_eq!(
+            seal_checksum(&mut tiny, MIN_SUMMED_LONGS),
+            Err(SealError::SummedLongsTooLong {
+                summed_longs: MIN_SUMMED_LONGS,
+                capacity: 2,
+            })
+        );
+    }
+
+    /// A `SummedLongs` below [`MIN_SUMMED_LONGS`] is unsatisfiable, not
+    /// merely refused by convention: even a hand-built block gets no
+    /// value at `ChkSum` that makes such a sum come out zero, which is
+    /// why sealing declines to try.
+    #[test]
+    fn short_summed_longs_can_never_check_out() {
+        for longs in 1u32..MIN_SUMMED_LONGS {
+            let mut block = [0u8; 512];
+            put_be32(&mut block, 4, longs);
+            for chk in [0u32, 1, 0xFFFF_FFFF, 0x8000_0000] {
+                put_be32(&mut block, 8, chk);
+                // The first `longs` longwords are ID and SummedLongs,
+                // both non-zero here, so the sum cannot be zero however
+                // ChkSum is set.
+                put_be32(&mut block, 0, id::RDSK);
+                assert!(!checksum_ok(&block));
+            }
+        }
+    }
+
+    /// The write seam, end to end through the crate's own reader: seal a
+    /// block, hand it to a [`BlockSink`], and parse the result back.
+    /// A `MemDisk` is both traits, which is exactly the
+    /// `BlockSource + BlockSink` bound the write path will take.
+    #[test]
+    fn block_sink_writes_blocks_a_parse_reads_back() {
+        fn stamp<D: BlockSource + BlockSink>(disk: &mut D, src: &[u8], block: usize)
+        where
+            <D as BlockSink>::Error: core::fmt::Debug,
+        {
+            let bs = BlockSink::block_size(disk);
+            disk.write_block(block as u64, &src[block * bs..(block + 1) * bs])
+                .unwrap();
+        }
+
+        // A blank disk, filled a block at a time from a known-good image
+        // through the sink rather than by slicing the buffer.
+        let image = one_partition_image(2);
+        let mut disk = MemDisk::new(vec![0u8; image.len()]);
+        for block in 0..image.len() / 512 {
+            stamp(&mut disk, &image, block);
+        }
+        assert_eq!(disk.data, image);
+
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.rdsk_block, 2);
+        assert_eq!(rdb.partitions[0].name, "DH0");
+    }
+
+    /// A sink refuses a block past its end, so a layout that does not
+    /// fit fails at the write rather than growing the disk under it.
+    #[test]
+    fn block_sink_refuses_a_write_past_the_end() {
+        let mut disk = MemDisk::new(vec![0u8; 4 * 512]);
+        assert_eq!(disk.write_block(3, &[0u8; 512]), Ok(()));
+        assert_eq!(disk.write_block(4, &[0u8; 512]), Err(()));
+        assert_eq!(BlockSink::block_count(&disk), Some(4));
+    }
+
+    /// `SeekBlockSource` gains [`BlockSink`] from a `Write` inner type
+    /// and keeps its block size across both directions.
+    #[cfg(feature = "std")]
+    #[test]
+    fn seek_block_source_writes_when_the_inner_type_can() {
+        let mut disk = SeekBlockSource::new(std::io::Cursor::new(vec![0u8; 8 * 512])).unwrap();
+        let mut block = vec![0u8; 512];
+        put_be32(&mut block, 0, id::RDSK);
+        seal_checksum(&mut block, 64).unwrap();
+        disk.write_block(5, &block).unwrap();
+
+        let mut back = vec![0u8; 512];
+        disk.read_block(5, &mut back).unwrap();
+        assert_eq!(back, block);
+        assert!(checksum_ok(&back));
+        assert_eq!(BlockSink::block_size(&disk), 512);
+        assert_eq!(BlockSink::block_count(&disk), Some(8));
+    }
+
+    #[test]
+    fn put_be32_is_be32s_inverse() {
+        let mut block = [0u8; 512];
+        for (i, v) in [0u32, 1, 0x4441_5441, u32::MAX, 0x8000_0000]
+            .into_iter()
+            .enumerate()
+        {
+            put_be32(&mut block, i * 4, v);
+            assert_eq!(be32(&block, i * 4), v);
+        }
+        // And the byte order really is the format's, not the host's.
+        put_be32(&mut block, 0, 0x5244_534B);
+        assert_eq!(&block[..4], b"RDSK");
+    }
+
+    /// Every case below was read out of an image `rdbtool` actually
+    /// created — `rdbtool <img> create size=<n> [bs=<n>] + init`, then
+    /// the geometry read back — so these are observations, not a
+    /// restatement of the algorithm.
+    ///
+    /// **Pinned against amitools 0.8.1.** If a future amitools changes
+    /// its convention this test is where it will be noticed, and the
+    /// decision (follow, or diverge deliberately) belongs there rather
+    /// than in silently drifting images.
+    const RDBTOOL_0_8_1: &[(u64, usize, u32, u32, u32)] = &[
+        // (requested bytes, block size, cylinders, heads, sectors)
+        //
+        // The Amiga-ish candidate wins almost everywhere: its cylinder
+        // is 16 KiB, so it wastes less than the 63-sector one can.
+        (512 * 1024, 512, 32, 1, 32),
+        (1024 * 1024, 512, 64, 1, 32),
+        (10 * 1024 * 1024, 512, 640, 1, 32),
+        (100 * 1024 * 1024, 512, 6400, 1, 32),
+        (512 * 1024 * 1024, 512, 32768, 1, 32),
+        (700 * 1024 * 1024, 512, 44800, 1, 32),
+        // Past 65535 cylinders the halving starts, so the head count
+        // doubles with every doubling of the disk and the cylinder
+        // count sticks at 32768.
+        (1024 * 1024 * 1024, 512, 32768, 2, 32),
+        (2 * 1024 * 1024 * 1024, 512, 32768, 4, 32),
+        (4 * 1024 * 1024 * 1024, 512, 32768, 8, 32),
+        (8 * 1024 * 1024 * 1024, 512, 32768, 16, 32),
+        (16 * 1024 * 1024 * 1024, 512, 32768, 32, 32),
+        (64 * 1024 * 1024 * 1024, 512, 32768, 128, 32),
+        // Either side of the ceiling: 65535 cylinders is allowed,
+        // 65536 is not, and 65537 loses a cylinder to the halving.
+        (1_073_725_440, 512, 65535, 1, 32),
+        (1_073_741_824, 512, 32768, 2, 32),
+        (1_073_758_208, 512, 32768, 2, 32),
+        (2_147_467_264, 512, 65535, 2, 32),
+        // Sizes that are an exact multiple of the PC-ish cylinder:
+        // both candidates waste nothing and the tie goes to 63 sectors.
+        // The head count walks the breakpoint table.
+        (516_096, 512, 1, 16, 63),
+        (1_032_192, 512, 2, 16, 63),
+        (51_609_600, 512, 100, 16, 63),
+        (527_966_208, 512, 1023, 16, 63),
+        (528_482_304, 512, 1024, 16, 63), // exactly 504 MiB: still 16 heads
+        (528_482_305, 512, 1024, 16, 63), // one byte over: still 16 heads
+        (1_056_964_608, 512, 1024, 32, 63),
+        (2_113_929_216, 512, 1024, 64, 63),
+        (4_227_858_432, 512, 1024, 128, 63),
+        (8_455_716_864, 512, 1024, 256, 63),
+        // Sizes that divide evenly into no cylinder at all: the count
+        // rounds down and the tail is unaddressable.
+        (123_456_789, 512, 7535, 1, 32),
+        (33_333_333, 512, 2034, 1, 32),
+        // 4 KB blocks: heads and sectors are unchanged, only the
+        // cylinder count scales — and with it where the ceiling bites.
+        (10 * 1024 * 1024, 4096, 80, 1, 32),
+        (100 * 1024 * 1024, 4096, 800, 1, 32),
+        (1024 * 1024 * 1024, 4096, 8192, 1, 32),
+        (8 * 1024 * 1024 * 1024, 4096, 32768, 2, 32),
+        (123_456_789, 4096, 941, 1, 32),
+        // The smallest disk that has a geometry at all: one 32-block
+        // cylinder. 16383 bytes is the TooSmall case, tested separately.
+        (16384, 512, 1, 1, 32),
+    ];
+
+    #[test]
+    fn geometry_matches_rdbtool_0_8_1() {
+        for &(bytes, bs, cylinders, heads, sectors) in RDBTOOL_0_8_1 {
+            let g = synthesize_geometry(bytes, bs)
+                .unwrap_or_else(|e| panic!("{bytes} bytes at bs {bs}: {e}"));
+            assert_eq!(
+                (g.cylinders, g.heads, g.sectors),
+                (cylinders, heads, sectors),
+                "{bytes} bytes at bs {bs}"
+            );
+            assert_eq!(g.block_size, bs);
+            assert_eq!(g.cylinder_blocks(), heads as u64 * sectors as u64);
+        }
+    }
+
+    /// The rounding direction, asserted as a property over every pinned
+    /// case rather than only where the numbers happen to be untidy: a
+    /// geometry describes at most the disk asked for, and falls short by
+    /// less than one cylinder. Rounding the other way would put a
+    /// partition's last cylinder past the end of the medium.
+    #[test]
+    fn geometry_never_describes_more_than_the_disk() {
+        for &(bytes, bs, ..) in RDBTOOL_0_8_1 {
+            let g = synthesize_geometry(bytes, bs).unwrap();
+            let cylinder_bytes = g.cylinder_blocks() * bs as u64;
+            assert!(g.total_bytes() <= bytes, "{bytes} at bs {bs} overshot");
+            assert!(
+                bytes - g.total_bytes() < cylinder_bytes,
+                "{bytes} at bs {bs} wasted a whole cylinder"
+            );
+        }
+    }
+
+    /// A disk short of one 32-block cylinder has no geometry, and says
+    /// so rather than returning a zero-cylinder one that would describe
+    /// a disk of no size.
+    #[test]
+    fn geometry_refuses_a_disk_below_one_cylinder() {
+        assert_eq!(
+            synthesize_geometry(16383, 512),
+            Err(GeometryError::TooSmall {
+                total_bytes: 16383,
+                block_size: 512,
+                minimum_bytes: 16384,
+            })
+        );
+        assert_eq!(
+            synthesize_geometry(0, 512),
+            Err(GeometryError::TooSmall {
+                total_bytes: 0,
+                block_size: 512,
+                minimum_bytes: 16384,
+            })
+        );
+        // The floor scales with the block size: 32 blocks, whatever
+        // they are worth.
+        assert!(synthesize_geometry(131_071, 4096).is_err());
+        assert!(synthesize_geometry(131_072, 4096).is_ok());
+    }
+
+    /// A size no 32-bit geometry can describe is an error, not a wrap.
+    /// Both candidates fail here: the PC-ish one needs 2.2e12 cylinders
+    /// and the Amiga-ish one 2^35 heads.
+    #[test]
+    fn geometry_refuses_a_disk_too_large_for_the_u32_fields() {
+        assert_eq!(
+            synthesize_geometry(u64::MAX, 512),
+            Err(GeometryError::TooLarge {
+                total_bytes: u64::MAX,
+                block_size: 512,
+            })
+        );
+        // An eighth of that in 32 KB blocks *is* describable, so the
+        // refusal above is a real limit and not a blanket cap on large
+        // inputs. It is also the one-candidate-survives case: the
+        // PC-ish geometry needs 4.4e9 cylinders and is discarded, while
+        // the Amiga-ish one lands on 2^25 heads and stands.
+        let g = synthesize_geometry(u64::MAX / 8, 32768).unwrap();
+        assert_eq!((g.cylinders, g.heads, g.sectors), (65535, 1 << 25, 32));
+        assert!(g.cylinder_blocks() <= u32::MAX as u64);
+    }
+
+    #[test]
+    fn geometry_refuses_an_unsupported_block_size() {
+        for bad in [0usize, 256, 768, 65536] {
+            assert_eq!(
+                synthesize_geometry(1024 * 1024 * 1024, bad),
+                Err(GeometryError::UnsupportedBlockSize { block_size: bad })
+            );
+        }
+    }
+
+    #[test]
+    fn geometry_error_displays_a_line() {
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                GeometryError::TooSmall {
+                    total_bytes: 16383,
+                    block_size: 512,
+                    minimum_bytes: 16384
+                }
+            ),
+            "16383 bytes is too small for a geometry in 512-byte blocks: \
+             at least 16384 bytes are needed for one cylinder"
+        );
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                GeometryError::TooLarge {
+                    total_bytes: 1,
+                    block_size: 512
+                }
+            ),
+            "1 bytes in 512-byte blocks exceeds what the RDB's 32-bit geometry \
+             fields can describe"
+        );
+    }
+
+    #[test]
+    fn seal_error_displays_a_line() {
+        assert_eq!(
+            alloc::format!("{}", SealError::SummedLongsTooShort { summed_longs: 1 }),
+            "SummedLongs 1 is below the 3 needed to cover ChkSum itself"
+        );
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                SealError::SummedLongsTooLong {
+                    summed_longs: 200,
+                    capacity: 128
+                }
+            ),
+            "SummedLongs 200 exceeds the 128 longwords the block holds"
+        );
     }
 }
