@@ -32,17 +32,17 @@ Everything the format can say, surfaced. Nothing here writes a byte.
       `rdb_HighRDSKBlock`, park/interleave/precomp geometry.
 - [x] **`rdb_Flags` semantics** as named constants (`LAST`, `LASTLUN`,
       `LASTTID`, `NORESELECT`, `DISKID`, `CTRLRID`, `SYNCH`), not a bare u32.
-- [ ] **FSHD chain**: `FileSysHeaderBlock` — `fhb_DosType`,
+- [x] **FSHD chain**: `FileSysHeaderBlock` — `fhb_DosType`,
       `fhb_Version`, `fhb_PatchFlags` and the patched fields it gates
       (`Type`, `Task`, `Lock`, `Handler`, `StackSize`, `Priority`,
       `Startup`, `GlobalVec`), `fhb_SegListBlocks` chain head. Same
       cycle/bounds/checksum discipline as PART.
-- [ ] **LSEG chain**: reassemble `lsb_LoadData` runs into the driver's
+- [x] **LSEG chain**: reassemble `lsb_LoadData` runs into the driver's
       hunk-format binary. This crate reassembles bytes; it does not
       implement hunk relocation (that is the loader's job, wherever the
       driver ends up running). **This is the AROS DOS\7 critical path** —
       reading proves the layout understanding that writing will need.
-- [ ] **BADB chain**: bad-block lists. Nearly extinct in practice, in
+- [x] **BADB chain**: bad-block lists. Nearly extinct in practice, in
       the format forever; read them so a repartitioner can preserve them.
 - [x] **Non-512 `rdb_BlockBytes` is required, not optional.** The
       survey answered itself with arithmetic: every RDB block count and

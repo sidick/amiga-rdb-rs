@@ -124,6 +124,45 @@ pub mod rdb_flags {
     pub const SYNCH: u32 = 1 << 6;
 }
 
+/// `fhb_PatchFlags` bits (NDK `devices/hardblocks.h`, and identically
+/// `fse_PatchFlags` in `dos/filehandler.h`).
+///
+/// The bit mask says which of the `FileSysHeaderBlock`'s tail fields are
+/// meaningful and should be substituted into the device node when the
+/// filesystem is mounted. Bit *n* covers the *n*th longword after
+/// `PatchFlags` itself, so the mapping is positional: unset means "this
+/// filesystem does not override that field", which is emphatically not
+/// the same as "override it with zero" — hence the [`Option`]s on
+/// [`FileSysHeader`].
+///
+/// Note the ordering trap: [`SEG_LIST`] is bit 7 and [`GLOBAL_VEC`] bit
+/// 8, because `fhb_SegListBlocks` physically precedes `fhb_GlobalVec` in
+/// the block. Sources that describe "eight patched fields" and put
+/// `GlobalVec` at bit 7 have silently dropped `SegList` from the count.
+pub mod fshd_patch {
+    /// `fhb_Type` — the device node type.
+    pub const TYPE: u32 = 1 << 0;
+    /// `fhb_Task` — handler task pointer (0 for a seglist-loaded handler).
+    pub const TASK: u32 = 1 << 1;
+    /// `fhb_Lock` — a lock to pass to the handler.
+    pub const LOCK: u32 = 1 << 2;
+    /// `fhb_Handler` — BSTR name of the handler to load.
+    pub const HANDLER: u32 = 1 << 3;
+    /// `fhb_StackSize` — handler process stack.
+    pub const STACK_SIZE: u32 = 1 << 4;
+    /// `fhb_Priority` — handler process priority.
+    pub const PRIORITY: u32 = 1 << 5;
+    /// `fhb_Startup` — startup value passed to the handler.
+    pub const STARTUP: u32 = 1 << 6;
+    /// `fhb_SegListBlocks` — the `LSEG` chain head. Surfaced
+    /// unconditionally as [`FileSysHeader::seg_list_blocks`] because the
+    /// chain has to be walkable either way; this bit only records
+    /// whether the FSHD asked for it to be patched in.
+    pub const SEG_LIST: u32 = 1 << 7;
+    /// `fhb_GlobalVec` — BCPL global vector (-1 for a non-BCPL handler).
+    pub const GLOBAL_VEC: u32 = 1 << 8;
+}
+
 /// The chain terminator used by every block-pointer field
 /// (`rdb_PartitionList`, `pb_Next`, ...): `0xFFFFFFFF`, i.e. `-1`, not
 /// `0` — block 0 is a valid block address on a disk whose RDSK sits
@@ -271,11 +310,108 @@ pub struct Partition {
     pub envec_raw: Vec<u32>,
 }
 
-/// A parsed RDB: the disk-level header plus its partitions.
+/// One loadable filesystem driver, as read from a `FileSysHeaderBlock`.
 ///
-/// Filesystem headers (`FSHD`) and bad-block lists are recorded as
-/// chain heads for now and will grow their own types with the
-/// `FSHD`/`LSEG` read support.
+/// An RDB may carry the filesystem handlers its partitions need, so a
+/// ROM that has never heard of (say) `DOS\x07` can still mount it: the
+/// boot code finds the FSHD whose `dos_type` matches the partition's,
+/// reassembles the driver binary from the `LSEG` chain
+/// ([`Rdb::load_filesystem`]), and patches the fields this struct gates
+/// into the device node.
+///
+/// The eight [`Option`] fields are gated by [`patch_flags`](Self::patch_flags)
+/// — see [`fshd_patch`]. `None` means the FSHD does not override that
+/// device-node field at all; it does *not* mean zero, and a writer that
+/// round-trips this must not turn one into the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSysHeader {
+    /// LBA of the `FSHD` block this came from.
+    pub fshd_block: u64,
+    /// `fhb_HostID` — SCSI ID of the owning controller, as on the RDSK.
+    pub host_id: u32,
+    /// `fhb_Flags`. No bits are defined by the NDK; carried so a
+    /// rewrite does not drop whatever a tool put there.
+    pub flags: u32,
+    /// `fhb_DosType` — which partitions this driver serves, matched
+    /// against a partition's [`Partition::dos_type`].
+    pub dos_type: u32,
+    /// `fhb_Version`, raw: major in the high 16 bits, minor in the low.
+    /// Kept as the packed longword because that is what the format
+    /// stores and what a version comparison actually wants (a plain
+    /// `>` on the whole word orders releases correctly); split it with
+    /// [`version_major`](Self::version_major) /
+    /// [`version_minor`](Self::version_minor).
+    pub version: u32,
+    /// `fhb_PatchFlags` — which of the fields below are significant.
+    /// Preserved raw, bits this crate does not model included.
+    pub patch_flags: u32,
+    /// `fhb_Type`, gated by [`fshd_patch::TYPE`].
+    pub node_type: Option<u32>,
+    /// `fhb_Task`, gated by [`fshd_patch::TASK`].
+    pub task: Option<u32>,
+    /// `fhb_Lock`, gated by [`fshd_patch::LOCK`].
+    pub lock: Option<u32>,
+    /// `fhb_Handler`, gated by [`fshd_patch::HANDLER`].
+    pub handler: Option<u32>,
+    /// `fhb_StackSize`, gated by [`fshd_patch::STACK_SIZE`].
+    pub stack_size: Option<u32>,
+    /// `fhb_Priority` (signed), gated by [`fshd_patch::PRIORITY`].
+    pub priority: Option<i32>,
+    /// `fhb_Startup` (signed), gated by [`fshd_patch::STARTUP`].
+    pub startup: Option<i32>,
+    /// `fhb_GlobalVec` (signed; -1 means "not BCPL"), gated by
+    /// [`fshd_patch::GLOBAL_VEC`].
+    pub global_vec: Option<i32>,
+    /// `fhb_SegListBlocks` — head of this driver's `LSEG` chain, or
+    /// [`CHAIN_END`] when the FSHD carries no binary (a header that
+    /// only patches device-node fields for a filesystem already in ROM).
+    ///
+    /// Not an `Option` despite [`fshd_patch::SEG_LIST`] existing: the
+    /// chain must be walkable to load the driver regardless of whether
+    /// the FSHD asked for the pointer to be patched into the node, and
+    /// `CHAIN_END` already expresses "no chain" unambiguously. The bit
+    /// itself survives in [`patch_flags`](Self::patch_flags).
+    pub seg_list_blocks: u32,
+}
+
+impl FileSysHeader {
+    /// Major version — `fhb_Version >> 16`.
+    pub fn version_major(&self) -> u16 {
+        (self.version >> 16) as u16
+    }
+
+    /// Minor version — the low 16 bits of `fhb_Version`.
+    pub fn version_minor(&self) -> u16 {
+        self.version as u16
+    }
+}
+
+/// One bad-block remapping from a `BadBlockBlock`: the drive block that
+/// went bad, and the spare that stands in for it. Both are device-block
+/// LBAs on the parent disk.
+///
+/// Effectively extinct — drives have remapped their own defects
+/// internally since well before the format stopped being used — but the
+/// entries exist on old images and a repartitioner that silently dropped
+/// them would hand the filesystem blocks that do not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadBlockEntry {
+    /// The failed block.
+    pub bad: u32,
+    /// The block substituted for it.
+    pub good: u32,
+}
+
+/// A parsed RDB: the disk-level header, its partitions, its loadable
+/// filesystems and its bad-block list.
+///
+/// The `FSHD` and `BADB` chains are parsed eagerly during
+/// [`Rdb::parse`] — they are a handful of blocks and the alternative
+/// would be methods taking `&mut S`, which would tie the returned value
+/// to the source's lifetime. `LSEG` payloads are the exception and stay
+/// lazy behind [`Rdb::load_filesystem`]: a driver binary runs to
+/// hundreds of kilobytes and most consumers only want the partition
+/// table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rdb {
     /// LBA the `RDSK` block was found at (0..16).
@@ -359,6 +495,19 @@ pub struct Rdb {
     pub bad_block_list: u32,
     /// Partitions in on-disk chain order.
     pub partitions: Vec<Partition>,
+    /// Loadable filesystems in `FSHD` chain order. Empty when
+    /// [`filesys_header_list`](Self::filesys_header_list) is
+    /// [`CHAIN_END`].
+    pub filesystems: Vec<FileSysHeader>,
+    /// Bad-block remappings, flattened across every `BADB` block in the
+    /// chain and kept in on-disk order.
+    ///
+    /// Flattened rather than grouped per block because the grouping
+    /// carries no information: which entries share a block is an
+    /// allocation artefact of whichever tool wrote the list, and a
+    /// rewrite repacks them anyway. The chain head survives in
+    /// [`bad_block_list`](Self::bad_block_list) for round-tripping.
+    pub bad_blocks: Vec<BadBlockEntry>,
 }
 
 /// Byte offsets into a `RDSK` block (NDK `RigidDiskBlock`).
@@ -401,9 +550,17 @@ mod rdsk {
     pub const CONTROLLER_REVISION: (usize, usize) = (212, 4);
 }
 
+/// Byte offsets shared by every chained RDB block.
+///
+/// `PART`, `FSHD`, `LSEG` and `BADB` all begin with the same five
+/// longwords — ID, SummedLongs, ChkSum, HostID, Next — which is what
+/// makes one [`walk_chain`] able to serve all four.
+mod chain {
+    pub const NEXT: usize = 16;
+}
+
 /// Byte offsets into a `PART` block (NDK `PartitionBlock`).
 mod part {
-    pub const NEXT: usize = 16;
     pub const FLAGS: usize = 20;
     pub const DRIVE_NAME: usize = 36; // BCPL: length byte, then chars (32 bytes total)
     pub const ENVIRONMENT: usize = 128; // DosEnvec, longwords
@@ -430,6 +587,96 @@ mod de {
     pub const BAUD: usize = 17;
     pub const CONTROL: usize = 18;
     pub const BOOT_BLOCKS: usize = 19;
+}
+
+/// Byte offsets into a `FSHD` block (NDK `FileSysHeaderBlock`).
+mod fshd {
+    pub const HOST_ID: usize = 12;
+    pub const FLAGS: usize = 20;
+    // 24..32: fhb_Reserved1[2]
+    pub const DOS_TYPE: usize = 32;
+    pub const VERSION: usize = 36;
+    pub const PATCH_FLAGS: usize = 40;
+    /// First of the nine patched longwords. Everything gated by
+    /// [`super::fshd_patch`] is at `PATCHED + n * 4`, which is exactly
+    /// why the bit numbering is positional.
+    pub const PATCHED: usize = 44;
+    /// Index into the patched longwords, not a byte offset — the one
+    /// field read unconditionally.
+    pub const SEG_LIST_INDEX: usize = 7;
+}
+
+/// Byte offsets into a `LSEG` block (NDK `LoadSegBlock`).
+mod lseg {
+    /// Start of `lsb_LoadData`; everything from here to the end of the
+    /// block is driver payload.
+    pub const LOAD_DATA: usize = 20;
+}
+
+/// Byte offsets into a `BADB` block (NDK `BadBlockBlock`).
+mod badb {
+    // 20: bbb_Reserved
+    /// Start of `bbb_BlockPairs` — pairs of (bad, good) longwords.
+    pub const ENTRIES: usize = 24;
+    /// Longwords before the entries. `SummedLongs` counts the whole
+    /// block header plus the entries, so the entry count is
+    /// `SummedLongs - HEADER_LONGS`.
+    pub const HEADER_LONGS: usize = ENTRIES / 4;
+}
+
+/// Walk one RDB block chain, verifying every block and calling `visit`.
+///
+/// The four chains (`PART`, `FSHD`, `LSEG`, `BADB`) differ only in the
+/// ID they expect and what they do with each block, so the discipline
+/// that matters — off-disk pointers, cycles, wrong IDs, bad checksums —
+/// lives here once rather than four times. `buf` is the caller's scratch
+/// block and holds the last-read block on return.
+///
+/// Bounded by a visited set rather than a maximum length: a cycle is the
+/// failure mode a crafted or corrupted image produces, and a length cap
+/// would either reject a legitimately long chain or still spin on one.
+fn walk_chain<S, F>(
+    disk: &mut S,
+    head: u32,
+    expected: u32,
+    buf: &mut [u8],
+    mut visit: F,
+) -> Result<(), RdbError<S::Error>>
+where
+    S: BlockSource,
+    F: FnMut(&[u8], u64) -> Result<(), RdbError<S::Error>>,
+{
+    let mut next = head;
+    let mut visited: Vec<u32> = Vec::new();
+    while next != CHAIN_END {
+        let lba = next as u64;
+        if let Some(n) = disk.block_count() {
+            if lba >= n {
+                return Err(RdbError::ChainOutOfRange { lba });
+            }
+        }
+        if visited.contains(&next) {
+            return Err(RdbError::ChainCycle { lba });
+        }
+        visited.push(next);
+
+        disk.read_block(lba, buf).map_err(RdbError::Io)?;
+        let found = be32(buf, 0);
+        if found != expected {
+            return Err(RdbError::WrongId {
+                lba,
+                expected,
+                found,
+            });
+        }
+        if !checksum_ok(buf) {
+            return Err(RdbError::BadChecksum { lba });
+        }
+
+        visit(buf, lba)?;
+        next = be32(buf, chain::NEXT);
+    }
+    Ok(())
 }
 
 impl Rdb {
@@ -501,42 +748,144 @@ impl Rdb {
             filesys_header_list: be32(&buf, rdsk::FILESYS_HEADER_LIST),
             bad_block_list: be32(&buf, rdsk::BAD_BLOCK_LIST),
             partitions: Vec::new(),
+            filesystems: Vec::new(),
+            bad_blocks: Vec::new(),
         };
+        let partition_list = be32(&buf, rdsk::PARTITION_LIST);
 
-        // Walk the PART chain. Bounded by visited-set rather than a
-        // magic count: a cycle is the failure mode, not length.
-        let mut next = be32(&buf, rdsk::PARTITION_LIST);
-        let mut visited: Vec<u32> = Vec::new();
-        while next != CHAIN_END {
-            let lba = next as u64;
-            if let Some(n) = disk.block_count() {
-                if lba >= n {
-                    return Err(RdbError::ChainOutOfRange { lba });
-                }
-            }
-            if visited.contains(&next) {
-                return Err(RdbError::ChainCycle { lba });
-            }
-            visited.push(next);
+        let mut partitions = Vec::new();
+        walk_chain(disk, partition_list, id::PART, &mut buf, |b, lba| {
+            partitions.push(parse_part(b, lba)?);
+            Ok(())
+        })?;
+        rdb.partitions = partitions;
 
-            disk.read_block(lba, &mut buf).map_err(RdbError::Io)?;
-            let found = be32(&buf, 0);
-            if found != id::PART {
-                return Err(RdbError::WrongId {
-                    lba,
-                    expected: id::PART,
-                    found,
-                });
-            }
-            if !checksum_ok(&buf) {
-                return Err(RdbError::BadChecksum { lba });
-            }
+        let mut filesystems = Vec::new();
+        walk_chain(
+            disk,
+            rdb.filesys_header_list,
+            id::FSHD,
+            &mut buf,
+            |b, lba| {
+                filesystems.push(parse_fshd(b, lba));
+                Ok(())
+            },
+        )?;
+        rdb.filesystems = filesystems;
 
-            rdb.partitions.push(parse_part(&buf, lba)?);
-            next = be32(&buf, part::NEXT);
-        }
+        let mut bad_blocks = Vec::new();
+        walk_chain(disk, rdb.bad_block_list, id::BADB, &mut buf, |b, _lba| {
+            parse_badb(b, &mut bad_blocks);
+            Ok(())
+        })?;
+        rdb.bad_blocks = bad_blocks;
 
         Ok(rdb)
+    }
+
+    /// Reassemble one filesystem driver's binary from its `LSEG` chain.
+    ///
+    /// Lazy rather than a field on [`Rdb`]: driver binaries run to
+    /// hundreds of kilobytes and most consumers of a partition table
+    /// never want them, so the cost is paid only when asked for. `disk`
+    /// must be the source the RDB was parsed from — the chain pointers
+    /// are LBAs on it — which is checked via its block size.
+    ///
+    /// The result is the driver in AmigaDOS hunk format, exactly as a
+    /// `LoadSeg` would consume it. This crate does not parse or relocate
+    /// hunks; that is the loader's job wherever the driver ends up
+    /// running.
+    ///
+    /// **Length has block granularity.** `LSEG` records no exact byte
+    /// count anywhere — each block contributes its whole `lsb_LoadData`
+    /// area (`block_bytes - 20` bytes) — so the returned `Vec` is the
+    /// binary followed by up to that much slack from the final block.
+    /// This is not a defect in the reassembly: the hunk structure inside
+    /// knows where it ends, and every real consumer finds the end by
+    /// parsing hunks rather than by trusting a length.
+    ///
+    /// An FSHD with no chain ([`CHAIN_END`]) yields an empty `Vec`, not
+    /// an error — a header that only patches device-node fields for a
+    /// ROM filesystem is legitimate.
+    pub fn load_filesystem<S: BlockSource>(
+        &self,
+        fshd: &FileSysHeader,
+        disk: &mut S,
+    ) -> Result<Vec<u8>, RdbError<S::Error>> {
+        let block_size = disk.block_size();
+        if block_size != self.block_bytes as usize {
+            return Err(RdbError::BlockBytesMismatch {
+                block_bytes: self.block_bytes,
+                block_size,
+            });
+        }
+        let mut buf = alloc::vec![0u8; block_size];
+        let mut out = Vec::new();
+        walk_chain(disk, fshd.seg_list_blocks, id::LSEG, &mut buf, |b, _lba| {
+            out.extend_from_slice(&b[lseg::LOAD_DATA..]);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
+/// Parse a verified `FSHD` block.
+///
+/// Infallible: every field is at a fixed offset well inside the
+/// smallest legal block, and `PatchFlags` cannot make a read go out of
+/// bounds — it only decides whether an already-in-bounds longword is
+/// meaningful.
+fn parse_fshd(buf: &[u8], lba: u64) -> FileSysHeader {
+    let patch_flags = be32(buf, fshd::PATCH_FLAGS);
+    let patched = |i: usize| be32(buf, fshd::PATCHED + i * 4);
+    let gated = |i: usize| {
+        if patch_flags & (1 << i) != 0 {
+            Some(patched(i))
+        } else {
+            None
+        }
+    };
+
+    FileSysHeader {
+        fshd_block: lba,
+        host_id: be32(buf, fshd::HOST_ID),
+        flags: be32(buf, fshd::FLAGS),
+        dos_type: be32(buf, fshd::DOS_TYPE),
+        version: be32(buf, fshd::VERSION),
+        patch_flags,
+        node_type: gated(0),
+        task: gated(1),
+        lock: gated(2),
+        handler: gated(3),
+        stack_size: gated(4),
+        priority: gated(5).map(|v| v as i32),
+        startup: gated(6).map(|v| v as i32),
+        // Bit 7 is SegList, read unconditionally below.
+        global_vec: gated(8).map(|v| v as i32),
+        seg_list_blocks: patched(fshd::SEG_LIST_INDEX),
+    }
+}
+
+/// Append a verified `BADB` block's entries to `out`.
+///
+/// `SummedLongs` counts the header plus the entry longwords, so the
+/// entry count is `(SummedLongs - 6) / 2`. That value is
+/// attacker-controlled, and although [`checksum_ok`] has already
+/// rejected a `SummedLongs` larger than the block, the arithmetic is
+/// clamped to what the block physically holds anyway: a bounds check
+/// that depends on a checksum passing is one refactor away from not
+/// being a bounds check.
+fn parse_badb(buf: &[u8], out: &mut Vec<BadBlockEntry>) {
+    let summed_longs = be32(buf, 4) as usize;
+    let entry_longs = summed_longs.saturating_sub(badb::HEADER_LONGS);
+    let capacity_longs = (buf.len() - badb::ENTRIES) / 4;
+    let pairs = entry_longs.min(capacity_longs) / 2;
+    for i in 0..pairs {
+        let off = badb::ENTRIES + i * 8;
+        out.push(BadBlockEntry {
+            bad: be32(buf, off),
+            good: be32(buf, off + 4),
+        });
     }
 }
 
@@ -887,7 +1236,7 @@ mod tests {
         seal(&mut d, bs, rdsk_block, 64);
 
         put32(&mut d, bs, part_block, 0, id::PART);
-        put32(&mut d, bs, part_block, part::NEXT, CHAIN_END);
+        put32(&mut d, bs, part_block, chain::NEXT, CHAIN_END);
         put32(&mut d, bs, part_block, part::FLAGS, 1); // bootable
         let name = b"DH0";
         d[part_block * bs + part::DRIVE_NAME] = name.len() as u8;
@@ -922,6 +1271,118 @@ mod tests {
 
     fn one_partition_image(rdsk_block: usize) -> Vec<u8> {
         one_partition_image_bs(rdsk_block, 512)
+    }
+
+    /// Blocks the [`fs_image`] fixture lays its extra chains out on,
+    /// after the RDSK at 2 and the PART at 3.
+    const FSHD_BLOCK: usize = 4;
+    const LSEG_BLOCK: usize = 5; // and 6
+    const BADB_BLOCK: usize = 7; // and 8
+
+    /// Bytes of driver payload one 512-byte `LSEG` block carries.
+    const LSEG_PAYLOAD: usize = 512 - lseg::LOAD_DATA;
+
+    /// [`one_partition_image`] plus a one-entry `FSHD` chain with a
+    /// two-block `LSEG` chain, and a two-block `BADB` chain. Returns the
+    /// image and the exact driver bytes the `LSEG` blocks were filled
+    /// with, so a reassembly test can compare against a known payload.
+    ///
+    /// The payload is sized to fill both blocks exactly (2 × 492 bytes);
+    /// a real driver leaves slack in its last block, which the format
+    /// cannot record and the reassembly therefore returns.
+    fn fs_image() -> (Vec<u8>, Vec<u8>) {
+        let bs = 512;
+        let mut d = one_partition_image(2);
+        put32(&mut d, bs, 2, rdsk::FILESYS_HEADER_LIST, FSHD_BLOCK as u32);
+        put32(&mut d, bs, 2, rdsk::BAD_BLOCK_LIST, BADB_BLOCK as u32);
+        seal(&mut d, bs, 2, 64);
+
+        put32(&mut d, bs, FSHD_BLOCK, 0, id::FSHD);
+        put32(&mut d, bs, FSHD_BLOCK, chain::NEXT, CHAIN_END);
+        put32(&mut d, bs, FSHD_BLOCK, fshd::HOST_ID, 7);
+        put32(&mut d, bs, FSHD_BLOCK, fshd::FLAGS, 0);
+        put32(&mut d, bs, FSHD_BLOCK, fshd::DOS_TYPE, 0x444F_5307);
+        put32(&mut d, bs, FSHD_BLOCK, fshd::VERSION, (43 << 16) | 4);
+        // Type, Handler, StackSize, Priority, SegList, GlobalVec patched;
+        // Task, Lock and Startup deliberately not.
+        put32(
+            &mut d,
+            bs,
+            FSHD_BLOCK,
+            fshd::PATCH_FLAGS,
+            fshd_patch::TYPE
+                | fshd_patch::HANDLER
+                | fshd_patch::STACK_SIZE
+                | fshd_patch::PRIORITY
+                | fshd_patch::SEG_LIST
+                | fshd_patch::GLOBAL_VEC,
+        );
+        // Every patched longword is written, gated or not: planting a
+        // value behind a clear bit is what proves the gate works.
+        for (i, v) in [
+            1u32,        // Type
+            0xDEAD_0001, // Task      (bit clear)
+            0xDEAD_0002, // Lock      (bit clear)
+            0x0000_0100, // Handler
+            8192,        // StackSize
+            10,          // Priority
+            0xDEAD_0003, // Startup   (bit clear)
+            LSEG_BLOCK as u32,
+            0xFFFF_FFFF, // GlobalVec (-1: not BCPL)
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put32(&mut d, bs, FSHD_BLOCK, fshd::PATCHED + i * 4, v);
+        }
+        seal(&mut d, bs, FSHD_BLOCK, 64);
+
+        let payload: Vec<u8> = (0..2 * LSEG_PAYLOAD).map(|i| (i % 251) as u8).collect();
+        for (i, block) in [LSEG_BLOCK, LSEG_BLOCK + 1].into_iter().enumerate() {
+            put32(&mut d, bs, block, 0, id::LSEG);
+            put32(
+                &mut d,
+                bs,
+                block,
+                chain::NEXT,
+                if i == 0 {
+                    (LSEG_BLOCK + 1) as u32
+                } else {
+                    CHAIN_END
+                },
+            );
+            let base = block * bs + lseg::LOAD_DATA;
+            d[base..base + LSEG_PAYLOAD]
+                .copy_from_slice(&payload[i * LSEG_PAYLOAD..(i + 1) * LSEG_PAYLOAD]);
+            // LSEG sums the whole block: SummedLongs == block_size / 4.
+            seal(&mut d, bs, block, (bs / 4) as u32);
+        }
+
+        // Two BADB blocks, so the flattening across the chain is tested
+        // rather than just the entries within one block.
+        for (block, next, entries) in [
+            (
+                BADB_BLOCK,
+                (BADB_BLOCK + 1) as u32,
+                &[(100u32, 900u32), (101, 901)][..],
+            ),
+            (BADB_BLOCK + 1, CHAIN_END, &[(102, 902)][..]),
+        ] {
+            put32(&mut d, bs, block, 0, id::BADB);
+            put32(&mut d, bs, block, chain::NEXT, next);
+            for (i, (bad, good)) in entries.iter().enumerate() {
+                put32(&mut d, bs, block, badb::ENTRIES + i * 8, *bad);
+                put32(&mut d, bs, block, badb::ENTRIES + i * 8 + 4, *good);
+            }
+            seal(
+                &mut d,
+                bs,
+                block,
+                (badb::HEADER_LONGS + entries.len() * 2) as u32,
+            );
+        }
+
+        (d, payload)
     }
 
     #[test]
@@ -1010,7 +1471,7 @@ mod tests {
     fn part_chain_cycle_is_an_error_not_a_hang() {
         let mut img = one_partition_image(0);
         // PART at 1 points to itself.
-        put32(&mut img, 512, 1, part::NEXT, 1);
+        put32(&mut img, 512, 1, chain::NEXT, 1);
         seal(&mut img, 512, 1, 64);
         let mut disk = MemDisk::new(img);
         assert_eq!(
@@ -1140,6 +1601,155 @@ mod tests {
         assert_eq!(rdb.cyl_blocks, 32);
         assert_eq!(rdb.auto_park_seconds, 0);
         assert_eq!(rdb.high_rdsk_block, 3);
+    }
+
+    /// The FSHD is read, and `PatchFlags` decides which tail fields
+    /// exist. The three ungated ones hold planted values in the block
+    /// and must still read as `None`.
+    #[test]
+    fn fshd_chain_parses_with_patch_flags_gating() {
+        let (img, _) = fs_image();
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.filesys_header_list, FSHD_BLOCK as u32);
+        assert_eq!(rdb.filesystems.len(), 1);
+        let f = &rdb.filesystems[0];
+        assert_eq!(f.fshd_block, FSHD_BLOCK as u64);
+        assert_eq!(f.host_id, 7);
+        assert_eq!(f.dos_type, 0x444F_5307);
+        assert_eq!(f.version_major(), 43);
+        assert_eq!(f.version_minor(), 4);
+        assert_eq!(f.node_type, Some(1));
+        assert_eq!(f.handler, Some(0x100));
+        assert_eq!(f.stack_size, Some(8192));
+        assert_eq!(f.priority, Some(10));
+        assert_eq!(f.global_vec, Some(-1));
+        assert_eq!(f.task, None);
+        assert_eq!(f.lock, None);
+        assert_eq!(f.startup, None);
+        // Always read, whatever the bit says — the chain must be walkable.
+        assert_eq!(f.seg_list_blocks, LSEG_BLOCK as u32);
+    }
+
+    #[test]
+    fn lseg_chain_reassembles_the_driver_binary() {
+        let (img, payload) = fs_image();
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let bin = rdb.load_filesystem(&rdb.filesystems[0], &mut disk).unwrap();
+        assert_eq!(bin.len(), 2 * LSEG_PAYLOAD);
+        assert_eq!(bin, payload);
+    }
+
+    /// No `LSEG` chain is an empty binary, not an error: an FSHD that
+    /// only patches device-node fields is legitimate.
+    #[test]
+    fn fshd_without_a_seg_list_loads_nothing() {
+        let (mut img, _) = fs_image();
+        put32(
+            &mut img,
+            512,
+            FSHD_BLOCK,
+            fshd::PATCHED + fshd::SEG_LIST_INDEX * 4,
+            CHAIN_END,
+        );
+        seal(&mut img, 512, FSHD_BLOCK, 64);
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert!(rdb
+            .load_filesystem(&rdb.filesystems[0], &mut disk)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn badb_entries_are_flattened_across_the_chain() {
+        let (img, _) = fs_image();
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.bad_block_list, BADB_BLOCK as u32);
+        assert_eq!(
+            rdb.bad_blocks,
+            vec![
+                BadBlockEntry {
+                    bad: 100,
+                    good: 900
+                },
+                BadBlockEntry {
+                    bad: 101,
+                    good: 901
+                },
+                BadBlockEntry {
+                    bad: 102,
+                    good: 902
+                },
+            ]
+        );
+    }
+
+    /// A disk with no BADB chain has no entries, and the head field
+    /// still round-trips.
+    #[test]
+    fn no_badb_chain_is_an_empty_list() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.bad_block_list, CHAIN_END);
+        assert!(rdb.bad_blocks.is_empty());
+        assert!(rdb.filesystems.is_empty());
+    }
+
+    #[test]
+    fn lseg_chain_cycle_is_an_error_not_a_hang() {
+        let (mut img, _) = fs_image();
+        // The second LSEG points back at the first.
+        put32(
+            &mut img,
+            512,
+            LSEG_BLOCK + 1,
+            chain::NEXT,
+            LSEG_BLOCK as u32,
+        );
+        seal(&mut img, 512, LSEG_BLOCK + 1, 128);
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(
+            rdb.load_filesystem(&rdb.filesystems[0], &mut disk)
+                .unwrap_err(),
+            RdbError::ChainCycle {
+                lba: LSEG_BLOCK as u64
+            }
+        );
+    }
+
+    #[test]
+    fn fshd_chain_with_wrong_id_is_an_error() {
+        let (mut img, _) = fs_image();
+        put32(&mut img, 512, FSHD_BLOCK, 0, id::PART);
+        seal(&mut img, 512, FSHD_BLOCK, 64);
+        let mut disk = MemDisk::new(img);
+        assert_eq!(
+            Rdb::parse(&mut disk).unwrap_err(),
+            RdbError::WrongId {
+                lba: FSHD_BLOCK as u64,
+                expected: id::FSHD,
+                found: id::PART,
+            }
+        );
+    }
+
+    /// A `BADB` whose `SummedLongs` claims more entries than the block
+    /// holds must clamp. Such a block also fails `checksum_ok`, so the
+    /// clamp is reached here by calling the parser directly — the point
+    /// is that the arithmetic is safe on its own.
+    #[test]
+    fn hostile_badb_summed_longs_clamps_entry_count() {
+        for bogus in [128u32, 1000, u32::MAX] {
+            let mut b = vec![0u8; 512];
+            b[4..8].copy_from_slice(&bogus.to_be_bytes());
+            let mut out = Vec::new();
+            parse_badb(&b, &mut out);
+            assert_eq!(out.len(), (512 - badb::ENTRIES) / 8);
+        }
     }
 
     #[test]

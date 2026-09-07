@@ -6,6 +6,15 @@
 use amiga_rdb::{rdb_flags, Rdb, SeekBlockSource, CHAIN_END};
 use std::fs::File;
 
+/// A dostype the conventional way: three printable characters and the
+/// version byte as a number, e.g. `DOS\3`. Shared by partitions and
+/// filesystem headers, which is the whole point — the two are matched on
+/// this value.
+fn dostype(v: u32) -> String {
+    let b = v.to_be_bytes();
+    format!("{}{}{}\\{}", b[0] as char, b[1] as char, b[2] as char, b[3])
+}
+
 fn main() {
     let path = std::env::args()
         .nth(1)
@@ -49,15 +58,27 @@ fn main() {
             rdb.controller_vendor, rdb.controller_product, rdb.controller_revision
         );
     }
-    if rdb.filesys_header_list != CHAIN_END {
-        println!("FSHD chain head: block {}", rdb.filesys_header_list);
+    // The loadable filesystems the image carries — this is how a
+    // partition with a dostype the ROM never heard of still mounts.
+    for f in &rdb.filesystems {
+        println!(
+            "FSHD at block {}  {}  version {}.{}  {}",
+            f.fshd_block,
+            dostype(f.dos_type),
+            f.version_major(),
+            f.version_minor(),
+            if f.seg_list_blocks == CHAIN_END {
+                String::from("no LSEG chain")
+            } else {
+                format!("LSEG chain head block {}", f.seg_list_blocks)
+            },
+        );
+    }
+    if !rdb.bad_blocks.is_empty() {
+        println!("bad blocks: {} remapped", rdb.bad_blocks.len());
     }
     for p in &rdb.partitions {
-        let ds = p.dos_type.to_be_bytes();
-        let dos = format!(
-            "{}{}{}\\{}",
-            ds[0] as char, ds[1] as char, ds[2] as char, ds[3]
-        );
+        let dos = dostype(p.dos_type);
         println!(
             "  {:<8} {}  cyls {:>5}..={:<5}  lba {:>8} +{:<8} ({} MB)  bootpri {}{}{}",
             p.name,
