@@ -423,16 +423,48 @@ The risky stage, gated on the differential suite existing first.
       Building it now would be guessing at an API with no caller,
       which is exactly the mistake `rdb_BlockBytes` taught us to avoid
       in the other direction. Revisit when a real consumer asks.
-- [ ] **AmiPart survey first**: before designing the edit API, read
+- [x] **AmiPart survey first**: before designing the edit API, read
       AmiPart (MIT, so readable closely — unlike xdftool, which stays a
       run-only GPL oracle) to enumerate the operation set and its edge
       cases: what happens to `rdb_HighRDSKBlock` on delete, how resize
       rounds to cylinder boundaries, what it does with holes in the RDB
       area. The API is shaped by real usage before the first line lands.
+
+      → **`docs/amipart-survey.md`** — operation inventory, resize/move
+      and delete edge cases, free-block management (there is none: every
+      write regenerates the whole area contiguously), crash shape (the
+      RDSK is written *first*), the invariants it keeps and drops, and a
+      recommended operation set. The four items it turned up are below.
 - [ ] **Edit existing structures**: add/delete a partition, change
       flags/bootpri/name, grow/shrink where cylinder math allows.
       AmiPart (MIT) is the readable reference for the operations users
       actually perform, resize edge cases included.
+
+      **Scope, from the survey**: a resize is a *table-entry* edit and
+      nothing more. Moving partition data and resizing filesystems is
+      what AmiPart's `PART_Move`/`GROW`/`SHRINK` do by reaching into
+      FFS/SFS/PFS internals, and it is out of scope here by the crate's
+      founding non-goal — so shrinking is destructive to whatever
+      filesystem is in the partition and must be documented as such
+      rather than quietly offered.
+- [ ] **Preserve unmodelled fields**: an edit rewrites every field it
+      parsed, including the ones it does not interpret —
+      `rdb_DriveInit`, `rdb_BadBlockList`, the controller identity
+      strings, unknown `rdb_Flags` and `pb_Flags` bits, the raw envec
+      longwords above what we model, `de_TableSize` as it was found. A
+      *tested* property, not a documented intention: this is AmiPart's
+      most damaging behaviour (it drops all of the above on every write,
+      `docs/amipart-survey.md` §6) and the one most easily inherited by
+      building the write path out of the fields the model happens to
+      name.
+- [ ] **Zero what we stop using**, inside the RDB area only: a `PART`
+      block orphaned by a delete, the tail of the area a shorter layout
+      no longer covers, and a stale `RDSK` left behind when the block it
+      was found at is not `rdb_RDBBlocksLo`. AmiPart leaves all three on
+      disk, checksum-valid and unreferenced, where the next tool's RDSK
+      scan can find them. Pairs with never shrinking `rdb_RDBBlocksHi`:
+      the area keeps its declared size, and what is inside it is exactly
+      what the chains say.
 - [ ] **Free-block management** inside the RDB area: reuse holes left
       by deleted PART/FSHD/LSEG blocks before extending toward
       `rdb_HighRDSKBlock`.
@@ -456,10 +488,22 @@ The risky stage, gated on the differential suite existing first.
       chain pointer last). The format has no journal; ordering is all
       there is.
 - [ ] **AmiPart as second differential oracle**: once mutation lands,
-      apply the same edit in both tools and diff the resulting images
-      block-by-block — a second independent implementation alongside
-      the xdftool round-trip diff from milestone 2, and one whose
-      source can legally be consulted when the diff disagrees.
+      apply the same edit in both tools and compare the results — a
+      second independent implementation alongside the xdftool round-trip
+      diff from milestone 2, and one whose source can legally be
+      consulted when the comparison disagrees.
+
+      **Re-scoped by the survey**: this cannot be a block-by-block diff,
+      and not because either tool is wrong. AmiPart regenerates the RDB
+      area from its own model on every write, so its output differs from
+      ours by construction — chain order (it sorts partitions by
+      `de_LowCyl`), `rdb_RDBBlocksHi` (shrunk to `rdb_HighRDSKBlock`),
+      `rdb_BadBlockList`/`rdb_DriveInit`/controller strings (zeroed),
+      `de_TableSize` (forced to 19), the dead geometry fields, and the
+      `RDSK` location. The comparison is therefore **semantic**: parse
+      both images with this crate and compare the models on the fields
+      both tools claim to own. `docs/amipart-survey.md` §1c and §6 list
+      the divergences to expect.
 
 ## Cross-cutting
 
