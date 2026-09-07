@@ -54,6 +54,17 @@ Everything the format can say, surfaced. Nothing here writes a byte.
       make sure extent math and `PartitionSource` stay in *disk* blocks
       and document that clearly, since this is exactly where a
       confusion silently corrupts.
+- [ ] **Overlap validation** (`Rdb::validate()` or similar): report (a)
+      any chained block — PART, FSHD, LSEG, BADB — lying outside
+      `rdb_RDBBlocksLo..=Hi`, and (b) any partition extent overlapping
+      the RDB area. Both are real: partitioning tools have been known
+      to write RDB structures past the reserved area into the first
+      partition when the area was too small — after which each side
+      trashes the other, both believing they own the same blocks — so
+      damaged-by-construction images exist in the wild. The
+      parser still *reads* them (the data is there and a recovery tool
+      needs it); validation is how a consumer learns the layout is
+      mutually destructive before either side scribbles on the other.
 
 ## Milestone 2 — create from scratch
 
@@ -73,6 +84,15 @@ want.
 - [ ] **RDSK + PART writing**: builder API — add partitions by size or
       by cylinder range, auto or explicit `DriveName`, boot priority,
       dostype, the lot. Block allocation within `rdb_RDBBlocksLo..Hi`.
+- [ ] **RDB-area sizing done right** — the lesson from the overlap
+      bug above: reserve *generously* at creation (partition
+      count is known, FSHD payload size is known or estimable — size
+      from what will actually be stored, plus headroom for later
+      edits, not a fixed small constant), and make "does not fit"
+      a **hard error before any block is written**, never a silent
+      overflow into partition space. The builder computes its full
+      block budget up front; there is no code path that writes block
+      N+1 after discovering block N was the last one.
 - [ ] **FSHD + LSEG writing**: take a hunk-format filesystem binary,
       split it into LSEG blocks, chain them, patch the FSHD fields.
       **This is the other half of the AROS DOS\7 fix** — ship a
@@ -96,7 +116,19 @@ The risky stage, gated on the differential suite existing first.
       `rdb_HighRDSKBlock`.
 - [ ] **Never-touch guarantee**: mutation writes only inside
       `rdb_RDBBlocksLo..=Hi`, asserted in code, not just documented —
-      partition contents are provably out of reach.
+      partition contents are provably out of reach. This is precisely
+      the invariant whose absence causes the overlap bug above; here it
+      is structural.
+- [ ] **Refuse-over-overlap**: an edit whose blocks don't fit the
+      existing RDB area fails with an error naming the shortfall — the
+      overlap outcome does not exist as a behaviour — and unlike a
+      tool with history, there is no legacy write-anyway path to keep.
+- [ ] **Expand the RDB area**: grow `rdb_RDBBlocksHi` (and
+      `rdb_HighRDSKBlock`) when — and only when — validation proves the
+      blocks being claimed are not inside any partition's extent. The
+      realistic enabler for editing old images created with the
+      historically tiny default area; pairs with the user resizing or
+      moving the first partition to free the space.
 - [ ] **Crash-shape discipline**: order writes so an interrupted edit
       leaves the *old* chain intact (write new blocks first, flip the
       chain pointer last). The format has no journal; ordering is all
