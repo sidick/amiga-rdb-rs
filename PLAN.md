@@ -1061,9 +1061,12 @@ differential oracle.
       into something that no longer parses. `fuzz/` is its own workspace
       root, so it never joins the parent build graph: `cargo test` and
       `cargo clippy --all-targets` at the repo root neither see nor need
-      it. **CI does not run the fuzzer** — it needs nightly and a time
-      budget that does not belong on a per-push job. Fine for now; the
-      place for it is a scheduled job, when there is a reason.
+      it. **CI runs exactly this command**, on nightly, as a normal
+      blocking job: 60 seconds from the committed seeds is a smoke run,
+      not a campaign — enough to catch a panic a change just introduced
+      on a shape the seeds already reach, cheap enough per push, and a
+      panic is a bug whoever found it. A longer scheduled campaign is
+      still the place for depth, when there is a reason.
 
       **What it found, first minute:** `parse_part` computed the extent
       as an unchecked `high_cyl - low_cyl + 1`, so an inverted cylinder
@@ -1120,9 +1123,14 @@ differential oracle.
 
 An independent review of the whole crate after 0.3.0, confirmed
 finding by finding. Each item below is fixed with a regression test
-that fails before the fix and passes after. Two of them break the
-public API, which pre-1.0 is allowed but not silent: both are noted
-here and in the changelog when 0.4 goes out.
+that fails before the fix and passes after. Several break the public
+API, which pre-1.0 is allowed but not silent: the removals below
+(`RdbError::EnvecTooShort`, `EditError::UnreadableBlock`) and the added
+variants (`RdbError::ChainTooLong`, `RdbError::SharedChain`,
+`ValidationIssue::SharedLsegChain`, `PartitionSourceError::BeyondParent`
+— additive, but these enums are not `non_exhaustive`, so an exhaustive
+match stops compiling) are all noted here and in the changelog when 0.4
+goes out.
 
 - [x] **An interrupted commit could publish a mixed table.** `plan`
       kept an in-area block in place and `prepare` then rewrote it with
@@ -1201,6 +1209,87 @@ here and in the changelog when 0.4 goes out.
       the probe too, which is the right trade — the probe is a search,
       not a health check — and every read after an `RDSK` is found
       still reports its error faithfully.
+- [x] **`SeekBlockSource` read and wrote the wrong block, silently.**
+      The byte offset was an unchecked `lba * block_size`: a debug
+      panic, and in release a *wrap* — 2⁵⁵ × 512 is exactly zero, so a
+      read of a block the disk does not have returned `Ok` with block 0
+      in the buffer and a write of one would have landed on the `RDSK`.
+      The LBA is attacker-supplied by a short path: a `PART` block with
+      a `de_Surfaces`/`de_BlocksPerTrack`/`de_LowCyl` triple of
+      2¹⁵/2¹⁵/2²⁵ — three ordinary-looking longwords — gives a
+      partition whose block 0 is the disk's block 2⁵⁵, and
+      `PartitionSource` forwards it. Both directions now use a checked
+      multiply and answer `io::ErrorKind::InvalidInput`. Belt and
+      braces at the other end too: `PartitionSource` bounds the parent
+      LBA it computes against the parent's own `block_count` when there
+      is one (`PartitionSourceError::BeyondParent`, an added variant),
+      so it never forwards an LBA it already knows is nonsense to a
+      source that may or may not check.
+- [x] **`walk_chain` was quadratic, and unbounded without a block
+      count.** The visited set was a `Vec` scanned per hop, so the walk
+      cost grew with the square of a length the *image* chooses — and a
+      chain of tens of thousands of `LSEG` blocks is legitimate, so the
+      length cannot simply be refused. It is a `BTreeSet` now (`alloc`,
+      no dependency). Separately, a source that reports no
+      `block_count` cannot have its chain pointers range-checked, so
+      nothing bounded the walk at all: the new `MAX_CHAIN_BLOCKS`
+      (2²⁰ blocks — 512 MB of `LSEG` payload at 512-byte blocks, three
+      orders of magnitude past any real driver and past most disks of
+      the era) ends it with `RdbError::ChainTooLong`. With a block
+      count the visited set still ends the walk first, so the constant
+      is unreachable on any source that says how big it is.
+- [x] **`RdbEditor::open` amplified a shared `LSEG` chain.** *k*
+      `FSHD`s pointing at one *L*-block chain made the editor retain
+      *k × L* copies of it, both factors chosen by the image. Sharing
+      is *damage*, not a layout to support — each `FSHD` owns its
+      chain, and an edit to one would rewrite the other's driver from a
+      different buffer — so `open` refuses it with the new
+      `RdbError::SharedChain`, naming the block that gave it away.
+      With that plus the per-chain visited set, every block the editor
+      retains is a distinct block of the disk, so a source that reports
+      a block count bounds the editor's memory by its own size. The
+      read path is unchanged: `parse` and `load_filesystem` walk one
+      chain at a time and read each correctly, and `validate_seg_lists`
+      — which reports rather than refuses — gained
+      `ValidationIssue::SharedLsegChain`, one issue per colliding
+      filesystem rather than one per shared block, since the image
+      chooses how many of those there are.
+- [x] **Two documented promises were wider than the code.** The README
+      said an interruption leaves the old table intact, full stop; the
+      commit's own docs have always said that the *completely full*
+      area falls back to blocks the old table is vacating, past which
+      the old table can no longer be walked. The README now promises
+      what holds: old-or-new while the area has any headroom,
+      RDSK-last damage-bounding without it, and `expand_rdb_area` as
+      the remedy. And `RdbBuilder::build` carried a comment claiming "a
+      block is written only after everything it points at", which is
+      false — it writes each chain head first. The comment is
+      corrected rather than the order (the builder's target is empty by
+      contract, so nothing reaches those chains until the `RDSK`
+      lands; `RdbEditor::commit`, whose target is *not* empty, really
+      does write tail-first, and says why).
+- [x] **Below-cap, confirmed and fixed in the same pass.**
+      `validate()`'s partition-overlap check was an allocating
+      *O(P²)* over a partition count the `PART` chain chooses; it is a
+      sort plus a sweep now, so the quadratic term is paid only for
+      pairs that genuinely overlap — which are pairs the caller asked
+      to hear about. `plan()`'s `taken`/`was_original`/`original_links`
+      linear scans, run once per structure per fixed-point pass over an
+      area whose size the image chooses, are a `BTreeSet` and a
+      `BTreeMap` keyed by LBA. `examples/rdbinfo.rs` computed a
+      partition's size in MB with an unchecked multiply — a debug panic
+      on a hostile `de_HighCyl` — now saturating. The editor's exposed
+      model kept a stale `rdb_FileSysHeaderList` after a filesystem was
+      added or removed, so a caller reading `rdb()` between the edit and
+      the commit saw a chain head with nothing behind it; the head is
+      recomputed from the list it heads, and `rdb()` now documents the
+      rule it follows (every field is the edited value, every block LBA
+      is provisional until `commit`). `Cargo.toml`'s description still
+      said "and eventually writing"; it creates and edits. And the
+      `rdbinfo` example lacked `required-features = ["std"]`, which is
+      why `cargo test --no-default-features --all-targets` failed —
+      declared now, and that command is a CI step rather than a thing
+      someone might run.
 
 ## Non-goals, so they don't creep in
 

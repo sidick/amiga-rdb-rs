@@ -7,7 +7,7 @@ edition = "2021"
 # toolchain; raising it is a semver-visible decision, not an accident.
 rust-version = "1.63"
 license = "MIT OR Apache-2.0"
-description = "Amiga Rigid Disk Block (RDB) partition tables: parsing, and eventually writing — RDSK, PART, FSHD and LSEG blocks"
+description = "Amiga Rigid Disk Block (RDB) partition tables: read, create and edit in place — RDSK, PART, FSHD, LSEG and BADB blocks"
 repository = "https://github.com/sidick/amiga-rdb-rs"
 keywords = ["amiga", "rdb", "partition", "retrocomputing"]
 categories = ["filesystem", "no-std", "parser-implementations"]
@@ -20,6 +20,13 @@ all-features = true
 [dependencies]
 # Deliberately none. This crate is pure format logic over the
 # `BlockSource` trait; consumers bring their own I/O.
+
+[[example]]
+name = "rdbinfo"
+# It opens a file through `SeekBlockSource`, which is a `std`-feature
+# item — without this, `cargo test --no-default-features --all-targets`
+# tries to build it anyway and fails.
+required-features = ["std"]
 
 [features]
 default = ["std"]

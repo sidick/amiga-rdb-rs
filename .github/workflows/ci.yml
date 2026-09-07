@@ -33,6 +33,11 @@ jobs:
       # The crate is no_std + alloc without the `std` feature; this job is the
       # only thing standing between that claim and it quietly becoming false.
       - run: cargo build --no-default-features
+      # And the tests, over every target: the `std`-only items are
+      # `#[cfg]`-ed out of the suite, and the one example declares
+      # `required-features = ["std"]` so it is skipped rather than built
+      # against a crate that has no `SeekBlockSource`.
+      - run: cargo test --no-default-features --all-targets
 
   clippy:
     name: clippy
@@ -79,6 +84,43 @@ jobs:
       # they run on stable above.
       - run: cargo test
       - run: cargo build --no-default-features
+
+  fuzz:
+    # A smoke run, not a campaign: 60 seconds over the committed corpus
+    # is enough to catch a panic a change just introduced on a shape the
+    # corpus already reaches, and cheap enough to run on every push. It
+    # is a normal, blocking job — a panic in the parser or the editor is
+    # a bug whether the fuzzer or a user found it. Deeper runs happen
+    # out of band; this is the regression net.
+    name: fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # cargo-fuzz needs nightly: the sanitizer flags and the
+      # libfuzzer-sys glue are nightly-only.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # `-runs` is not capped, so `-max_total_time` is the whole budget;
+      # `-max_len` keeps the inputs disk-image-shaped rather than
+      # multi-megabyte.
+      # Run from the repo root: cargo-fuzz finds `fuzz/` from here, and
+      # the fuzz crate is its own workspace so nothing else is built.
+      # `fuzz/seeds` is given explicitly because the corpus is not
+      # committed — a valid `RDSK` is gated on a checksum coverage
+      # feedback cannot guess its way to, so a run from nothing would
+      # spend its whole budget outside the parser.
+      # The corpus directory has to exist before it can be named; new
+      # inputs accumulate in it for the length of the job and are then
+      # thrown away with the runner.
+      - run: |
+          mkdir -p fuzz/corpus/parse
+          cargo fuzz run parse fuzz/corpus/parse fuzz/seeds \
+            -- -max_total_time=60 -max_len=65536
 
   differential:
     # The oracle suite: build images here, let amitools' `rdbtool` read them,

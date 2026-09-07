@@ -18,9 +18,19 @@ a fresh RDB — the whole layout computed and validated before the first
 block lands, filesystem drivers shipped inside the image so a 3.1-era
 ROM can mount a dostype it never heard of — and `RdbEditor` mutates an
 existing one in place: add/delete/resize partitions, swap drivers,
-grow the reserved area, while preserving every byte it does not model,
-writing only inside the RDB area, and ordering writes so an
-interruption leaves the old table intact (the `RDSK` lands last).
+grow the reserved area, while preserving every byte it does not model
+and writing only inside the RDB area. Writes are ordered so that an
+interrupted commit leaves a table that parses: the `RDSK` lands last,
+and while the reserved area has *any* spare block, every structure
+that has to move goes to one the old table does not use — so an
+interruption leaves the old table or the new one, whole, never a
+splice of the two. In a **completely full** area there is nowhere
+spare, and a moved structure lands on a block the old table is
+vacating; from that write on, the old table can no longer be walked
+past it. The `RDSK`-last order still bounds what that costs — the
+published table is never a half-written one — but the honest promise
+is old-or-new with headroom, and best-effort without it. `expand_rdb_area`
+is the headroom.
 What's *inside* a partition is deliberately out of scope — one
 filesystem family per crate; a partition composes with a filesystem
 crate through a small adapter that offsets LBAs into the parent
@@ -36,7 +46,8 @@ Feature-complete against the plan: read, create and in-place editing
 all landed, each validated against independent implementations —
 amitools' `rdbtool` runs in CI reading this crate's images and vice
 versa, and AmiPart's host CLI agrees field-for-field on the same
-edits. The parser and editor are fuzzed. The API is not stable yet:
+edits. The parser and editor are fuzzed, with a smoke run of the
+`parse` target in CI on every push. The API is not stable yet:
 pre-1.0, breaking changes arrive with a version bump and a changelog
 line, never silently.
 

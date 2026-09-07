@@ -87,7 +87,10 @@ fn main() {
             p.high_cyl,
             p.start_lba,
             p.block_len,
-            p.block_len * rdb.block_bytes as u64 / (1024 * 1024),
+            // Saturating: both factors come off the image, and a hostile
+            // `de_HighCyl` makes the product overflow — a debug panic,
+            // and in release a wrapped size printed as fact.
+            p.block_len.saturating_mul(rdb.block_bytes as u64) / (1024 * 1024),
             p.boot_pri,
             if p.bootable { "  bootable" } else { "" },
             if p.no_automount { "  noautomount" } else { "" },

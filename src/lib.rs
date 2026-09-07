@@ -138,6 +138,7 @@
 
 extern crate alloc;
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -243,6 +244,30 @@ pub const MAX_BLOCK_SIZE: usize = 32 * 1024;
 /// How many blocks from the start of the disk the `RDSK` block may
 /// legally sit in (`RDB_LOCATION_LIMIT`, NDK `devices/hardblocks.h`).
 pub const RDB_LOCATION_LIMIT: u64 = 16;
+
+/// How many blocks one chain (`PART`, `FSHD`, `LSEG`, `BADB`) may hold
+/// before the walk gives up with [`RdbError::ChainTooLong`].
+///
+/// Not a format limit — the format has none beyond the 32-bit block
+/// pointers, and a chain of distinct blocks is bounded by the disk. It
+/// exists for the one case where nothing else bounds the walk: a
+/// [`BlockSource`] that reports no [`block_count`](BlockSource::block_count)
+/// cannot have its pointers range-checked, so a hostile image can hand
+/// the parser an arbitrarily long acyclic-so-far chain and be answered
+/// with an arbitrarily large visited set. With a block count the visited
+/// set already ends the walk after at most one hop per block on the
+/// disk, and this constant is never reached.
+///
+/// 2²⁰ blocks is 512 MB of `LSEG` payload at the classic 512-byte
+/// block: three orders of magnitude past the largest filesystem driver
+/// anyone has shipped in an RDB, past any plausible reserved *area*, and
+/// past most whole disks of the era — so no legitimate image is refused
+/// — while keeping the visited set a crafted one can force to tens of
+/// megabytes rather than gigabytes. A cap high enough to be
+/// unreachable-in-practice and low enough to be reachable-in-a-test is
+/// the point: an unbounded walk is bounded by the attacker's patience,
+/// and any bound at all is better than that.
+pub const MAX_CHAIN_BLOCKS: usize = 1 << 20;
 
 /// Block identifiers, as big-endian magic numbers.
 pub mod id {
@@ -905,6 +930,31 @@ pub enum RdbError<E> {
         /// The block the chain came back to.
         lba: u64,
     },
+    /// A chain ran past [`MAX_CHAIN_BLOCKS`] blocks without repeating
+    /// one. Only reachable from a [`BlockSource`] that reports no
+    /// [`block_count`](BlockSource::block_count): with a count, an
+    /// acyclic chain cannot outlast the disk. See [`MAX_CHAIN_BLOCKS`]
+    /// for why the limit is where it is.
+    ChainTooLong {
+        /// The limit that was exceeded, i.e. [`MAX_CHAIN_BLOCKS`].
+        limit: usize,
+    },
+    /// Two `FSHD` blocks' `LSEG` chains share a block, so one driver's
+    /// payload is spliced into another's.
+    ///
+    /// Damage, not a layout the format supports: each `FSHD` owns its
+    /// chain, and an editor that rewrote one would silently rewrite the
+    /// other. Reported by [`RdbEditor::open`], which has to hold every
+    /// block of every chain and cannot faithfully edit aliased ones.
+    /// [`Rdb::parse`] does not raise it — it walks one chain at a time
+    /// and reads each faithfully — and
+    /// [`Rdb::validate_seg_lists`](Rdb::validate_seg_lists) *reports* it
+    /// as [`ValidationIssue::SharedLsegChain`] instead, validation being
+    /// a report rather than a refusal.
+    SharedChain {
+        /// The first block found on two chains.
+        lba: u64,
+    },
     /// `rdb_BlockBytes` disagrees with the source's
     /// [`block_size`](BlockSource::block_size). Every LBA in the RDB is
     /// in `rdb_BlockBytes` units; reading them through a differently
@@ -954,6 +1004,13 @@ impl<E: core::fmt::Display> core::fmt::Display for RdbError<E> {
             RdbError::ChainCycle { lba } => {
                 write!(f, "a chain loops back to block {lba}")
             }
+            RdbError::ChainTooLong { limit } => {
+                write!(f, "a chain is longer than the {limit}-block limit")
+            }
+            RdbError::SharedChain { lba } => write!(
+                f,
+                "two filesystems' LSEG chains share block {lba}, so neither can be edited"
+            ),
             RdbError::BlockBytesMismatch {
                 block_bytes,
                 block_size,
@@ -1439,6 +1496,26 @@ pub enum ValidationIssue {
         /// `de_DosType`'s index, which is the issue.
         table_size: u32,
     },
+    /// Two filesystems' `LSEG` chains run through the same block: one
+    /// driver's payload is spliced into another's, and rewriting either
+    /// filesystem rewrites both.
+    ///
+    /// Reported by
+    /// [`validate_seg_lists`](Rdb::validate_seg_lists) — the only half
+    /// of validation that has the chains' LBAs — once per filesystem
+    /// that collides with an earlier one, naming the first shared block
+    /// rather than every one of them. [`RdbEditor::open`] refuses such
+    /// an image outright ([`RdbError::SharedChain`]); this is the
+    /// read-side report of the same damage.
+    SharedLsegChain {
+        /// Index into [`Rdb::filesystems`] of the filesystem whose chain
+        /// ran into a block an earlier chain already used.
+        index: usize,
+        /// Index of that earlier filesystem, always below `index`.
+        other: usize,
+        /// The first block the two chains share.
+        lba: u64,
+    },
 }
 
 impl core::fmt::Display for ValidationIssue {
@@ -1497,6 +1574,9 @@ impl core::fmt::Display for ValidationIssue {
                  short of the {} needed to reach de_DosType",
                 de::DOS_TYPE
             ),
+            ValidationIssue::SharedLsegChain { index, other, lba } => {
+                write!(f, "filesystems {other} and {index} share LSEG block {lba}")
+            }
         }
     }
 }
@@ -1628,9 +1708,19 @@ mod badb {
 /// lives here once rather than four times. `buf` is the caller's scratch
 /// block and holds the last-read block on return.
 ///
-/// Bounded by a visited set rather than a maximum length: a cycle is the
-/// failure mode a crafted or corrupted image produces, and a length cap
-/// would either reject a legitimately long chain or still spin on one.
+/// Bounded two ways. The visited set is the real bound and the one that
+/// catches the failure mode a crafted or corrupted image produces — a
+/// cycle — and, when the source reports a
+/// [`block_count`](BlockSource::block_count), it is sufficient on its
+/// own: every hop is at a distinct in-range block, so the chain cannot
+/// outlast the disk. [`MAX_CHAIN_BLOCKS`] is the backstop for a source
+/// that reports no count, where nothing else limits how long an
+/// acyclic-so-far chain can run.
+///
+/// The set is a [`BTreeSet`], not a list: an *O(L²)* membership scan
+/// over a chain the image chooses the length of is work an attacker
+/// picks, and a driver chain of tens of thousands of `LSEG` blocks is
+/// perfectly legitimate.
 fn walk_chain<S, F>(
     disk: &mut S,
     head: u32,
@@ -1643,7 +1733,7 @@ where
     F: FnMut(&[u8], u64) -> Result<(), RdbError<S::Error>>,
 {
     let mut next = head;
-    let mut visited: Vec<u32> = Vec::new();
+    let mut visited: BTreeSet<u32> = BTreeSet::new();
     while next != CHAIN_END {
         let lba = next as u64;
         if let Some(n) = disk.block_count() {
@@ -1651,10 +1741,14 @@ where
                 return Err(RdbError::ChainOutOfRange { lba });
             }
         }
-        if visited.contains(&next) {
+        if !visited.insert(next) {
             return Err(RdbError::ChainCycle { lba });
         }
-        visited.push(next);
+        if visited.len() > MAX_CHAIN_BLOCKS {
+            return Err(RdbError::ChainTooLong {
+                limit: MAX_CHAIN_BLOCKS,
+            });
+        }
 
         disk.read_block(lba, buf).map_err(RdbError::Io)?;
         let found = be32(buf, hdr::ID);
@@ -1865,8 +1959,9 @@ impl Rdb {
     ///    rather than zero (see [`ValidationIssue::EnvecTooShort`]).
     ///
     /// Check 4 goes beyond the RDB-versus-partition case, but it is the
-    /// same failure — two owners, both writing — and costs one pass over
-    /// the partition pairs. Checks 3 and 4 never consult the RDB area,
+    /// same failure — two owners, both writing — and costs a sort plus
+    /// one comparison per pair that actually overlaps, rather than one
+    /// per pair. Checks 3 and 4 never consult the RDB area,
     /// so they run even when it is unusable.
     ///
     /// `LSEG` blocks are *not* covered here: they are lazy by design (a
@@ -1939,24 +2034,48 @@ impl Rdb {
 
         // Partition-versus-partition, which needs no RDB area and so
         // runs even when the area is unusable.
-        for a in 0..self.partitions.len() {
-            for b in a + 1..self.partitions.len() {
-                let (pa, pb) = (&self.partitions[a], &self.partitions[b]);
-                let start = pa.start_lba.max(pb.start_lba);
-                let end = pa
-                    .start_lba
-                    .saturating_add(pa.block_len)
-                    .min(pb.start_lba.saturating_add(pb.block_len));
-                if start < end {
-                    issues.push(ValidationIssue::PartitionsOverlap {
-                        a,
-                        b,
-                        a_name: pa.name.clone(),
-                        b_name: pb.name.clone(),
-                        start,
-                        len: end - start,
-                    });
+        //
+        // Swept in start order rather than compared pairwise: the number
+        // of partitions is whatever the `PART` chain says, and an image
+        // is free to say thousands. Sorting first costs O(P log P) and
+        // then each partition is compared only against the ones that
+        // actually start before it ends, so the quadratic term is paid
+        // only for pairs that genuinely overlap — which are pairs the
+        // caller asked to be told about.
+        let mut order: Vec<usize> = (0..self.partitions.len()).collect();
+        let extent = |i: usize| {
+            let p = &self.partitions[i];
+            (p.start_lba, p.start_lba.saturating_add(p.block_len))
+        };
+        order.sort_by_key(|&i| extent(i));
+        for (rank, &i) in order.iter().enumerate() {
+            let (i_start, i_end) = extent(i);
+            if i_start >= i_end {
+                continue;
+            }
+            for &j in &order[rank + 1..] {
+                let (j_start, j_end) = extent(j);
+                // Sorted by start, so once one candidate starts at or
+                // after `i`'s end, every later one does too.
+                if j_start >= i_end {
+                    break;
                 }
+                if j_start >= j_end {
+                    continue;
+                }
+                // `a` is always the lower index, as documented, which
+                // the sort order does not preserve.
+                let (a, b) = (i.min(j), i.max(j));
+                let start = i_start.max(j_start);
+                let end = i_end.min(j_end);
+                issues.push(ValidationIssue::PartitionsOverlap {
+                    a,
+                    b,
+                    a_name: self.partitions[a].name.clone(),
+                    b_name: self.partitions[b].name.clone(),
+                    start,
+                    len: end - start,
+                });
             }
         }
 
@@ -1980,7 +2099,9 @@ impl Rdb {
     }
 
     /// The `LSEG` half of [`validate`](Self::validate): walk every
-    /// filesystem's driver chain and report blocks outside the RDB area.
+    /// filesystem's driver chain and report blocks outside the RDB area,
+    /// and chains that run through each other
+    /// ([`ValidationIssue::SharedLsegChain`]).
     ///
     /// Takes the disk because `LSEG` chains are only ever walked on
     /// demand — [`load_filesystem`](Self::load_filesystem) is where their
@@ -2012,7 +2133,13 @@ impl Rdb {
         let (lo, hi) = (self.rdb_blocks_lo as u64, self.rdb_blocks_hi as u64);
         let mut buf = alloc::vec![0u8; block_size];
         let mut issues = Vec::new();
-        for f in &self.filesystems {
+        // Which filesystem claimed each LSEG block, so a block on two
+        // chains is caught. A shared chain is damage — see
+        // [`ValidationIssue::SharedLsegChain`] — and it is only visible
+        // from here, where every chain is walked in one pass.
+        let mut owner: BTreeMap<u64, usize> = BTreeMap::new();
+        for (index, f) in self.filesystems.iter().enumerate() {
+            let mut shared: Option<(usize, u64)> = None;
             walk_chain(disk, f.seg_list_blocks, id::LSEG, &mut buf, |_b, lba| {
                 if lba < lo || lba > hi {
                     issues.push(ValidationIssue::BlockOutsideRdbArea {
@@ -2022,8 +2149,22 @@ impl Rdb {
                         hi,
                     });
                 }
+                // One issue per colliding filesystem, not one per shared
+                // block: two chains that are the same chain share every
+                // block of it, and an image gets to choose how many that
+                // is.
+                match owner.get(&lba) {
+                    Some(&other) if shared.is_none() => shared = Some((other, lba)),
+                    Some(_) => {}
+                    None => {
+                        owner.insert(lba, index);
+                    }
+                }
                 Ok(())
             })?;
+            if let Some((other, lba)) = shared {
+                issues.push(ValidationIssue::SharedLsegChain { index, other, lba });
+            }
         }
         Ok(issues)
     }
@@ -3378,11 +3519,16 @@ impl RdbBuilder {
                 .map_err(BuildError::Io)?;
         }
 
-        // Each filesystem's LSEG chain before its FSHD, and every FSHD
-        // before the RDSK: a block is written only after everything it
-        // points at, so an interruption leaves dangling blocks that
-        // nothing references rather than a chain into blocks that do not
-        // exist.
+        // Each filesystem's LSEG chain before its FSHD, and — like the
+        // PART blocks above — every one of them before the RDSK. Within
+        // a chain the blocks go out head first, so a prefix of this
+        // write really can leave a chain pointing at a block that has
+        // not been written yet; what makes that harmless is the RDSK
+        // landing last, so nothing *reaches* those chains until all of
+        // them are down. (`RdbEditor::commit` writes each chain from its
+        // tail, because there the target is not empty and an old RDSK is
+        // still published. Here the target is empty by contract, and an
+        // interrupted build leaves blocks nothing references.)
         for (i, placed) in layout.filesystems.iter().enumerate() {
             let spec = &self.filesystems[i];
             let payload = lseg_payload_bytes(block_size);
@@ -4640,7 +4786,12 @@ pub struct RdbEditor {
     /// this holds and the new layout does not; and because the old
     /// chain's shape is what [`plan`](Self::plan) must not disturb
     /// before the `RDSK` flip.
-    original: Vec<OriginalLinks>,
+    ///
+    /// Keyed by LBA: [`plan`](Self::plan) asks "was this block ours, and
+    /// what did it point at" once per structure per fixed-point pass,
+    /// and a linear scan there is quadratic in an area whose size the
+    /// image chooses.
+    original: BTreeMap<u64, OriginalLinks>,
     /// [`BlockSource::block_count`] as `open` found it, when the source
     /// said — the disk-size authority [`expand_rdb_area`](Self::expand_rdb_area)
     /// and [`set_geometry_cylinders`](Self::set_geometry_cylinders)
@@ -4665,6 +4816,27 @@ impl RdbEditor {
     /// Fails exactly as [`Rdb::parse`] does, plus the same failures over
     /// the `LSEG` chains: a cycle, an off-disk pointer, a wrong ID or a
     /// bad checksum is an error rather than a truncated read.
+    ///
+    /// # How much it can be made to hold
+    ///
+    /// One copy of every block of the area, and no more. Within a chain
+    /// that is the chain walk's visited set; *across* chains it is
+    /// [`RdbError::SharedChain`], which refuses an image whose `FSHD`s
+    /// share `LSEG` blocks — without it, `k` filesystems pointing at one
+    /// `L`-block chain would be retained `k` times over, an
+    /// amplification the image chooses both factors of. With both, every
+    /// retained block is a distinct block of the disk, so a source that
+    /// reports a [`block_count`](BlockSource::block_count) bounds the
+    /// memory by its own size, and one that does not is bounded by
+    /// [`MAX_CHAIN_BLOCKS`] per chain.
+    ///
+    /// A shared chain is damage rather than a layout to support: each
+    /// `FSHD` owns its chain, an edit to one would rewrite the other's
+    /// driver, and there is no faithful answer for an editor to give.
+    /// [`Rdb::parse`] and [`Rdb::load_filesystem`] still read such an
+    /// image — one chain at a time, each read correctly — and
+    /// [`Rdb::validate_seg_lists`] reports it as
+    /// [`ValidationIssue::SharedLsegChain`].
     pub fn open<S: BlockSource>(disk: &mut S) -> Result<Self, RdbError<S::Error>> {
         let rdb = Rdb::parse(disk)?;
         let block_size = disk.block_size();
@@ -4681,16 +4853,33 @@ impl RdbEditor {
 
         let mut fshds = Vec::with_capacity(rdb.filesystems.len());
         let mut lsegs = Vec::with_capacity(rdb.filesystems.len());
+        // Every LSEG block already claimed by an earlier filesystem.
+        // Two `FSHD`s sharing a chain is damage the parser reads
+        // faithfully and the editor cannot: it would hold `k` copies of
+        // the same blocks (a `k`-fold amplification an image chooses the
+        // size of) and every edit would rewrite all of them. Refused,
+        // clearly, rather than accepted and mishandled.
+        let mut claimed: BTreeSet<u64> = BTreeSet::new();
         for f in &rdb.filesystems {
             fshds.push(RawBlock::read(disk, f.fshd_block, block_size)?);
             let mut chain = Vec::new();
+            let mut shared = None;
             walk_chain(disk, f.seg_list_blocks, id::LSEG, &mut buf, |b, lba| {
+                if !claimed.insert(lba) {
+                    shared.get_or_insert(lba);
+                    // Stop growing the copy the moment it is known to be
+                    // one: an aliased chain is refused below either way.
+                    return Ok(());
+                }
                 chain.push(RawBlock {
                     lba,
                     bytes: b.to_vec(),
                 });
                 Ok(())
             })?;
+            if let Some(lba) = shared {
+                return Err(RdbError::SharedChain { lba });
+            }
             lsegs.push(chain);
         }
 
@@ -4705,6 +4894,7 @@ impl RdbEditor {
             .chain(fshds.iter().map(|b| b.links(true)))
             .chain(lsegs.iter().flatten().map(|b| b.links(false)))
             .chain(badbs.iter().map(|b| b.links(false)))
+            .map(|l| (l.lba, l))
             .collect();
 
         Ok(Self {
@@ -4733,6 +4923,14 @@ impl RdbEditor {
     /// the layout. Validate the disk after the commit; that is where
     /// this crate's own tests do it, the disk being the only authority
     /// on what is on the disk.
+    ///
+    /// The same goes for the chain heads — `filesys_header_list`,
+    /// `bad_block_list` — which are kept in step with the lists they
+    /// head after every structural edit, so the model is never
+    /// self-contradictory, but which read [`CHAIN_END`] for a chain
+    /// whose first block has not been placed yet. In short: **every
+    /// field is the edited value; every block LBA is provisional until
+    /// [`commit`](Self::commit)**.
     pub fn rdb(&self) -> &Rdb {
         &self.rdb
     }
@@ -5794,6 +5992,7 @@ impl RdbEditor {
         self.fshds.push(header_block);
         self.lsegs.push(chain);
         self.rdb.filesystems.push(header);
+        self.sync_filesys_header_list();
         Ok(self.fshds.len() - 1)
     }
 
@@ -5818,6 +6017,7 @@ impl RdbEditor {
         self.fshds[index] = header_block;
         self.lsegs[index] = chain;
         self.rdb.filesystems[index] = header;
+        self.sync_filesys_header_list();
         Ok(())
     }
 
@@ -5867,7 +6067,28 @@ impl RdbEditor {
         self.fshds.remove(index);
         self.lsegs.remove(index);
         self.rdb.filesystems.remove(index);
+        self.sync_filesys_header_list();
         Ok(affected)
+    }
+
+    /// Bring [`Rdb::filesys_header_list`] back in step with the `FSHD`
+    /// list after it has grown or shrunk.
+    ///
+    /// The head is a *block pointer*, so removing the first filesystem
+    /// (or removing the last one altogether) leaves it naming a block
+    /// the model no longer has anything at — a caller reading
+    /// [`rdb`](Self::rdb) between the edit and the commit would see a
+    /// chain head that contradicts `filesystems`. It reads the head the
+    /// current list implies: the first `FSHD`'s block, or [`CHAIN_END`]
+    /// when there are none. An `FSHD` the editor added has no block yet
+    /// and reads [`UNPLACED_BLOCK`], whose low 32 bits are `CHAIN_END`
+    /// — provisional exactly like every other block LBA in the model,
+    /// and settled by the commit.
+    fn sync_filesys_header_list(&mut self) {
+        self.rdb.filesys_header_list = match self.fshds.first() {
+            Some(b) => b.lba as u32,
+            None => CHAIN_END,
+        };
     }
 
     // ---- structural edits: the bad-block list ----------------------
@@ -6131,13 +6352,13 @@ impl RdbEditor {
     /// that were are off-limits to the first allocation tier and are
     /// zeroed if nothing lands on them.
     fn was_original(&self, lba: u64) -> bool {
-        self.original.iter().any(|b| b.lba == lba)
+        self.original.contains_key(&lba)
     }
 
     /// What the block at `lba` pointed at when it was read, or `None`
     /// if the published layout does not use that block at all.
     fn original_links(&self, lba: u64) -> Option<OriginalLinks> {
-        self.original.iter().copied().find(|b| b.lba == lba)
+        self.original.get(&lba).copied()
     }
 
     fn plan<E>(&self) -> Result<CommitPlan, CommitError<E>> {
@@ -6208,19 +6429,20 @@ impl RdbEditor {
         // what makes the loop below terminate.
         let mut relocate: Vec<bool> = alloc::vec![false; current.len()];
         let (assigned, taken) = loop {
-            // `taken` is linear-scanned rather than a set: it is bounded
-            // by the area's block count, which is a few dozen blocks
-            // plus whatever driver payload the image carries, and
-            // pulling in a hash map would mean a dependency this crate
-            // does not have.
-            let mut taken: Vec<u64> = alloc::vec![rdsk];
+            // A set, not a list: the area holds a few dozen blocks plus
+            // whatever driver payload the image carries, and "whatever
+            // the image carries" is the attacker's number — a linear
+            // membership scan per placement is quadratic in it. A
+            // `BTreeSet` is `alloc`, so it costs no dependency.
+            let mut taken: BTreeSet<u64> = BTreeSet::new();
+            taken.insert(rdsk);
             let mut assigned: Vec<u64> = alloc::vec![0; current.len()];
             let mut placed: Vec<bool> = alloc::vec![false; current.len()];
             for (i, &lba) in current.iter().enumerate() {
                 if !relocate[i] && (lo..=hi).contains(&lba) && !taken.contains(&lba) {
                     assigned[i] = lba;
                     placed[i] = true;
-                    taken.push(lba);
+                    taken.insert(lba);
                 }
             }
             // Allocation is two tiers, and the order is the crash shape.
@@ -6268,7 +6490,7 @@ impl RdbEditor {
                 };
                 assigned[i] = lba;
                 placed[i] = true;
-                taken.push(lba);
+                taken.insert(lba);
             }
 
             // The chain-shape rule, run to a fixed point: a block kept
@@ -6319,7 +6541,7 @@ impl RdbEditor {
         // why an image edited by it loses its headroom and why the BADB
         // chain it appends above the old ceiling is orphaned by the next
         // write (`docs/amipart-survey.md` §4).
-        let high_rdsk_block = taken.iter().copied().max().unwrap_or(rdsk) as u32;
+        let high_rdsk_block = taken.iter().next_back().copied().unwrap_or(rdsk) as u32;
 
         // What the old layout used, the new one does not, and lies
         // inside the area. A block outside it is left alone whatever it
@@ -6333,14 +6555,13 @@ impl RdbEditor {
         // that it was ever ours. AmiPart leaves such a block on disk,
         // checksum-valid and unreferenced, where the next tool's `RDSK`
         // scan can find it (`docs/amipart-survey.md` §3).
-        let mut zeroed: Vec<u64> = self
+        // Already sorted and deduplicated: `original` is keyed by LBA.
+        let zeroed: Vec<u64> = self
             .original
-            .iter()
-            .map(|b| b.lba)
+            .keys()
+            .copied()
             .filter(|lba| (lo..=hi).contains(lba) && !taken.contains(lba))
             .collect();
-        zeroed.sort_unstable();
-        zeroed.dedup();
 
         Ok(CommitPlan {
             part_lbas,
@@ -6458,9 +6679,11 @@ pub struct PartitionSource<'a, S: BlockSource> {
     block_len: u64,
 }
 
-/// Error from [`PartitionSource`]: either the parent's error, or a read
-/// past the partition's end (which the parent could not catch — the
-/// block may exist on disk, just not in this partition).
+/// Error from [`PartitionSource`]: the parent's own error, a read past
+/// the partition's end (which the parent could not catch — the block may
+/// exist on disk, just not in this partition), or a read that is inside
+/// the partition and past the end of the *parent* (which the parent
+/// should catch, and which is refused here rather than trusted to).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartitionSourceError<E> {
     /// The parent [`BlockSource`] failed on the underlying read.
@@ -6471,6 +6694,25 @@ pub enum PartitionSourceError<E> {
         lba: u64,
         /// How many blocks the partition has, so `lba` had to be below it.
         len: u64,
+    },
+    /// The block is inside the partition but off the end of the *parent*
+    /// device: the partition's extent, which came off an attacker- or
+    /// corruption-supplied `PART` block, claims blocks the disk does not
+    /// have.
+    ///
+    /// Caught here rather than forwarded, because a parent is not
+    /// obliged to notice: a source whose own bounds check is a multiply
+    /// away from wrapping (`lba * block_size`) would answer a nonsense
+    /// LBA with the *wrong block*. Only reported when the parent reports
+    /// a [`block_count`](BlockSource::block_count); without one there is
+    /// nothing to check against and the read is forwarded as before.
+    BeyondParent {
+        /// The partition-relative block asked for.
+        lba: u64,
+        /// Where it lands on the parent — at or above `block_count`.
+        parent_lba: u64,
+        /// How many blocks the parent says it has.
+        block_count: u64,
     },
 }
 
@@ -6484,6 +6726,15 @@ impl<E: core::fmt::Display> core::fmt::Display for PartitionSourceError<E> {
                 f,
                 "block {lba} is past the end of the partition, which has {len} blocks"
             ),
+            PartitionSourceError::BeyondParent {
+                lba,
+                parent_lba,
+                block_count,
+            } => write!(
+                f,
+                "block {lba} of the partition is block {parent_lba} of the device, \
+                 which has only {block_count} blocks"
+            ),
         }
     }
 }
@@ -6493,7 +6744,9 @@ impl<E: std::error::Error + 'static> std::error::Error for PartitionSourceError<
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PartitionSourceError::Parent(e) => Some(e),
-            PartitionSourceError::OutOfRange { .. } => None,
+            PartitionSourceError::OutOfRange { .. } | PartitionSourceError::BeyondParent { .. } => {
+                None
+            }
         }
     }
 }
@@ -6532,6 +6785,21 @@ impl<'a, S: BlockSource> BlockSource for PartitionSource<'a, S> {
                 })
             }
         };
+        // And the parent's own end, when it will say where that is. A
+        // hostile `start_lba` produces a parent LBA no disk has, and a
+        // parent that computes a byte offset from it can wrap the
+        // multiply and answer with the *wrong* block rather than an
+        // error. Refusing here means the adapter never forwards an LBA
+        // it already knows is nonsense.
+        if let Some(block_count) = self.parent.block_count() {
+            if parent_lba >= block_count {
+                return Err(PartitionSourceError::BeyondParent {
+                    lba,
+                    parent_lba,
+                    block_count,
+                });
+            }
+        }
         self.parent
             .read_block(parent_lba, buf)
             .map_err(PartitionSourceError::Parent)
@@ -6607,13 +6875,33 @@ mod std_support {
 
         fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
             self.inner
-                .seek(SeekFrom::Start(lba * self.block_size as u64))?;
+                .seek(SeekFrom::Start(byte_offset(lba, self.block_size)?))?;
             self.inner.read_exact(buf)
         }
 
         fn block_count(&self) -> Option<u64> {
             self.blocks
         }
+    }
+
+    /// `lba * block_size`, refused rather than wrapped.
+    ///
+    /// An LBA is attacker-controlled: a `PART` block can declare a
+    /// `de_LowCyl` that saturates a partition's `start_lba`, and
+    /// [`PartitionSource`](super::PartitionSource) forwards
+    /// partition-relative blocks to the parent unchanged. An unchecked
+    /// multiply panics in a debug build and, far worse, *wraps* in a
+    /// release one — `2^55 * 512` is 0, so a read meant for a block that
+    /// is not on the disk returns `Ok` with the contents of block 0, and
+    /// a write lands on the `RDSK`. Out of the address space is out of
+    /// range, and says so.
+    fn byte_offset(lba: u64, block_size: usize) -> std::io::Result<u64> {
+        lba.checked_mul(block_size as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("block {lba} is past the end of the byte address space"),
+            )
+        })
     }
 
     impl<T: Read + Write + Seek> BlockSink for SeekBlockSource<T> {
@@ -6625,7 +6913,7 @@ mod std_support {
 
         fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
             self.inner
-                .seek(SeekFrom::Start(lba * self.block_size as u64))?;
+                .seek(SeekFrom::Start(byte_offset(lba, self.block_size)?))?;
             self.inner.write_all(buf)
         }
 
@@ -6869,6 +7157,26 @@ mod tests {
         put32(d, bs, block, e + de::BAUD * 4, 9600);
         put32(d, bs, block, e + de::CONTROL * 4, 0x1234);
         put32(d, bs, block, e + de::BOOT_BLOCKS * 4, 2);
+        seal(d, bs, block, 64);
+    }
+
+    /// Write one minimal `FSHD` block: the chain pointer, the dostype,
+    /// and a patched seg-list head. Everything else is zero, which is a
+    /// legal `FSHD` — the fixtures that care about the patch flags
+    /// build theirs by hand.
+    fn write_fshd(d: &mut [u8], bs: usize, block: usize, next: u32, dos_type: u32, seg_head: u32) {
+        put32(d, bs, block, 0, id::FSHD);
+        put32(d, bs, block, chain::NEXT, next);
+        put32(d, bs, block, fshd::HOST_ID, 7);
+        put32(d, bs, block, fshd::DOS_TYPE, dos_type);
+        put32(d, bs, block, fshd::PATCH_FLAGS, fshd_patch::SEG_LIST);
+        put32(
+            d,
+            bs,
+            block,
+            fshd::PATCHED + fshd::SEG_LIST_INDEX * 4,
+            seg_head,
+        );
         seal(d, bs, block, 64);
     }
 
@@ -7822,11 +8130,41 @@ mod tests {
             "reading a block failed: disk on fire"
         );
         assert_eq!(
+            line(RdbError::ChainTooLong { limit: 1024 }),
+            "a chain is longer than the 1024-block limit"
+        );
+        assert_eq!(
+            line(RdbError::SharedChain { lba: 9 }),
+            "two filesystems' LSEG chains share block 9, so neither can be edited"
+        );
+        assert_eq!(
             alloc::format!(
                 "{}",
                 PartitionSourceError::<&str>::OutOfRange { lba: 256, len: 256 }
             ),
             "block 256 is past the end of the partition, which has 256 blocks"
+        );
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                PartitionSourceError::<&str>::BeyondParent {
+                    lba: 3,
+                    parent_lba: 4096,
+                    block_count: 320,
+                }
+            ),
+            "block 3 of the partition is block 4096 of the device, which has only 320 blocks"
+        );
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                ValidationIssue::SharedLsegChain {
+                    index: 1,
+                    other: 0,
+                    lba: 5
+                }
+            ),
+            "filesystems 0 and 1 share LSEG block 5"
         );
     }
 
@@ -12266,5 +12604,293 @@ mod tests {
         for (e, expected) in commits {
             assert_eq!(alloc::format!("{e}"), expected);
         }
+    }
+
+    // ---- chain walking: cost and bounds -----------------------------
+
+    /// A `PART` block whose extent starts at block 2⁵⁵ — the one value
+    /// that makes `lba * 512` wrap to exactly zero.
+    ///
+    /// `de_Surfaces * de_BlocksPerTrack` is 2³⁰ and `de_LowCyl` is 2²⁵,
+    /// both perfectly ordinary-looking longwords, and the extent is one
+    /// cylinder so it is not empty and not inverted: nothing about the
+    /// block says "hostile" until its LBA meets a multiply.
+    fn wrapping_start_lba_image() -> Vec<u8> {
+        let bs = 512;
+        let mut d = one_partition_image(2);
+        let e = part::ENVIRONMENT;
+        put32(&mut d, bs, 3, e + de::SURFACES * 4, 1 << 15);
+        put32(&mut d, bs, 3, e + de::BLOCKS_PER_TRACK * 4, 1 << 15);
+        put32(&mut d, bs, 3, e + de::LOW_CYL * 4, 1 << 25);
+        put32(&mut d, bs, 3, e + de::HIGH_CYL * 4, 1 << 25);
+        seal(&mut d, bs, 3, 64);
+        d
+    }
+
+    /// `SeekBlockSource` used to compute its byte offset with an
+    /// unchecked `lba * block_size`. In a debug build that panicked; in
+    /// a release build it *wrapped*, and 2⁵⁵ × 512 is zero — so a read
+    /// of a block the disk does not have returned `Ok` with the `RDSK`
+    /// in the buffer, and a write of one would have landed on the `RDSK`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn seek_block_source_refuses_an_lba_that_wraps_the_byte_offset() {
+        use std::io::Cursor;
+
+        let mut image = one_partition_image(2);
+        // A recognisable block 0, which is where `lba * 512` wraps to.
+        image[..512].iter_mut().for_each(|b| *b = 0x5A);
+        let block0 = image[..512].to_vec();
+        {
+            let mut disk = SeekBlockSource::with_block_size(Cursor::new(&mut image), 512).unwrap();
+
+            let mut buf = vec![0u8; 512];
+            let err = BlockSource::read_block(&mut disk, 1 << 55, &mut buf).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert_ne!(buf, block0, "the read answered with block 0's contents");
+            assert!(buf.iter().all(|&b| b == 0));
+
+            let err = BlockSink::write_block(&mut disk, 1 << 55, &vec![0xAB; 512]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(image[..512], block0[..], "the write landed on block 0");
+    }
+
+    /// The path that gets a hostile LBA to a real source: a partition
+    /// whose `start_lba` came off the image, viewed through
+    /// `PartitionSource`, which forwards `start_lba + lba` to the
+    /// parent. Block 0 of *this* partition is block 2⁵⁵ of the disk.
+    #[cfg(feature = "std")]
+    #[test]
+    fn partition_source_refuses_a_wrapping_start_over_a_seek_source() {
+        use std::io::Cursor;
+
+        let image = wrapping_start_lba_image();
+        let rdsk = image[1024..1536].to_vec();
+        let mut disk = SeekBlockSource::with_block_size(Cursor::new(image), 512).unwrap();
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = &rdb.partitions[0];
+        assert_eq!(p.start_lba, 1 << 55);
+        assert_eq!(p.block_len, 1 << 30);
+
+        let mut view = PartitionSource::new(&mut disk, p);
+        let mut buf = vec![0u8; 512];
+        let err = view.read_block(0, &mut buf).unwrap_err();
+        // Caught by the adapter, on the parent's own block count, before
+        // the parent ever sees the LBA.
+        assert!(matches!(
+            err,
+            PartitionSourceError::BeyondParent {
+                lba: 0,
+                parent_lba: 0x0080_0000_0000_0000,
+                block_count: 320,
+            }
+        ));
+        assert_ne!(buf, rdsk, "the read answered with block 0's contents");
+    }
+
+    /// The same guard for a parent that is not a `SeekBlockSource`: the
+    /// adapter refuses an out-of-range parent LBA itself rather than
+    /// trusting whatever the parent does with one.
+    #[test]
+    fn partition_source_refuses_a_block_past_the_parent() {
+        let mut disk = MemDisk::new(wrapping_start_lba_image());
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = rdb.partitions[0].clone();
+        let mut view = PartitionSource::new(&mut disk, &p);
+        let mut buf = vec![0u8; 512];
+        assert!(matches!(
+            view.read_block(1, &mut buf),
+            Err(PartitionSourceError::BeyondParent { .. })
+        ));
+    }
+
+    /// A `LSEG` chain 10 000 blocks long — a size the *image* chooses,
+    /// which is the point. The visited set used to be a `Vec` scanned
+    /// linearly per hop, so the walk cost grew with the square of a
+    /// number an attacker writes into a block; a driver chain of tens of
+    /// thousands of blocks is also perfectly legitimate.
+    #[test]
+    fn a_long_lseg_chain_walks_in_linear_time() {
+        let bs = 512;
+        const CHAIN: usize = 10_000;
+        // RDSK at 2, PART at 3, FSHD at 4, LSEG from 5 upward.
+        let mut d = vec![0u8; (5 + CHAIN + 1) * bs];
+        d[..one_partition_image(2).len()].copy_from_slice(&one_partition_image(2));
+        put32(&mut d, bs, 2, rdsk::FILESYS_HEADER_LIST, 4);
+        // The area has to cover the chain, or every block of it is an
+        // issue rather than a walk.
+        put32(&mut d, bs, 2, rdsk::RDB_BLOCKS_HI, (5 + CHAIN) as u32);
+        seal(&mut d, bs, 2, 64);
+        write_fshd(&mut d, bs, 4, CHAIN_END, 0x444F_5303, 5);
+        for i in 0..CHAIN {
+            let block = 5 + i;
+            put32(&mut d, bs, block, 0, id::LSEG);
+            let next = if i + 1 == CHAIN {
+                CHAIN_END
+            } else {
+                (block + 1) as u32
+            };
+            put32(&mut d, bs, block, chain::NEXT, next);
+            seal(&mut d, bs, block, (bs / 4) as u32);
+        }
+
+        let mut disk = MemDisk::new(d);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let driver = rdb.load_filesystem(&rdb.filesystems[0], &mut disk).unwrap();
+        assert_eq!(driver.len(), CHAIN * LSEG_PAYLOAD);
+        assert!(rdb.validate_seg_lists(&mut disk).unwrap().is_empty());
+    }
+
+    /// A source that reports no `block_count` cannot have its chain
+    /// pointers range-checked, so nothing but [`MAX_CHAIN_BLOCKS`]
+    /// bounds how long a chain it can be made to walk — and before the
+    /// cap, nothing did: the walk ran until the visited set exhausted
+    /// memory.
+    #[test]
+    fn a_chain_on_a_countless_source_stops_at_the_hop_cap() {
+        /// Every block is a valid `LSEG` pointing at the next one, for
+        /// ever, and the source declines to say how many blocks it has.
+        struct Endless;
+
+        impl BlockSource for Endless {
+            type Error = ();
+
+            fn block_size(&self) -> usize {
+                512
+            }
+
+            fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), ()> {
+                buf.iter_mut().for_each(|b| *b = 0);
+                buf[..4].copy_from_slice(&id::LSEG.to_be_bytes());
+                buf[chain::NEXT..chain::NEXT + 4]
+                    .copy_from_slice(&((lba as u32).wrapping_add(1)).to_be_bytes());
+                // The shortest legal sum, so the test's cost is the walk
+                // rather than 128 longwords of checksum per block.
+                seal_checksum(&mut buf[..MIN_SUMMED_LONGS as usize * 4], MIN_SUMMED_LONGS)
+                    .expect("seal");
+                Ok(())
+            }
+
+            fn block_count(&self) -> Option<u64> {
+                None
+            }
+        }
+
+        let mut buf = vec![0u8; 512];
+        let err = walk_chain(&mut Endless, 1, id::LSEG, &mut buf, |_, _| Ok(()));
+        assert_eq!(
+            err,
+            Err(RdbError::ChainTooLong {
+                limit: MAX_CHAIN_BLOCKS
+            })
+        );
+    }
+
+    // ---- shared LSEG chains -----------------------------------------
+
+    /// Two `FSHD` blocks whose `fhb_SegListBlocks` name the *same*
+    /// `LSEG` chain — the amplification shape: `k` filesystems retain
+    /// `k` copies of one chain, and an edit to either rewrites both.
+    fn shared_chain_image() -> Vec<u8> {
+        let (mut d, _) = fs_image();
+        let bs = 512;
+        // A second FSHD at block 9, chained after the first, pointing at
+        // the first's LSEG head.
+        put32(&mut d, bs, FSHD_BLOCK, chain::NEXT, 9);
+        seal(&mut d, bs, FSHD_BLOCK, 64);
+        write_fshd(&mut d, bs, 9, CHAIN_END, 0x444F_5303, LSEG_BLOCK as u32);
+        d
+    }
+
+    /// The editor holds every block of every chain, so aliased chains
+    /// are both a memory amplification and an unrepresentable edit: a
+    /// commit would write one driver's blocks twice, from two different
+    /// buffers. Refused, with the block that gave it away.
+    #[test]
+    fn open_refuses_two_filesystems_sharing_an_lseg_chain() {
+        let mut disk = MemDisk::new(shared_chain_image());
+        // The parser is happy: it walks one chain at a time and reads
+        // each of them correctly.
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.filesystems.len(), 2);
+        assert_eq!(
+            RdbEditor::open(&mut disk),
+            Err(RdbError::SharedChain {
+                lba: LSEG_BLOCK as u64
+            })
+        );
+    }
+
+    /// Validation reports the same damage rather than refusing it — and
+    /// once per colliding filesystem, not once per shared block, since
+    /// the image chooses how many of those there are.
+    #[test]
+    fn validate_seg_lists_reports_a_shared_lseg_chain() {
+        let mut disk = MemDisk::new(shared_chain_image());
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(
+            rdb.validate_seg_lists(&mut disk).unwrap(),
+            vec![ValidationIssue::SharedLsegChain {
+                index: 1,
+                other: 0,
+                lba: LSEG_BLOCK as u64,
+            }]
+        );
+    }
+
+    // ---- overlap sweep, and the model between edit and commit --------
+
+    /// Three partitions that all claim the same blocks. Every pair is
+    /// reported, `a` below `b` in each — the sweep replaced a pairwise
+    /// scan and must not lose or reorder a pair.
+    #[test]
+    fn validate_reports_every_overlapping_pair() {
+        let bs = 512;
+        let mut d = one_partition_image(2);
+        write_part(&mut d, bs, 3, 4, "DH0", 128, (2, 5), 16);
+        write_part(&mut d, bs, 4, 5, "DH1", 128, (3, 6), 16);
+        write_part(&mut d, bs, 5, CHAIN_END, "DH2", 128, (4, 7), 16);
+        put32(&mut d, bs, 2, rdsk::HIGH_RDSK_BLOCK, 5);
+        seal(&mut d, bs, 2, 64);
+
+        let mut disk = MemDisk::new(d);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let pairs: Vec<(usize, usize)> = rdb
+            .validate()
+            .into_iter()
+            .filter_map(|i| match i {
+                ValidationIssue::PartitionsOverlap { a, b, .. } => Some((a, b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pairs, vec![(0, 1), (0, 2), (1, 2)]);
+    }
+
+    /// `rdb()` is the edited model, and a model that still named a
+    /// removed `FSHD` as its chain head was contradicting itself: a
+    /// caller reading it between the edit and the commit saw a head
+    /// block with no filesystem behind it.
+    #[test]
+    fn removing_a_filesystem_updates_the_chain_head_in_the_model() {
+        let (image, _) = fs_image();
+        let mut disk = MemDisk::new(image);
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        assert_eq!(editor.rdb().filesys_header_list, FSHD_BLOCK as u32);
+
+        editor.remove_filesystem(0).unwrap();
+        assert!(editor.rdb().filesystems.is_empty());
+        assert_eq!(editor.rdb().filesys_header_list, CHAIN_END);
+
+        // And an added one reads as unplaced — CHAIN_END until a commit
+        // gives it a block — rather than as the removed one's block.
+        editor
+            .add_filesystem(FileSystemSpec::new(0x444F_5303, vec![0xAB; 100]))
+            .unwrap();
+        assert_eq!(editor.rdb().filesys_header_list, CHAIN_END);
+        editor.commit(&mut disk).unwrap();
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(rdb.filesystems.len(), 1);
+        assert_ne!(rdb.filesys_header_list, CHAIN_END);
     }
 }
