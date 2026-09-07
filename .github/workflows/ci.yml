@@ -99,6 +99,12 @@ jobs:
       # cargo-fuzz needs nightly: the sanitizer flags and the
       # libfuzzer-sys glue are nightly-only.
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # cargo-fuzz's default Linux target is musl (a static,
+          # sanitizer-friendly libc) — nightly does not ship it by
+          # default, and without it the build fails before the fuzzer
+          # ever runs.
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
