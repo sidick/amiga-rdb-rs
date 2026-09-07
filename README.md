@@ -1,23 +1,30 @@
 # amiga-rdb
 
 Amiga Rigid Disk Block (RDB) partition tables as a pure-Rust,
-permissively-licensed library: `RDSK`, `PART`, `FSHD` and `LSEG` blocks,
-their checksums, and the `DosEnvec` geometry that tells you where each
-partition lives and how to mount it.
+permissively-licensed library: `RDSK`, `PART`, `FSHD`, `LSEG` and `BADB`
+blocks, their checksums, and the `DosEnvec` geometry that tells you where
+each partition lives and how to mount it.
 
-In: anything that can read 512-byte blocks (the `BlockSource` trait).
-Out: partitions as extents plus metadata, and filesystem-driver
-payloads. What's *inside* a partition is deliberately out of scope —
+In: anything that can read fixed-size blocks (the `BlockSource` trait).
+The block size is the device's, reported at runtime — 512 is the classic
+value, but the format's 32-bit block fields cap such a disk at 2 TB, and
+4 KB-sector disks are in live use. Out: partitions as extents plus
+metadata, loadable filesystem drivers reassembled from their `LSEG`
+chains, bad-block lists, and `Rdb::validate()` — which reports blocks
+with two owners, the layout that parses fine and destroys itself on the
+first write. What's *inside* a partition is deliberately out of scope —
 one filesystem family per crate; a partition composes with a filesystem
 crate through a small adapter that offsets LBAs into the parent device.
 
 `no_std` + `alloc` at the core; the `std` feature (default) adds only
-conveniences. No dependencies.
+conveniences. No dependencies. MSRV 1.63, tested in CI on that exact
+toolchain; raising it is a semver-visible change, not an accident.
 
 ## Status
 
-Early: read side first, then create, then in-place editing. The API is
-not stable yet.
+Early: read side first, then create, then in-place editing. The read
+side is complete — everything the format can say is surfaced; nothing
+writes a byte yet. The API is not stable yet.
 
 ## Why this exists
 

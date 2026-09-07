@@ -28,7 +28,7 @@ fn main() {
     let rdb = match Rdb::parse(&mut disk) {
         Ok(rdb) => rdb,
         Err(e) => {
-            eprintln!("{path}: {e:?}");
+            eprintln!("{path}: {e}");
             std::process::exit(1);
         }
     };
@@ -102,7 +102,7 @@ fn main() {
     let mut issues = rdb.validate();
     match rdb.validate_seg_lists(&mut disk) {
         Ok(more) => issues.extend(more),
-        Err(e) => eprintln!("{path}: walking LSEG chains: {e:?}"),
+        Err(e) => eprintln!("{path}: walking LSEG chains: {e}"),
     }
     if !issues.is_empty() {
         println!("layout issues ({}):", issues.len());

@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Zero dependencies, so there is nothing to vendor and nothing to break.
+  CARGO_NET_RETRY: 10
+
+jobs:
+  test:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets
+      # --all-targets skips doctests; run them too, they are part of the docs.
+      - run: cargo test --doc
+
+  no-std:
+    name: build --no-default-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The crate is no_std + alloc without the `std` feature; this job is the
+      # only thing standing between that claim and it quietly becoming false.
+      - run: cargo build --no-default-features
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features
+
+  msrv:
+    # Keep in step with `rust-version` in Cargo.toml; the two are one decision.
+    name: msrv (1.63)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.63
+      - uses: Swatinem/rust-cache@v2
+      # Test + build only. clippy and rustfmt drift lint-for-lint between
+      # releases, so pinning their opinions to an old toolchain buys nothing;
+      # they run on stable above.
+      - run: cargo test
+      - run: cargo build --no-default-features
+
+  # TODO: differential job against the GPL oracles — `xdftool <img> open + part`
+  # (amitools) diffed against `rdbinfo`, over the redistributable AROS fixture
+  # once amibake's `aros68k` recipe can build it here. Gated on milestone 2's
+  # round-trip work; see PLAN.md. Run the oracle, never copy it.

@@ -2,6 +2,10 @@
 name = "amiga-rdb"
 version = "0.1.0"
 edition = "2021"
+# Conservative floor: nothing here needs anything newer, and old toolchains
+# are common in retrocomputing/distro packaging. Tested in CI on this exact
+# toolchain; raising it is a semver-visible decision, not an accident.
+rust-version = "1.63"
 license = "MIT OR Apache-2.0"
 description = "Amiga Rigid Disk Block (RDB) partition tables: parsing, and eventually writing — RDSK, PART, FSHD and LSEG blocks"
 repository = "https://github.com/sidick/amiga-rdb-rs"

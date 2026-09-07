@@ -26,8 +26,118 @@
 //! Everything on disk is big-endian; all multi-byte reads go through
 //! [`be32`]/[`be16`] rather than any `#[repr(C)]` overlay, so the crate
 //! is byte-order- and alignment-safe on any host.
+//!
+//! # Example
+//!
+//! The whole read path: a disk, [`Rdb::parse`], the partitions it found,
+//! and a [`PartitionSource`] handed to whatever mounts the filesystem.
+//! The source here is a `Vec<u8>` so the example is self-contained; a
+//! real one is a file (with the `std` feature, [`SeekBlockSource`] wraps
+//! any `Read + Seek`) or a raw device.
+//!
+//! ```
+//! use amiga_rdb::{BlockSource, PartitionSource, Rdb};
+//!
+//! // The one seam: "read me block N". 512-byte blocks here; a 4 KB-sector
+//! // disk says 4096 and every LBA below counts in *those* blocks.
+//! struct MemDisk(Vec<u8>);
+//!
+//! impl BlockSource for MemDisk {
+//!     type Error = std::io::Error;
+//!
+//!     fn block_size(&self) -> usize {
+//!         512
+//!     }
+//!
+//!     fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+//!         let off = lba as usize * 512;
+//!         let block = self.0.get(off..off + 512).ok_or_else(|| {
+//!             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "past the end of the disk")
+//!         })?;
+//!         buf.copy_from_slice(block);
+//!         Ok(())
+//!     }
+//!
+//!     fn block_count(&self) -> Option<u64> {
+//!         Some(self.0.len() as u64 / 512)
+//!     }
+//! }
+//!
+//! # // A one-partition image, built here so the example runs as a test.
+//! # fn put32(d: &mut [u8], block: usize, off: usize, v: u32) {
+//! #     let o = block * 512 + off;
+//! #     d[o..o + 4].copy_from_slice(&v.to_be_bytes());
+//! # }
+//! # fn seal(d: &mut [u8], block: usize) {
+//! #     put32(d, block, 4, 64);
+//! #     put32(d, block, 8, 0);
+//! #     let base = block * 512;
+//! #     let mut sum = 0u32;
+//! #     for i in 0..64 {
+//! #         let w = d[base + i * 4..base + i * 4 + 4].try_into().unwrap();
+//! #         sum = sum.wrapping_add(u32::from_be_bytes(w));
+//! #     }
+//! #     put32(d, block, 8, sum.wrapping_neg());
+//! # }
+//! # fn image() -> Vec<u8> {
+//! #     let mut d = vec![0u8; 320 * 512];
+//! #     put32(&mut d, 0, 0, 0x5244_534B);            // RDSK
+//! #     put32(&mut d, 0, 16, 512);                   // rdb_BlockBytes
+//! #     put32(&mut d, 0, 24, 0xFFFF_FFFF);           // rdb_BadBlockList
+//! #     put32(&mut d, 0, 28, 1);                     // rdb_PartitionList
+//! #     put32(&mut d, 0, 32, 0xFFFF_FFFF);           // rdb_FileSysHeaderList
+//! #     put32(&mut d, 0, 132, 15);                   // rdb_RDBBlocksHi
+//! #     seal(&mut d, 0);
+//! #     put32(&mut d, 1, 0, 0x5041_5254);            // PART
+//! #     put32(&mut d, 1, 16, 0xFFFF_FFFF);           // pb_Next
+//! #     d[512 + 36] = 3;                             // pb_DriveName, BCPL
+//! #     d[512 + 37..512 + 40].copy_from_slice(b"DH0");
+//! #     put32(&mut d, 1, 128, 16);                   // de_TableSize
+//! #     put32(&mut d, 1, 128 + 4, 128);              // de_SizeBlock
+//! #     put32(&mut d, 1, 128 + 12, 1);               // de_Surfaces
+//! #     put32(&mut d, 1, 128 + 20, 32);              // de_BlocksPerTrack
+//! #     put32(&mut d, 1, 128 + 36, 2);               // de_LowCyl
+//! #     put32(&mut d, 1, 128 + 40, 9);               // de_HighCyl
+//! #     put32(&mut d, 1, 128 + 64, 0x444F_5303);     // de_DosType
+//! #     seal(&mut d, 1);
+//! #     d
+//! # }
+//! #
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # let mut disk = MemDisk(image());
+//! // let mut disk = MemDisk(std::fs::read("disk.hdf")?);
+//! let rdb = Rdb::parse(&mut disk)?;
+//!
+//! // Two owners of the same blocks is a layout that parses perfectly and
+//! // destroys itself on the first write, so ask before trusting it.
+//! for issue in rdb.validate() {
+//!     eprintln!("layout issue: {issue}");
+//! }
+//!
+//! for partition in &rdb.partitions {
+//!     println!(
+//!         "{} dostype {:08X} blocks {}..{}",
+//!         partition.name,
+//!         partition.dos_type,
+//!         partition.start_lba,
+//!         partition.start_lba + partition.block_len,
+//!     );
+//!
+//!     // The composition seam: LBA 0 of this source is the partition's
+//!     // first block on the disk. A filesystem crate mounts one of these
+//!     // and never sees the partition table.
+//!     let mut source = PartitionSource::new(&mut disk, partition);
+//!     let mut boot = vec![0u8; source.block_size()];
+//!     source.read_block(0, &mut boot)?;
+//!     println!("  first block starts {:02X?}", &boot[..4]);
+//! }
+//! # assert_eq!(rdb.partitions.len(), 1);
+//! # Ok(())
+//! # }
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![deny(missing_docs)]
 
 extern crate alloc;
 
@@ -48,6 +158,9 @@ use alloc::vec::Vec;
 /// such disks are in live use. Supported sizes are powers of two in
 /// [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`].
 pub trait BlockSource {
+    /// How this source reports a failed read. No bound is imposed here —
+    /// a test's source may fail with `()` — but a source whose error is
+    /// [`Display`](core::fmt::Display) makes [`RdbError`] displayable too.
     type Error;
 
     /// Bytes per device block. Must be constant for the source's
@@ -101,8 +214,9 @@ pub mod id {
 /// spelled `1 << 4` at every call site. Most of them are SCSI-bus
 /// scanning hints written by the controller's setup tool, meaningful
 /// only to the driver that scans the bus; two of them
-/// ([`DISK_ID`]/[`CTRLR_ID`]) gate whether the RDSK's identification
-/// strings hold anything real, so a consumer printing those must check.
+/// ([`DISK_ID`](rdb_flags::DISK_ID)/[`CTRLR_ID`](rdb_flags::CTRLR_ID)) gate
+/// whether the RDSK's identification strings hold anything real, so a
+/// consumer printing those must check.
 pub mod rdb_flags {
     /// No disks exist after this one on this controller — the scan may
     /// stop here.
@@ -135,7 +249,8 @@ pub mod rdb_flags {
 /// the same as "override it with zero" — hence the [`Option`]s on
 /// [`FileSysHeader`].
 ///
-/// Note the ordering trap: [`SEG_LIST`] is bit 7 and [`GLOBAL_VEC`] bit
+/// Note the ordering trap: [`SEG_LIST`](fshd_patch::SEG_LIST) is bit 7
+/// and [`GLOBAL_VEC`](fshd_patch::GLOBAL_VEC) bit
 /// 8, because `fhb_SegListBlocks` physically precedes `fhb_GlobalVec` in
 /// the block. Sources that describe "eight patched fields" and put
 /// `GlobalVec` at bit 7 have silently dropped `SegList` from the count.
@@ -155,9 +270,10 @@ pub mod fshd_patch {
     /// `fhb_Startup` — startup value passed to the handler.
     pub const STARTUP: u32 = 1 << 6;
     /// `fhb_SegListBlocks` — the `LSEG` chain head. Surfaced
-    /// unconditionally as [`FileSysHeader::seg_list_blocks`] because the
-    /// chain has to be walkable either way; this bit only records
-    /// whether the FSHD asked for it to be patched in.
+    /// unconditionally as
+    /// [`FileSysHeader::seg_list_blocks`](super::FileSysHeader::seg_list_blocks)
+    /// because the chain has to be walkable either way; this bit only
+    /// records whether the FSHD asked for it to be patched in.
     pub const SEG_LIST: u32 = 1 << 7;
     /// `fhb_GlobalVec` — BCPL global vector (-1 for a non-BCPL handler).
     pub const GLOBAL_VEC: u32 = 1 << 8;
@@ -213,7 +329,10 @@ pub enum RdbError<E> {
     Io(E),
     /// The source's [`block_size`](BlockSource::block_size) is not a
     /// power of two in [`MIN_BLOCK_SIZE`]`..=`[`MAX_BLOCK_SIZE`].
-    UnsupportedBlockSize { block_size: usize },
+    UnsupportedBlockSize {
+        /// What the source said its block size was.
+        block_size: usize,
+    },
     /// No valid `RDSK` block in the first [`RDB_LOCATION_LIMIT`] blocks.
     ///
     /// Not necessarily damage: RDB-less images (a bare filesystem from
@@ -222,28 +341,136 @@ pub enum RdbError<E> {
     NoRdsk,
     /// A block in a chain had the wrong ID. `expected`/`found` are the
     /// magic numbers; `lba` is where.
-    WrongId { lba: u64, expected: u32, found: u32 },
+    WrongId {
+        /// The block the chain pointed at.
+        lba: u64,
+        /// The magic number the chain's type requires (see [`id`]).
+        expected: u32,
+        /// The magic number actually found there.
+        found: u32,
+    },
     /// A block's checksum failed. The chain is reported broken rather
     /// than the block trusted: a bad checksum on this platform usually
     /// means a bug wrote it, and silently accepting it is how images
     /// get corrupted further.
-    BadChecksum { lba: u64 },
+    BadChecksum {
+        /// The block whose `ChkSum` did not add up.
+        lba: u64,
+    },
     /// A chain pointer walked past the end of the disk (only detectable
     /// when [`BlockSource::block_count`] is `Some`).
-    ChainOutOfRange { lba: u64 },
+    ChainOutOfRange {
+        /// The off-disk block the chain pointed at.
+        lba: u64,
+    },
     /// A chain revisited a block — a cycle. Without this check a
     /// crafted or corrupted image loops the parser forever.
-    ChainCycle { lba: u64 },
+    ChainCycle {
+        /// The block the chain came back to.
+        lba: u64,
+    },
     /// `rdb_BlockBytes` disagrees with the source's
     /// [`block_size`](BlockSource::block_size). Every LBA in the RDB is
     /// in `rdb_BlockBytes` units; reading them through a differently
     /// sized source would silently address the wrong bytes, so the
     /// mismatch is an error, not a guess. (An image of a 4 KB-sector
     /// disk must be presented by a source that says 4096.)
-    BlockBytesMismatch { block_bytes: u32, block_size: usize },
+    BlockBytesMismatch {
+        /// `rdb_BlockBytes`, as the `RDSK` block declares it.
+        block_bytes: u32,
+        /// What the source says it reads in.
+        block_size: usize,
+    },
     /// A `PART` block's `DosEnvec` was too short to contain the fields
     /// this crate needs (`de_TableSize` below `DE_DOSTYPE`).
-    EnvecTooShort { lba: u64, table_size: u32 },
+    EnvecTooShort {
+        /// The `PART` block carrying the short envec.
+        lba: u64,
+        /// The `de_TableSize` it declared.
+        table_size: u32,
+    },
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for RdbError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RdbError::Io(e) => write!(f, "reading a block failed: {e}"),
+            RdbError::UnsupportedBlockSize { block_size } => write!(
+                f,
+                "unsupported device block size {block_size}: \
+                 must be a power of two in {MIN_BLOCK_SIZE}..={MAX_BLOCK_SIZE}"
+            ),
+            RdbError::NoRdsk => write!(
+                f,
+                "no valid RDSK block in the first {RDB_LOCATION_LIMIT} blocks"
+            ),
+            RdbError::WrongId {
+                lba,
+                expected,
+                found,
+            } => write!(
+                f,
+                "block {lba} has ID {} where {} was expected",
+                Fourcc(*found),
+                Fourcc(*expected)
+            ),
+            RdbError::BadChecksum { lba } => {
+                write!(f, "block {lba} has a bad checksum")
+            }
+            RdbError::ChainOutOfRange { lba } => {
+                write!(
+                    f,
+                    "a chain pointed at block {lba}, past the end of the disk"
+                )
+            }
+            RdbError::ChainCycle { lba } => {
+                write!(f, "a chain loops back to block {lba}")
+            }
+            RdbError::BlockBytesMismatch {
+                block_bytes,
+                block_size,
+            } => write!(
+                f,
+                "the RDB declares {block_bytes}-byte blocks but the source reads \
+                 {block_size}-byte blocks"
+            ),
+            RdbError::EnvecTooShort { lba, table_size } => write!(
+                f,
+                "the DosEnvec in the PART block at {lba} declares de_TableSize {table_size}, \
+                 short of the {} needed to reach de_DosType",
+                de::DOS_TYPE
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: std::error::Error + 'static> std::error::Error for RdbError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RdbError::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// A block ID rendered the way the format writes it — four ASCII
+/// characters, e.g. `PART` — falling back to hex for the corrupt case
+/// that produced the error in the first place.
+struct Fourcc(u32);
+
+impl core::fmt::Display for Fourcc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let b = self.0.to_be_bytes();
+        if b.iter().all(|c| (0x20..0x7F).contains(c)) {
+            for c in b {
+                write!(f, "{}", c as char)?;
+            }
+            Ok(())
+        } else {
+            write!(f, "{:#010x}", self.0)
+        }
+    }
 }
 
 /// One partition, as read from a `PART` block.
@@ -277,12 +504,14 @@ pub struct Partition {
     /// Device blocks per cylinder (`de_Surfaces * de_BlocksPerTrack`),
     /// kept because filesystems and repartitioners both need it.
     pub cylinder_blocks: u64,
-    /// `de_LowCyl`/`de_HighCyl`, inclusive.
+    /// `de_LowCyl` — the partition's first cylinder.
     pub low_cyl: u32,
+    /// `de_HighCyl` — its last cylinder, *inclusive*.
     pub high_cyl: u32,
-    /// `de_NumBuffers`, `de_BufMemType` — mount parameters a handler
-    /// needs even though they say nothing about the disk itself.
+    /// `de_NumBuffers` — a mount parameter the handler needs, saying
+    /// nothing about the disk itself.
     pub num_buffers: u32,
+    /// `de_BufMemType` — which memory those buffers want, likewise.
     pub buf_mem_type: u32,
     /// `de_SizeBlock` in longwords (128 == 512-byte filesystem blocks).
     /// Per partition: one disk can carry differently sized filesystem
@@ -433,9 +662,11 @@ pub struct Rdb {
     /// follow it (nothing in the wild uses it), it just carries it so a
     /// rewrite does not drop it.
     pub drive_init: u32,
-    /// Disk geometry as the RDB declares it.
+    /// `rdb_Cylinders` — cylinders on the drive, as the RDB declares it.
     pub cylinders: u32,
+    /// `rdb_Heads` — surfaces per cylinder.
     pub heads: u32,
+    /// `rdb_Sectors` — blocks per track.
     pub sectors: u32,
     /// `rdb_Interleave` — physical sector interleave. Historical: a
     /// value tuned to a controller too slow to read consecutive
@@ -451,16 +682,17 @@ pub struct Rdb {
     pub reduced_write: u32,
     /// `rdb_StepRate` — head step rate in the drive's own units.
     pub step_rate: u32,
-    /// The block range the RDB structures themselves occupy
-    /// (`rdb_RDBBlocksLo..=rdb_RDBBlocksHi`) — the area a repartitioner
-    /// may rewrite and a filesystem must never touch.
+    /// `rdb_RDBBlocksLo` — first block of the area the RDB structures
+    /// themselves occupy: the area a repartitioner may rewrite and a
+    /// filesystem must never touch.
     pub rdb_blocks_lo: u32,
+    /// `rdb_RDBBlocksHi` — the last block of that area, *inclusive*.
     pub rdb_blocks_hi: u32,
-    /// `rdb_LoCylinder`/`rdb_HiCylinder` — the cylinder range available
-    /// to partitions. Distinct from `cylinders`: the RDB area itself
-    /// normally sits below `lo_cylinder`, so this is the range a
-    /// partitioner may actually hand out.
+    /// `rdb_LoCylinder` — first cylinder available to partitions.
+    /// Distinct from `cylinders`: the RDB area itself normally sits
+    /// below this, so this is the range a partitioner may hand out.
     pub lo_cylinder: u32,
+    /// `rdb_HiCylinder` — the last such cylinder, *inclusive*.
     pub hi_cylinder: u32,
     /// `rdb_CylBlocks` — device blocks per cylinder as the *drive*
     /// declares it. Each partition states its own (`de_Surfaces *
@@ -475,19 +707,23 @@ pub struct Rdb {
     /// this is the high-water mark actually used, so a writer knows
     /// where free space in the RDB area begins.
     pub high_rdsk_block: u32,
-    /// `rdb_DiskVendor`/`Product`/`Revision` — SCSI INQUIRY identity of
-    /// the drive, space-padded ASCII (*not* BCPL, unlike
-    /// `pb_DriveName`). Only meaningful when `flags` has
-    /// [`rdb_flags::DISK_ID`]; otherwise these are whatever bytes
-    /// happened to be there, so they are parsed unconditionally but must
-    /// not be displayed without checking the bit.
+    /// `rdb_DiskVendor` — SCSI INQUIRY identity of the drive,
+    /// space-padded ASCII (*not* BCPL, unlike `pb_DriveName`). Only
+    /// meaningful when `flags` has [`rdb_flags::DISK_ID`]; otherwise
+    /// this and its two neighbours are whatever bytes happened to be
+    /// there, so they are parsed unconditionally but must not be
+    /// displayed without checking the bit.
     pub disk_vendor: String,
+    /// `rdb_DiskProduct`, gated by [`rdb_flags::DISK_ID`] as above.
     pub disk_product: String,
+    /// `rdb_DiskRevision`, gated by [`rdb_flags::DISK_ID`] as above.
     pub disk_revision: String,
-    /// `rdb_ControllerVendor`/`Product`/`Revision`, gated the same way
-    /// by [`rdb_flags::CTRLR_ID`].
+    /// `rdb_ControllerVendor` — the same INQUIRY identity for the
+    /// controller, gated the same way by [`rdb_flags::CTRLR_ID`].
     pub controller_vendor: String,
+    /// `rdb_ControllerProduct`, gated by [`rdb_flags::CTRLR_ID`].
     pub controller_product: String,
+    /// `rdb_ControllerRevision`, gated by [`rdb_flags::CTRLR_ID`].
     pub controller_revision: String,
     /// Head of the `FSHD` chain ([`CHAIN_END`] if none).
     pub filesys_header_list: u32,
@@ -565,9 +801,8 @@ impl core::fmt::Display for BlockKind {
 ///
 /// All block quantities are *device* blocks, like everything else in
 /// this crate's API. The [`Display`](core::fmt::Display) impl renders a
-/// single line fit to show a user; it is available in `no_std` because
-/// it is `core::fmt`, unlike the error types, which are still waiting on
-/// the cross-cutting error work.
+/// single line fit to show a user, in `no_std` as much as `std` — as do
+/// [`RdbError`] and [`PartitionSourceError`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationIssue {
     /// `rdb_RDBBlocksLo` is above `rdb_RDBBlocksHi`: the reserved area is
@@ -579,8 +814,9 @@ pub enum ValidationIssue {
     /// that means nothing. Partition-versus-partition checking is
     /// unaffected — it never consults the area.
     RdbAreaInvalid {
-        /// `rdb_RDBBlocksLo` and `rdb_RDBBlocksHi` as they were read.
+        /// `rdb_RDBBlocksLo` as it was read.
         lo: u32,
+        /// `rdb_RDBBlocksHi` as it was read — below `lo`, which is the issue.
         hi: u32,
     },
     /// A chained block sits outside `rdb_RDBBlocksLo..=rdb_RDBBlocksHi` —
@@ -591,8 +827,9 @@ pub enum ValidationIssue {
         kind: BlockKind,
         /// Where it actually is.
         lba: u64,
-        /// The reserved area it should have been inside, inclusive.
+        /// First block of the reserved area it should have been inside.
         lo: u64,
+        /// Last block of that area, inclusive.
         hi: u64,
     },
     /// A partition's extent covers part of the RDB area: the filesystem
@@ -603,11 +840,13 @@ pub enum ValidationIssue {
         index: usize,
         /// The partition's `pb_DriveName`, so a report can name it.
         name: String,
-        /// The partition's extent, `start_lba..start_lba + block_len`.
+        /// First block of the partition's extent.
         start_lba: u64,
+        /// Its length, so the extent is `start_lba..start_lba + block_len`.
         block_len: u64,
-        /// The reserved area it collides with, inclusive.
+        /// First block of the reserved area it collides with.
         lo: u64,
+        /// Last block of that area, inclusive.
         hi: u64,
     },
     /// Two partitions' extents intersect. Beyond the letter of the
@@ -615,14 +854,18 @@ pub enum ValidationIssue {
     /// the same consequence — two filesystems mounting the same blocks,
     /// each destroying the other — for one extra comparison.
     PartitionsOverlap {
-        /// Indices into [`Rdb::partitions`], `a` always the lower.
+        /// Index into [`Rdb::partitions`] of the first partition, always
+        /// the lower of the two.
         a: usize,
+        /// Index of the second, always above `a`.
         b: usize,
-        /// Their `pb_DriveName`s.
+        /// `a`'s `pb_DriveName`, so a report can name it.
         a_name: String,
+        /// `b`'s `pb_DriveName`.
         b_name: String,
-        /// The blocks both claim: `start..start + len`.
+        /// First block both claim.
         start: u64,
+        /// How many, so the shared extent is `start..start + len`.
         len: u64,
     },
 }
@@ -1298,11 +1541,44 @@ pub struct PartitionSource<'a, S: BlockSource> {
 /// block may exist on disk, just not in this partition).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartitionSourceError<E> {
+    /// The parent [`BlockSource`] failed on the underlying read.
     Parent(E),
-    OutOfRange { lba: u64, len: u64 },
+    /// A read past the partition's last block.
+    OutOfRange {
+        /// The partition-relative block asked for.
+        lba: u64,
+        /// How many blocks the partition has, so `lba` had to be below it.
+        len: u64,
+    },
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for PartitionSourceError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PartitionSourceError::Parent(e) => {
+                write!(f, "the parent device failed: {e}")
+            }
+            PartitionSourceError::OutOfRange { lba, len } => write!(
+                f,
+                "block {lba} is past the end of the partition, which has {len} blocks"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: std::error::Error + 'static> std::error::Error for PartitionSourceError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PartitionSourceError::Parent(e) => Some(e),
+            PartitionSourceError::OutOfRange { .. } => None,
+        }
+    }
 }
 
 impl<'a, S: BlockSource> PartitionSource<'a, S> {
+    /// View `partition` of `parent` as a [`BlockSource`] of its own,
+    /// borrowing the parent for as long as the view lives.
     pub fn new(parent: &'a mut S, partition: &Partition) -> Self {
         Self {
             parent,
@@ -2299,6 +2575,53 @@ mod tests {
             ValidationIssue::PartitionsOverlap { a: 0, b: 1, .. }
         ));
         assert!(rdb.validate_seg_lists(&mut disk).unwrap().is_empty());
+    }
+
+    /// The error types render one line a user can act on: which block,
+    /// and both sides of every disagreement. A wrong ID prints the four
+    /// characters the format actually writes.
+    #[test]
+    fn errors_display_as_one_useful_line() {
+        let line = |e: RdbError<&str>| alloc::format!("{e}");
+        assert_eq!(
+            line(RdbError::WrongId {
+                lba: 4,
+                expected: id::FSHD,
+                found: id::PART,
+            }),
+            "block 4 has ID PART where FSHD was expected"
+        );
+        // A corrupt ID is not four printable characters; hex, not mojibake.
+        assert_eq!(
+            line(RdbError::WrongId {
+                lba: 4,
+                expected: id::PART,
+                found: 0,
+            }),
+            "block 4 has ID 0x00000000 where PART was expected"
+        );
+        assert_eq!(
+            line(RdbError::BadChecksum { lba: 7 }),
+            "block 7 has a bad checksum"
+        );
+        assert_eq!(
+            line(RdbError::BlockBytesMismatch {
+                block_bytes: 4096,
+                block_size: 512,
+            }),
+            "the RDB declares 4096-byte blocks but the source reads 512-byte blocks"
+        );
+        assert_eq!(
+            line(RdbError::Io("disk on fire")),
+            "reading a block failed: disk on fire"
+        );
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                PartitionSourceError::<&str>::OutOfRange { lba: 256, len: 256 }
+            ),
+            "block 256 is past the end of the partition, which has 256 blocks"
+        );
     }
 
     #[test]

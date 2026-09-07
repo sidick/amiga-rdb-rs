@@ -162,22 +162,45 @@ The risky stage, gated on the differential suite existing first.
 
 ## Cross-cutting
 
-- [ ] **Errors**: `Display` for every error type; `std::error::Error`
-      under the `std` feature.
+- [x] **Errors**: `Display` for every error type; `std::error::Error`
+      under the `std` feature. `Display` is `core::fmt`, so it holds in
+      `no_std` too; the `Io`/`Parent` variants require `E: Display` on
+      the impl only, so a source whose error is `()` still parses. Under
+      `std`, `source()` returns the wrapped error, so `?` into
+      `Box<dyn Error>` works and the chain survives.
 - [ ] **Fuzzing**: `cargo-fuzz` target for `Rdb::parse` over arbitrary
       images — the parser already refuses cycles/bounds/checksums, and
       the fuzzer's job is to prove there is no panic path left.
-- [ ] **CI** (GitHub Actions): test on stable, `--no-default-features`
-      build, clippy `-D warnings`, rustfmt, docs build. Differential
+- [x] **CI** (GitHub Actions): test on stable, `--no-default-features`
+      build, clippy `-D warnings`, rustfmt, docs build (`RUSTDOCFLAGS=-D
+      warnings`), MSRV. One workflow, `.github/workflows/ci.yml`, jobs
+      parallel. Differential
       job runs when the redistributable AROS fixture can be fetched or
-      rebuilt (amibake's `aros68k` recipe builds from nothing).
-- [ ] **MSRV**: pick one, state it in Cargo.toml and README, test it in CI.
+      rebuilt (amibake's `aros68k` recipe builds from nothing) — not
+      built yet, recorded as a `TODO` in the yaml so the intent has a
+      home next to the jobs it will join.
+- [x] **MSRV**: 1.63, in `rust-version` and tested by its own CI job
+      (test + build only — clippy/rustfmt run on stable, where their
+      opinions are current). Verified by actually running the suite on
+      the 1.63.0 toolchain; nothing in the crate reaches past it, and
+      the floor is deliberately conservative because retro tooling is
+      packaged by distros that move slowly. *(README mention still
+      pending.)*
 - [ ] **crates.io**: publish at the end of milestone 1 (read-complete
       is a coherent 0.2); semver honestly from then on — the API is
       allowed to break pre-1.0 but not silently.
-- [ ] **Docs**: every public item documented (`#![deny(missing_docs)]`
+- [x] **Docs**: every public item documented (`#![deny(missing_docs)]`
       once the surface settles); one worked example in the crate docs
       showing disk → partitions → `PartitionSource` → filesystem crate.
+      Denied now that milestone 1 has settled the read surface; the
+      paired fields that shared one doc comment (`low_cyl`/`high_cyl`,
+      the `rdb_blocks_*` and identification strings, every struct-variant
+      error field) now each carry their own, which is the point — the
+      *inclusive* half of a range is exactly what a reader gets wrong.
+      The crate example builds its own one-partition image in hidden
+      doctest lines rather than exposing a `#[doc(hidden)]` fixture
+      helper, so `cargo test` runs the whole path for real and the public
+      API stays what it says it is.
 
 ## Non-goals, so they don't creep in
 
