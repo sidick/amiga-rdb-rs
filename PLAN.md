@@ -44,16 +44,29 @@ Everything the format can say, surfaced. Nothing here writes a byte.
       reading proves the layout understanding that writing will need.
 - [ ] **BADB chain**: bad-block lists. Nearly extinct in practice, in
       the format forever; read them so a repartitioner can preserve them.
-- [ ] **Non-512 `rdb_BlockBytes`**: currently refused explicitly.
-      Support it or keep the refusal — decide *after* a survey of what
-      tools actually write (m68k-machine's own hostblk work found later
-      Kickstarts cope with >512; an RDB claiming 1024 exists in the
-      wild). Refusal is acceptable; misreading geometry is not.
+- [ ] **Non-512 `rdb_BlockBytes` is required, not optional.** The
+      survey answered itself with arithmetic: every RDB block count and
+      cylinder field is 32-bit, so 512-byte device blocks cap the
+      addressable disk at 2 TB. Larger `BlockBytes` is how the format
+      reaches modern media at all (4 KB → 16 TB, and matches flash's
+      native block size; 32 KB → 256 TB), and real systems run this
+      way today — 8 TB drives carved into 2 TB partitions are in live
+      use. Power-of-two sizes 512..=32 KB. **API consequence, decide
+      early:** block size becomes a runtime property of the source
+      rather than the `BLOCK_SIZE` const baked into `BlockSource`'s
+      buffer type — this reshapes the trait, `PartitionSource`, and
+      every LBA in the public API (all of which must be documented as
+      *device* blocks of the source's size), so it lands before the
+      API attracts consumers, not after.
 - [ ] **Partition `SizeBlock` ≠ 128**: filesystem blocks larger than
-      512 bytes are legal and real. `Partition` already records it;
-      make sure extent math and `PartitionSource` stay in *disk* blocks
-      and document that clearly, since this is exactly where a
-      confusion silently corrupts.
+      the device block are not just legal but in live use — FFS with
+      32 KB blocks on 2 TB partitions is a working real-world setup.
+      `Partition` already records it; extent math and `PartitionSource`
+      stay in *device* blocks, documented loudly, since a
+      device-block/filesystem-block confusion is exactly where a
+      corruption goes silent. (Two independent knobs: `rdb_BlockBytes`
+      is the device's block size, `de_SizeBlock` the filesystem's per
+      partition — a 4 KB-block disk can carry a 32 KB-block FFS.)
 - [ ] **Overlap validation** (`Rdb::validate()` or similar): report (a)
       any chained block — PART, FSHD, LSEG, BADB — lying outside
       `rdb_RDBBlocksLo..=Hi`, and (b) any partition extent overlapping
