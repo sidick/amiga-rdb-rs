@@ -12,9 +12,12 @@
 //! emulator holding an image file, a tool holding a raw device, and a
 //! test holding a `Vec<u8>`. [`BlockSink`] is its write-side mirror,
 //! kept separate so that "this code only reads" is a fact the type
-//! system enforces, and [`RdbBuilder`] is what writes through it: a
-//! whole partition table computed and checked before its first block
-//! reaches the disk. What is *inside* a partition is out of
+//! system enforces. [`RdbBuilder`] writes a fresh table through it — the
+//! whole layout computed and checked before its first block reaches the
+//! disk — and [`RdbEditor`] mutates an existing one in place, preserving
+//! every byte it does not model and ordering its writes so that an
+//! interrupted commit leaves the old table or the new one, never a
+//! splice of the two. What is *inside* a partition is out of
 //! scope by design: one filesystem family per crate, composed through
 //! an adapter that offsets a partition's LBAs into the parent device.
 //!
@@ -37,7 +40,9 @@
 //! and a [`PartitionSource`] handed to whatever mounts the filesystem.
 //! The source here is a `Vec<u8>` so the example is self-contained; a
 //! real one is a file (with the `std` feature, [`SeekBlockSource`] wraps
-//! any `Read + Seek`) or a raw device.
+//! any `Read + Seek`) or a raw device. The write side has worked
+//! examples of its own, on [`RdbBuilder`] (create a table from nothing)
+//! and [`RdbEditor`] (edit one in place).
 //!
 //! ```
 //! use amiga_rdb::{BlockSource, PartitionSource, Rdb};

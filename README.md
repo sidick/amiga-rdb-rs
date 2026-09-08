@@ -31,6 +31,7 @@ past it. The `RDSK`-last order still bounds what that costs — the
 published table is never a half-written one — but the honest promise
 is old-or-new with headroom, and best-effort without it. `expand_rdb_area`
 is the headroom.
+
 What's *inside* a partition is deliberately out of scope — one
 filesystem family per crate; a partition composes with a filesystem
 crate through a small adapter that offsets LBAs into the parent
