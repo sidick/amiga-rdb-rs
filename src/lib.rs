@@ -6684,16 +6684,26 @@ pub struct PartitionSource<'a, S: BlockSource> {
     block_len: u64,
 }
 
-/// Error from [`PartitionSource`]: the parent's own error, a read past
-/// the partition's end (which the parent could not catch — the block may
-/// exist on disk, just not in this partition), or a read that is inside
-/// the partition and past the end of the *parent* (which the parent
-/// should catch, and which is refused here rather than trusted to).
+/// Error from [`PartitionSource`] and [`PartitionSink`]: the parent's
+/// own error, an access past the partition's end (which the parent could
+/// not catch — the block may exist on disk, just not in this partition),
+/// or an access that is inside the partition and past the end of the
+/// *parent* (which the parent should catch, and which is refused here
+/// rather than trusted to).
+///
+/// One type for both directions rather than a parallel
+/// `PartitionSinkError`: the two adapters apply the *same* two-tier
+/// bound to the same arithmetic, so the failure modes are identical and
+/// a second enum would only make a caller that both reads and writes
+/// match twice on the same three cases. The name is the read side's for
+/// compatibility — it was public before the write side existed — and
+/// every variant is worded direction-neutrally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PartitionSourceError<E> {
-    /// The parent [`BlockSource`] failed on the underlying read.
+    /// The parent [`BlockSource`] or [`BlockSink`] failed on the
+    /// underlying transfer.
     Parent(E),
-    /// A read past the partition's last block.
+    /// An access past the partition's last block.
     OutOfRange {
         /// The partition-relative block asked for.
         lba: u64,
@@ -6708,9 +6718,10 @@ pub enum PartitionSourceError<E> {
     /// Caught here rather than forwarded, because a parent is not
     /// obliged to notice: a source whose own bounds check is a multiply
     /// away from wrapping (`lba * block_size`) would answer a nonsense
-    /// LBA with the *wrong block*. Only reported when the parent reports
-    /// a [`block_count`](BlockSource::block_count); without one there is
-    /// nothing to check against and the read is forwarded as before.
+    /// LBA with the *wrong block* — and on the write side would *damage*
+    /// it. Only reported when the parent reports a
+    /// [`block_count`](BlockSource::block_count); without one there is
+    /// nothing to check against and the transfer is forwarded as before.
     BeyondParent {
         /// The partition-relative block asked for.
         lba: u64,
@@ -6807,6 +6818,109 @@ impl<'a, S: BlockSource> BlockSource for PartitionSource<'a, S> {
         }
         self.parent
             .read_block(parent_lba, buf)
+            .map_err(PartitionSourceError::Parent)
+    }
+
+    fn block_count(&self) -> Option<u64> {
+        Some(self.block_len)
+    }
+}
+
+/// A [`BlockSink`] view of one partition: the write-side mirror of
+/// [`PartitionSource`], and the other half of the composition seam with
+/// filesystem crates — they format into one of these, never the disk.
+/// LBA 0 here is `partition.start_lba` on the parent, in the parent's
+/// device blocks (the block size passes through unchanged — this adapter
+/// never speaks `de_SizeBlock` filesystem blocks).
+///
+/// Bounds are checked on the way *in*, on the same two tiers
+/// [`PartitionSource::read_block`] uses, which matters more here than
+/// there: a forwarded nonsense LBA loses a caller a block of data on the
+/// read side and destroys someone else's on the write side.
+///
+/// There is no flush: this crate does not buffer, so there would be
+/// nothing to flush, and durability stays where
+/// [`BlockSink::write_block`] already puts it — with the caller and the
+/// underlying sink. Growing a partition into free space is likewise not
+/// here: a sink only ever sees one `Partition`'s extent and has no view
+/// of its siblings or the RDB's free space, so that is a question for
+/// [`RdbEditor::resize_partition`] before the sink is constructed.
+///
+/// A parent that is both `BlockSource + BlockSink` can be viewed either
+/// way, one view at a time — the borrow is exclusive, exactly as
+/// [`PartitionSource`]'s is:
+///
+/// ```no_run
+/// # use amiga_rdb::{BlockSink, BlockSource, PartitionSink, PartitionSource, Rdb};
+/// # fn go<S: BlockSource<Error = E> + BlockSink<Error = E>, E>(
+/// #     disk: &mut S, rdb: &Rdb,
+/// # ) -> Result<(), Box<dyn core::fmt::Debug>> {
+/// let part = rdb.partitions[0].clone();
+/// let mut buf = vec![0u8; BlockSource::block_size(disk)];
+/// {
+///     let mut sink = PartitionSink::new(disk, &part);
+///     sink.write_block(0, &buf).ok();
+/// }
+/// let mut source = PartitionSource::new(disk, &part);
+/// source.read_block(0, &mut buf).ok();
+/// # Ok(())
+/// # }
+/// ```
+pub struct PartitionSink<'a, S: BlockSink> {
+    parent: &'a mut S,
+    start_lba: u64,
+    block_len: u64,
+}
+
+impl<'a, S: BlockSink> PartitionSink<'a, S> {
+    /// View `partition` of `parent` as a [`BlockSink`] of its own,
+    /// borrowing the parent for as long as the view lives.
+    pub fn new(parent: &'a mut S, partition: &Partition) -> Self {
+        Self {
+            parent,
+            start_lba: partition.start_lba,
+            block_len: partition.block_len,
+        }
+    }
+}
+
+impl<'a, S: BlockSink> BlockSink for PartitionSink<'a, S> {
+    type Error = PartitionSourceError<S::Error>;
+
+    fn block_size(&self) -> usize {
+        self.parent.block_size()
+    }
+
+    fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+        // Same guard as the read side, for the same reason: a
+        // `Partition` parsed from a hostile PART block can carry a
+        // saturated `start_lba` and `block_len`, and then an in-range
+        // `lba` still runs off the end of the *address space*.
+        let parent_lba = match self.start_lba.checked_add(lba) {
+            Some(l) if lba < self.block_len => l,
+            _ => {
+                return Err(PartitionSourceError::OutOfRange {
+                    lba,
+                    len: self.block_len,
+                })
+            }
+        };
+        // And the parent's own end, when it will say where that is. The
+        // parent is not obliged to notice — one whose bounds check is a
+        // multiply away from wrapping would write the *wrong block* —
+        // and a wrong write is not recoverable the way a wrong read is,
+        // so the adapter refuses rather than forwards.
+        if let Some(block_count) = self.parent.block_count() {
+            if parent_lba >= block_count {
+                return Err(PartitionSourceError::BeyondParent {
+                    lba,
+                    parent_lba,
+                    block_count,
+                });
+            }
+        }
+        self.parent
+            .write_block(parent_lba, buf)
             .map_err(PartitionSourceError::Parent)
     }
 
@@ -7498,6 +7612,85 @@ mod tests {
             ps.read_block(256, &mut buf),
             Err(PartitionSourceError::OutOfRange { lba: 256, len: 256 })
         ));
+    }
+
+    /// The write-side mirror of `partition_source_offsets_and_bounds`:
+    /// the same translation, checked by where the bytes land on the
+    /// parent rather than by what comes back.
+    #[test]
+    fn partition_sink_offsets_and_bounds() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = rdb.partitions[0].clone();
+        let mut sink = PartitionSink::new(&mut disk, &p);
+        assert_eq!(sink.block_count(), Some(256));
+        assert_eq!(BlockSink::block_size(&sink), 512);
+        let buf = vec![0xCDu8; 512];
+        sink.write_block(1, &buf).unwrap();
+        // Partition block 1 is disk block 65, and nothing either side
+        // of it moved.
+        assert_eq!(disk.data[65 * 512..66 * 512], buf[..]);
+        assert_eq!(disk.data[64 * 512], 0);
+        assert_eq!(disk.data[66 * 512], 0);
+    }
+
+    /// A write past the partition's end is refused without the parent
+    /// ever seeing it — the block exists on the disk, which is exactly
+    /// why the parent cannot be trusted to catch this one.
+    #[test]
+    fn partition_sink_refuses_a_write_past_the_partition() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = rdb.partitions[0].clone();
+        let before = disk.data.clone();
+        let mut sink = PartitionSink::new(&mut disk, &p);
+        let buf = vec![0xCDu8; 512];
+        assert!(matches!(
+            sink.write_block(256, &buf),
+            Err(PartitionSourceError::OutOfRange { lba: 256, len: 256 })
+        ));
+        assert_eq!(disk.data, before, "the refused write touched the parent");
+    }
+
+    /// The second tier: a hostile `start_lba` off the image puts an
+    /// in-partition block past the end of the disk. Refused on the
+    /// parent's own block count, before the parent sees the LBA.
+    #[test]
+    fn partition_sink_refuses_a_block_past_the_parent() {
+        let mut disk = MemDisk::new(wrapping_start_lba_image());
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = rdb.partitions[0].clone();
+        let before = disk.data.clone();
+        let mut sink = PartitionSink::new(&mut disk, &p);
+        let buf = vec![0xCDu8; 512];
+        assert!(matches!(
+            sink.write_block(1, &buf),
+            Err(PartitionSourceError::BeyondParent { .. })
+        ));
+        assert_eq!(disk.data, before, "the refused write touched the parent");
+    }
+
+    /// Both halves of the seam over one partition of one disk: what
+    /// `PartitionSink` writes at a partition-relative LBA is what
+    /// `PartitionSource` reads back at the same LBA.
+    #[test]
+    fn partition_sink_and_source_round_trip() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = rdb.partitions[0].clone();
+
+        let mut written = vec![0u8; 512];
+        for (i, b) in written.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        for lba in [0u64, 1, 255] {
+            let mut sink = PartitionSink::new(&mut disk, &p);
+            sink.write_block(lba, &written).unwrap();
+            let mut source = PartitionSource::new(&mut disk, &p);
+            let mut read = vec![0u8; 512];
+            source.read_block(lba, &mut read).unwrap();
+            assert_eq!(read, written, "round trip at partition block {lba}");
+        }
     }
 
     /// The full envec: TableSize 20 means longwords 1..=20 follow, so

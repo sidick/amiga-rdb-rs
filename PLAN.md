@@ -410,29 +410,50 @@ want.
 
 The risky stage, gated on the differential suite existing first.
 
-**Complete**, bar `PartitionSink` — the one item below still unticked,
-and unticked *deliberately*: it is an API with no caller, and building it
-now would be guessing. Everything else here has landed: the whole
-`RdbEditor` operation set, the four properties the AmiPart survey turned
-up (preserve unmodelled fields, zero what we stop using, free-block
-management, never-touch), refuse-over-overlap in both halves, both area
-levers plus `set_geometry_cylinders`, the crash-shape ordering with its
-exhaustive truncation tests, and AmiPart running as a second
-differential oracle.
+**Complete**, bar `PartitionSink` — the one item below, now being
+built. Everything else here has landed: the whole `RdbEditor` operation
+set, the four properties the AmiPart survey turned up (preserve
+unmodelled fields, zero what we stop using, free-block management,
+never-touch), refuse-over-overlap in both halves, both area levers plus
+`set_geometry_cylinders`, the crash-shape ordering with its exhaustive
+truncation tests, and AmiPart running as a second differential oracle.
 
-- [ ] **`PartitionSink`** — the writing counterpart to
-      `PartitionSource`, deferred here on purpose rather than built
-      alongside `BlockSink` in milestone 2. Nothing in milestone 2 needs
-      it: creating an RDB writes only inside `rdb_RDBBlocksLo..=Hi`, and
-      a partition's *contents* are out of scope by the crate's founding
-      non-goal — one filesystem family per crate, stopping at the
-      partition boundary. The consumer that wants it is a filesystem
-      crate formatting into a partition, and that consumer's needs
-      (does it want the bounds check on every write? a flush? a
-      grow-into-free-space story?) are unknown until one exists.
-      Building it now would be guessing at an API with no caller,
-      which is exactly the mistake `rdb_BlockBytes` taught us to avoid
-      in the other direction. Revisit when a real consumer asks.
+- [x] **`PartitionSink`** — the writing counterpart to
+      `PartitionSource`, deferred on purpose rather than built alongside
+      `BlockSink` in milestone 2, on the reasoning that a filesystem
+      crate's actual needs (bounds check on every write? a flush? a
+      grow-into-free-space story?) were unknown until one existed, and
+      guessing would repeat the mistake `rdb_BlockBytes` taught us to
+      avoid in the other direction.
+
+      **The consumer arrived.** `amiga-ffs-rs`'s `PLAN.md` (2026-09-09/10)
+      confirmed against this crate's published 0.4.0 source — not
+      assumed — that `PartitionSource` was read-only, and named the
+      shape its `convert` command needs: a partition-scoped write
+      window for formatting a fresh volume into an existing partition,
+      bounds-checked the same way `PartitionSource::read_block` is
+      (a checked-add against the window, a second bound against the
+      parent's own block count so a hostile `PART` block cannot forward
+      a write past where it claims to end).
+
+      `PartitionSink` mirrors `PartitionSource` exactly: same
+      constructor shape (`new(parent, partition)`), `write_block` with
+      the identical two-tier bound, `block_size`/`block_count` passed
+      through unchanged (never `de_SizeBlock` — the same device-block/
+      filesystem-block separation `PartitionSource` already documents).
+      No flush method: this crate does not buffer, so there is nothing
+      to flush — a caller wanting durability flushes the underlying
+      sink itself, the same contract `BlockSink::write_block` already
+      documents. **Grow-into-free-space is out of scope**, decided
+      explicitly rather than by omission: `PartitionSink` has no view of
+      sibling partitions or the RDB's free space (it only ever sees one
+      `Partition`'s extent), so "grow the destination" is a question for
+      `RdbEditor::resize_partition` before a `PartitionSink` is ever
+      constructed, not something the sink could answer with the
+      information it has. Both directions can coexist on one partition
+      exactly as `BlockSource`/`BlockSink` do: `S: BlockSource +
+      BlockSink` composes with `PartitionSource`/`PartitionSink` the
+      same way.
 - [x] **AmiPart survey first**: before designing the edit API, read
       AmiPart (MIT, so readable closely — unlike xdftool, which stays a
       run-only GPL oracle) to enumerate the operation set and its edge
