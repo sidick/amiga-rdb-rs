@@ -522,18 +522,17 @@ truncation tests, and AmiPart running as a second differential oracle.
       filesystem image's own header — the "filesystem contents"
       non-goal by name) are out of scope by design already, not gaps.
 
-      **Two real gaps, unscheduled — recorded rather than guessed at,
-      on `PartitionSink`'s own precedent**: `fsflags` has no
-      equivalent (patching an existing filesystem's device-node fields
-      — priority, stack size, and the rest `fshd_patch` names — needs
-      `replace_filesystem` today, which means re-supplying the whole
-      driver binary just to change one flag); `free` has no equivalent
-      (no way to ask "which cylinder ranges are unclaimed" — a caller
-      computes it by hand from `partitions()` and the geometry today).
-      Both are cheap, and both wait for a real caller to confirm the
-      shape rather than being built now. `remap` (heads/sectors changed
-      after the fact) and `adjust auto` (expand-to-fill-medium) are
-      niche enough to defer past even that.
+      **Two real gaps, filed rather than guessed at, on
+      `PartitionSink`'s own precedent**: no `fsflags` equivalent
+      ([#4](https://github.com/sidick/amiga-rdb-rs/issues/4) — patching
+      an existing filesystem's device-node fields needs
+      `replace_filesystem` today, binary and all) and no `free`
+      equivalent ([#5](https://github.com/sidick/amiga-rdb-rs/issues/5)
+      — no way to ask which cylinder ranges are unclaimed). `remap` and
+      `adjust auto` are niche enough to defer past even those
+      ([#6](https://github.com/sidick/amiga-rdb-rs/issues/6)). Pending
+      work now lives in GitHub issues, not as open items in this
+      file — PLAN.md stays the record of what landed and why.
 - [x] **AmiPart survey first**: before designing the edit API, read
       AmiPart (MIT, so readable closely — unlike xdftool, which stays a
       run-only GPL oracle) to enumerate the operation set and its edge
@@ -1192,11 +1191,12 @@ truncation tests, and AmiPart running as a second differential oracle.
       warnings`), MSRV. One workflow, `.github/workflows/ci.yml`, jobs
       parallel. The **differential** job landed with milestone 2's
       round-trip item: `amitools==0.8.1` pinned via `pip install
-      --user`, `AMIGA_RDB_DIFFERENTIAL=1 cargo test rdbtool`. What
-      remains a `TODO` in the yaml is the boot-level differential — a
-      redistributable AROS fixture (amibake's `aros68k` recipe builds
-      one from nothing) mounted by a 3.1-era ROM, which is the one
-      question the block-level oracle cannot answer.
+      --user`, `AMIGA_RDB_DIFFERENTIAL=1 cargo test rdbtool`. The
+      boot-level differential — a real 3.1-era ROM mounting a
+      redistributable AROS `DOS\7` fixture, the one question the
+      block-level oracle cannot answer — is filed as
+      [#7](https://github.com/sidick/amiga-rdb-rs/issues/7) rather than
+      a bare `TODO` in the yaml.
 - [x] **MSRV**: 1.63, in `rust-version` and tested by its own CI job
       (test + build only — clippy/rustfmt run on stable, where their
       opinions are current). Verified by actually running the suite on
@@ -1204,9 +1204,10 @@ truncation tests, and AmiPart running as a second differential oracle.
       the floor is deliberately conservative because retro tooling is
       packaged by distros that move slowly. *(README mention still
       pending.)*
-- [ ] **crates.io**: publish at the end of milestone 1 (read-complete
-      is a coherent 0.2); semver honestly from then on — the API is
-      allowed to break pre-1.0 but not silently.
+- [x] **crates.io**: published at the end of milestone 1 as 0.2.0,
+      read-complete being a coherent first release; semver honestly
+      since — 0.3.0 for milestone 2+3, 0.4.0 for the review-fix API
+      breaks, all pre-1.0 and none silent.
 - [x] **Docs**: every public item documented (`#![deny(missing_docs)]`
       once the surface settles); one worked example in the crate docs
       showing disk → partitions → `PartitionSource` → filesystem crate.

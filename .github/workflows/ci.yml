@@ -153,9 +153,12 @@ jobs:
         env:
           AMIGA_RDB_DIFFERENTIAL: "1"
 
-  # TODO: the remaining differential is the boot-level one — an AROS `DOS\7`
+  # The remaining differential is the boot-level one — an AROS `DOS\7`
   # fixture with its filesystem in the RDB, mounted by a 3.1-era ROM, once
   # amibake's `aros68k` recipe can build a redistributable image here. The
   # block-level oracle above covers RDSK/PART/FSHD/LSEG in both directions;
-  # what it cannot say is whether a real ROM boots the result. Milestone 3
-  # adds AmiPart (MIT) as a second oracle for the mutation path.
+  # what it cannot say is whether a real ROM boots the result. Tracked as
+  # https://github.com/sidick/amiga-rdb-rs/issues/7, not a bare TODO.
+  # AmiPart (MIT) already runs locally as a second oracle for the
+  # mutation path (see PLAN.md); it is not in CI, having no package to
+  # install the way amitools does.
