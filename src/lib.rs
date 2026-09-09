@@ -234,6 +234,14 @@ pub trait BlockSink {
     /// [`BlockSource::block_count`]. A sink that knows its size lets a
     /// writer refuse a layout that runs off the end *before* writing
     /// the first block rather than halfway through.
+    ///
+    /// Unlike [`block_size`](Self::block_size), this carries no
+    /// documented equality with [`BlockSource::block_count`] on a type
+    /// that is both: a sink's writable capacity and a source's readable
+    /// one are allowed to differ (a backing store that can grow to
+    /// accept a write past what has been read so far, for instance).
+    /// Code bounding a *write* should ask this trait, not
+    /// [`BlockSource::block_count`].
     fn block_count(&self) -> Option<u64> {
         None
     }
@@ -6826,6 +6834,92 @@ impl<'a, S: BlockSource> BlockSource for PartitionSource<'a, S> {
     }
 }
 
+/// The other half of the same precedent [`SeekBlockSource`] already
+/// sets in this crate: one struct gains a second capability's
+/// `impl` when its inner type supports it, rather than a second struct
+/// or a third "does everything" type appearing beside it. Here the inner
+/// type is the *parent* `S`, not a stream — `PartitionSource` becomes a
+/// [`BlockSink`] too exactly when `S` is both a [`BlockSource`] and a
+/// [`BlockSink`].
+///
+/// `PartitionSource`, not [`PartitionSink`], is the one that gains the
+/// second `impl`: it is the primary of the pair (built first, carries
+/// the composition-seam doc comment), so a caller constructs exactly one
+/// `PartitionSource` and gets a type usable as a `BlockSource`, a
+/// `BlockSink`, or — for a consumer crate with a marker trait like
+/// `amiga-ffs-rs`'s `BlockMedium: BlockSource + BlockSink<Error = <Self
+/// as BlockSource>::Error>` and a blanket impl of it — a single
+/// combined-capability object, without a second `PartitionSink` to juggle
+/// alongside it or touching `PartitionSink` itself.
+///
+/// The `S: BlockSink<Error = <S as BlockSource>::Error>` bound matters
+/// for the same reason: without pinning the two `Error` types together,
+/// a parent whose read and write errors differ would leave
+/// `PartitionSource`'s own `BlockSource::Error` and `BlockSink::Error`
+/// disagreeing too, and a `BlockMedium`-style blanket impl (which
+/// requires them to match exactly) would never fire.
+///
+/// The bound check below is not new logic — it is
+/// [`PartitionSink::write_block`]'s existing two-tier check, copied
+/// verbatim, and [`PartitionSourceError`] already covers both failure
+/// modes, so no new error variant was needed for this direction either.
+impl<'a, S> BlockSink for PartitionSource<'a, S>
+where
+    S: BlockSource + BlockSink<Error = <S as BlockSource>::Error>,
+{
+    type Error = PartitionSourceError<<S as BlockSource>::Error>;
+
+    fn block_size(&self) -> usize {
+        // `S` is both `BlockSource` and `BlockSink`, so the method name
+        // alone is ambiguous — pick the same trait `PartitionSource`'s
+        // own `BlockSource` impl delegates through.
+        BlockSource::block_size(self.parent)
+    }
+
+    fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), Self::Error> {
+        // Same two-tier guard as `PartitionSink::write_block`: a
+        // `Partition` parsed from a hostile PART block can carry a
+        // saturated `start_lba` and `block_len`, and then an in-range
+        // `lba` still runs off the end of the *address space*.
+        let parent_lba = match self.start_lba.checked_add(lba) {
+            Some(l) if lba < self.block_len => l,
+            _ => {
+                return Err(PartitionSourceError::OutOfRange {
+                    lba,
+                    len: self.block_len,
+                })
+            }
+        };
+        // And the parent's own end, when it will say where that is —
+        // asked of `BlockSink`, not `BlockSource`: this is a write
+        // bound, and unlike `block_size` (whose two traits are
+        // documented to agree), `block_count` carries no such contract,
+        // so a parent is free to answer differently for reading and
+        // writing (a source that has not grown into a sink's larger
+        // backing store yet, say). The parent is not obliged to notice
+        // this on its own — one whose bounds check is a multiply away
+        // from wrapping would write the *wrong block* — and a wrong
+        // write is not recoverable the way a wrong read is, so the
+        // adapter refuses rather than forwards.
+        if let Some(block_count) = BlockSink::block_count(self.parent) {
+            if parent_lba >= block_count {
+                return Err(PartitionSourceError::BeyondParent {
+                    lba,
+                    parent_lba,
+                    block_count,
+                });
+            }
+        }
+        self.parent
+            .write_block(parent_lba, buf)
+            .map_err(PartitionSourceError::Parent)
+    }
+
+    fn block_count(&self) -> Option<u64> {
+        Some(self.block_len)
+    }
+}
+
 /// A [`BlockSink`] view of one partition: the write-side mirror of
 /// [`PartitionSource`], and the other half of the composition seam with
 /// filesystem crates — they format into one of these, never the disk.
@@ -7603,8 +7697,8 @@ mod tests {
         let rdb = Rdb::parse(&mut disk).unwrap();
         let p = rdb.partitions[0].clone();
         let mut ps = PartitionSource::new(&mut disk, &p);
-        assert_eq!(ps.block_count(), Some(256));
-        assert_eq!(ps.block_size(), 512);
+        assert_eq!(BlockSource::block_count(&ps), Some(256));
+        assert_eq!(BlockSource::block_size(&ps), 512);
         let mut buf = [0u8; 512];
         ps.read_block(0, &mut buf).unwrap();
         assert_eq!(buf[0], 0xAB);
@@ -7691,6 +7785,98 @@ mod tests {
             source.read_block(lba, &mut read).unwrap();
             assert_eq!(read, written, "round trip at partition block {lba}");
         }
+    }
+
+    /// `PartitionSource` as a `BlockSink`: the write lands at the correct
+    /// parent offset, exactly as `partition_sink_offsets_and_bounds`
+    /// proves for `PartitionSink` — but through the read-side struct.
+    #[test]
+    fn partition_source_write_block_offsets_and_bounds() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = rdb.partitions[0].clone();
+        let mut source = PartitionSource::new(&mut disk, &p);
+        assert_eq!(BlockSink::block_size(&source), 512);
+        let buf = vec![0xCDu8; 512];
+        source.write_block(1, &buf).unwrap();
+        // Partition block 1 is disk block 65, and nothing either side
+        // of it moved.
+        assert_eq!(disk.data[65 * 512..66 * 512], buf[..]);
+        assert_eq!(disk.data[64 * 512], 0);
+        assert_eq!(disk.data[66 * 512], 0);
+    }
+
+    /// A write through `PartitionSource::write_block` past the
+    /// partition's end is refused without the parent ever seeing it —
+    /// mirrors `partition_sink_refuses_a_write_past_the_partition`.
+    #[test]
+    fn partition_source_write_block_refuses_a_write_past_the_partition() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = rdb.partitions[0].clone();
+        let before = disk.data.clone();
+        let mut source = PartitionSource::new(&mut disk, &p);
+        let buf = vec![0xCDu8; 512];
+        assert!(matches!(
+            source.write_block(256, &buf),
+            Err(PartitionSourceError::OutOfRange { lba: 256, len: 256 })
+        ));
+        assert_eq!(disk.data, before, "the refused write touched the parent");
+    }
+
+    /// The second tier on `PartitionSource::write_block`: a hostile
+    /// `start_lba` puts an in-partition block past the end of the disk.
+    /// Mirrors `partition_sink_refuses_a_block_past_the_parent`.
+    #[test]
+    fn partition_source_write_block_refuses_a_block_past_the_parent() {
+        let mut disk = MemDisk::new(wrapping_start_lba_image());
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = rdb.partitions[0].clone();
+        let before = disk.data.clone();
+        let mut source = PartitionSource::new(&mut disk, &p);
+        let buf = vec![0xCDu8; 512];
+        assert!(matches!(
+            source.write_block(1, &buf),
+            Err(PartitionSourceError::BeyondParent { .. })
+        ));
+        assert_eq!(disk.data, before, "the refused write touched the parent");
+    }
+
+    /// The point of the whole change: one `PartitionSource` instance
+    /// used as both a `BlockSink` and a `BlockSource`, unlike
+    /// `partition_sink_and_source_round_trip`'s two objects over the
+    /// same partition.
+    #[test]
+    fn partition_source_write_then_read_back_on_the_same_instance() {
+        let mut disk = MemDisk::new(one_partition_image(2));
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        let p = rdb.partitions[0].clone();
+
+        let mut written = vec![0u8; 512];
+        for (i, b) in written.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let mut source = PartitionSource::new(&mut disk, &p);
+        source.write_block(3, &written).unwrap();
+        let mut read = vec![0u8; 512];
+        source.read_block(3, &mut read).unwrap();
+        assert_eq!(read, written);
+    }
+
+    /// The closest local proof this crate can offer that the
+    /// `Error =` bound actually closes the gap `amiga-ffs-rs` hit: a
+    /// small stand-in for its `BlockMedium` marker trait, with the same
+    /// blanket impl shape, and a check that `PartitionSource<'_,
+    /// MemDisk>` satisfies it — a single object usable through a bound
+    /// that requires both traits with matching errors.
+    trait LocalBlockMedium: BlockSource + BlockSink<Error = <Self as BlockSource>::Error> {}
+    impl<T: BlockSource + BlockSink<Error = <T as BlockSource>::Error>> LocalBlockMedium for T {}
+
+    fn assert_medium<T: LocalBlockMedium>() {}
+
+    #[test]
+    fn partition_source_over_a_matching_error_parent_satisfies_a_block_medium_bound() {
+        assert_medium::<PartitionSource<'_, MemDisk>>();
     }
 
     /// The full envec: TableSize 20 means longwords 1..=20 follow, so
@@ -8060,8 +8246,8 @@ mod tests {
         // device's block size for both, not de_SizeBlock's.
         for (p, blocks) in [(&a, 96u64), (&b, 160)] {
             let ps = PartitionSource::new(&mut disk, p);
-            assert_eq!(ps.block_size(), 512);
-            assert_eq!(ps.block_count(), Some(blocks));
+            assert_eq!(BlockSource::block_size(&ps), 512);
+            assert_eq!(BlockSource::block_count(&ps), Some(blocks));
         }
 
         // A legal layout, mixed block sizes and all.

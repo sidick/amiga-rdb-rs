@@ -454,6 +454,86 @@ truncation tests, and AmiPart running as a second differential oracle.
       exactly as `BlockSource`/`BlockSink` do: `S: BlockSource +
       BlockSink` composes with `PartitionSource`/`PartitionSink` the
       same way.
+- [x] **`PartitionSource` gains `BlockSink` when the parent can take
+      it** — the second half of the same request, confirmed the same
+      way `PartitionSink` itself was: `amiga-ffs-rs` tried to build
+      `convert` for real against what exists today, not guessed at it.
+      `format()` takes `S: BlockSink` alone and `PartitionSink` already
+      satisfies it, but `Populator::new`/`Mutator::open` — filling a
+      formatted volume, which `convert` needs right after `format()` —
+      take `S: BlockMedium` (`amiga-ffs-rs`'s own marker trait, one
+      type satisfying both `BlockSource` and `BlockSink` with matching
+      `Error`). `PartitionSource` and `PartitionSink` are two structs,
+      each holding its own exclusive borrow of the parent; neither
+      implements the other's trait, and Rust's aliasing rules mean you
+      cannot hold both on one partition at once to glue them together
+      at the call site. There is no way to construct a single object
+      windowed onto one partition that satisfies `BlockMedium` today.
+
+      **Shape: this crate's own precedent, not a new one.**
+      `SeekBlockSource<T: Read + Seek>` solves the identical problem
+      for a plain file — one struct, a second `impl` gated on the
+      inner type's extra capability (`impl<T: Read + Write + Seek>
+      BlockSink for SeekBlockSource<T>`), so the block size can never
+      differ between a read view and a write view of the same file.
+      `PartitionSource` gets the same treatment rather than
+      `PartitionSink` gaining `BlockSource` or a third
+      `PartitionMedium` type existing beside them: it is the "primary"
+      of the pair (built first, holds the composition-seam doc
+      comment), and it means a caller constructs exactly one
+      `PartitionSource` and gets a type usable everywhere a
+      `BlockSource`, a `BlockSink`, *or* (via `amiga-ffs-rs`'s blanket
+      impl) a `BlockMedium` is asked for — not two objects to juggle.
+      `PartitionSink` itself is untouched.
+
+      The new impl is `impl<'a, S> BlockSink for PartitionSource<'a, S>
+      where S: BlockSource + BlockSink<Error = <S as
+      BlockSource>::Error>` — the `Error =` constraint matters: without
+      it, a parent whose read and write errors are different types
+      would make `PartitionSource`'s `BlockSource::Error` and
+      `BlockSink::Error` disagree, and `amiga-ffs-rs`'s `BlockMedium`
+      blanket impl (which requires exactly matching `Error`s) would
+      never fire. The write-side bound-check logic is not new logic —
+      it is `PartitionSink::write_block`'s existing two-tier check
+      (checked-add against the window, then against the parent's own
+      `block_count`), and `PartitionSourceError` already covers both
+      directions' failure cases, so no new error variant is needed.
+
+      Same exclusions as `PartitionSink`'s, same reasoning: no flush
+      (this crate doesn't buffer), no grow-into-free-space (one
+      `Partition`'s extent only, no view of siblings or free space —
+      `RdbEditor::resize_partition`'s question, decided first),
+      `block_size`/`block_count` passed through unchanged.
+
+      **Surveyed against `rdbtool`'s own command set** (2026-09-09),
+      the same discipline as the AmiPart survey below, checking a real
+      tool's actual command reference rather than guessing at parity.
+      Most of it is already covered — `create`/`open`/`init` by
+      `RdbBuilder`/`Rdb::parse`, `add`/`change`/`delete` by
+      `add_partition`/the `set_*` edits/`remove_partition`,
+      `fsadd`/`fsget`/`fsdelete` by
+      `add_filesystem`/`load_filesystem`/`remove_filesystem`, `adjust
+      lo=/hi=` by `set_lo_cylinder`/`expand_rdb_area`, and
+      `export`/`import` by `PartitionSource`/`PartitionSink` directly
+      (bounds-checked better than `rdbtool`'s own). `resize` (the whole
+      image file), `map`/`json`/`show`/`list` (presentation — a CLI's
+      job, not this library's; `rdbinfo` is explicitly an example) and
+      `addimg` (deriving a partition's size and dostype by sniffing a
+      filesystem image's own header — the "filesystem contents"
+      non-goal by name) are out of scope by design already, not gaps.
+
+      **Two real gaps, unscheduled — recorded rather than guessed at,
+      on `PartitionSink`'s own precedent**: `fsflags` has no
+      equivalent (patching an existing filesystem's device-node fields
+      — priority, stack size, and the rest `fshd_patch` names — needs
+      `replace_filesystem` today, which means re-supplying the whole
+      driver binary just to change one flag); `free` has no equivalent
+      (no way to ask "which cylinder ranges are unclaimed" — a caller
+      computes it by hand from `partitions()` and the geometry today).
+      Both are cheap, and both wait for a real caller to confirm the
+      shape rather than being built now. `remap` (heads/sectors changed
+      after the fact) and `adjust auto` (expand-to-fill-medium) are
+      niche enough to defer past even that.
 - [x] **AmiPart survey first**: before designing the edit API, read
       AmiPart (MIT, so readable closely — unlike xdftool, which stays a
       run-only GPL oracle) to enumerate the operation set and its edge
