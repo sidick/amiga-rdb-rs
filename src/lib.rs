@@ -1109,6 +1109,19 @@ pub struct Partition {
     pub low_cyl: u32,
     /// `de_HighCyl` — its last cylinder, *inclusive*.
     pub high_cyl: u32,
+    /// `de_Reserved` — blocks held back at the start of the partition
+    /// for the boot block. [`RdbEditor::set_reserved`] is the writer
+    /// side; before this field existed a reader had to index
+    /// [`envec_raw`](Self::envec_raw) at the private offset 6 to get it
+    /// back.
+    pub reserved: u32,
+    /// `de_PreAlloc` — blocks held back at the end of the partition.
+    /// [`RdbEditor::set_pre_alloc`] is the writer side; envec offset 7.
+    pub pre_alloc: u32,
+    /// `de_Interleave` — the filesystem's own interleave, not the
+    /// drive's `rdb_Interleave` (see [`Rdb`]'s field of the same name).
+    /// [`RdbEditor::set_interleave`] is the writer side; envec offset 8.
+    pub interleave: u32,
     /// `de_NumBuffers` — a mount parameter the handler needs, saying
     /// nothing about the disk itself.
     pub num_buffers: u32,
@@ -2351,6 +2364,9 @@ fn parse_part(buf: &[u8], lba: u64) -> Partition {
         cylinder_blocks,
         low_cyl,
         high_cyl,
+        reserved: field(de::RESERVED),
+        pre_alloc: field(de::PRE_ALLOC),
+        interleave: field(de::INTERLEAVE),
         num_buffers: field(de::NUM_BUFFERS),
         buf_mem_type: field(de::BUF_MEM_TYPE),
         size_block_longs: field(de::SIZE_BLOCK),
@@ -10624,10 +10640,18 @@ mod tests {
         assert_eq!(p.baud, Some(9600));
         assert_eq!(p.control, Some(0x0000_BEEF));
         assert_eq!(p.boot_blocks, Some(2));
+        assert_eq!(p.reserved, 4);
+        assert_eq!(p.pre_alloc, 6);
+        assert_eq!(p.interleave, 3);
         assert_eq!(p.envec_raw[de::RESERVED], 4);
         assert_eq!(p.envec_raw[de::PRE_ALLOC], 6);
         assert_eq!(p.envec_raw[de::INTERLEAVE], 3);
         assert_eq!(p.envec_raw.len(), 20); // de_TableSize 19 now
+                                           // The named accessors agree with the raw envec at the documented
+                                           // offsets (6, 7, 8) — the whole point of exposing them.
+        assert_eq!(p.reserved, p.envec_raw[de::RESERVED]);
+        assert_eq!(p.pre_alloc, p.envec_raw[de::PRE_ALLOC]);
+        assert_eq!(p.interleave, p.envec_raw[de::INTERLEAVE]);
         assert!(rdb.validate().is_empty());
         // The editor's own model said all of this before the commit did.
         assert_eq!(rdb.partitions, editor.partitions());
