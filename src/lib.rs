@@ -1951,20 +1951,30 @@ impl Rdb {
 
     /// The amitools-compatible alternative to
     /// [`load_filesystem`](Self::load_filesystem): trims the returned
-    /// binary to the exact byte length the chain's own `SummedLongs`
-    /// fields encode, rather than padding it out to a whole block.
+    /// binary to the byte length the chain's own `SummedLongs` fields
+    /// encode, rather than padding it out to a whole block.
     ///
     /// `load_filesystem`'s length has block granularity because `LSEG`
     /// records no explicit byte count anywhere — see its doc comment.
-    /// But each block's `SummedLongs` (longword count actually summed:
-    /// five header longwords plus the payload's whole longwords, floored
-    /// — see `lseg_summed_longs_match_rdbtool_0_8_1`) *does* encode the
-    /// exact length on the final block of a chain whose driver did not
-    /// fill it, and amitools' `rdbtool fsget` recovers a driver's byte
-    /// length exactly this way. This method does the same: every block
-    /// but the last contributes its whole payload, and the last
-    /// contributes only `(SummedLongs - 5) * 4` bytes of it, clamped to
-    /// the block's payload capacity.
+    /// Each block's `SummedLongs` (longword count actually summed: five
+    /// header longwords plus the payload's whole longwords, *floored* —
+    /// see `lseg_summed_longs_match_rdbtool_0_8_1`) recovers the final
+    /// block's length to the nearest longword, and amitools' `rdbtool
+    /// fsget` recovers a driver's byte length exactly this way. This
+    /// method does the same: every block but the last contributes its
+    /// whole payload, and the last contributes only `(SummedLongs - 5) *
+    /// 4` bytes of it, clamped to the block's payload capacity.
+    ///
+    /// **This is byte-exact only when the original driver's length was
+    /// itself a multiple of four.** `SummedLongs` has no way to record a
+    /// trailing one to three bytes — [`fill_lseg_fields`]'s doc comment
+    /// is the other side of the same fact — so a driver of, say, 493
+    /// bytes round-trips as 492: the last byte was never recorded by
+    /// *any* writer that fills `SummedLongs` this way, this crate's own
+    /// included, and no reader can recover what the format never kept.
+    /// `load_filesystem` (block-granular, never lossy) is the method to
+    /// reach for when a driver's exact length matters and it might not
+    /// be a multiple of four.
     ///
     /// Only the *last* block's `SummedLongs` is trusted for a length —
     /// an earlier block declaring fewer longwords than a full payload is
@@ -9952,6 +9962,40 @@ mod tests {
             rdb.lseg_blocks(f, &mut disk).unwrap().len(),
             layout.filesystems[0].lseg_block_count as usize
         );
+    }
+
+    /// The documented limit of [`Rdb::load_filesystem_exact`]: a driver
+    /// whose length is not a multiple of four loses its trailing one to
+    /// three bytes, because `SummedLongs` never recorded them —
+    /// `fill_lseg_fields` floors `data.len() / 4` on write, so no reader
+    /// can recover what the format never kept. `load_filesystem` (block
+    /// granular) still has every byte.
+    #[test]
+    fn load_filesystem_exact_loses_a_driver_length_not_a_multiple_of_four() {
+        // 1001 bytes over a 492-byte payload is three blocks, the last
+        // holding 1001 - 2 * 492 = 17 real bytes — SummedLongs floors
+        // that to 4 longwords (16 bytes), one short.
+        let driver = fake_driver(1001);
+        let (mut disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_size(4 * 1024 * 1024).dos_type(0x444F_5307))
+                .filesystem(FileSystemSpec::new(0x444F_5307, driver.clone())),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        let f = &rdb.filesystems[0];
+
+        let padded = rdb.load_filesystem(f, &mut disk).unwrap();
+        assert_eq!(&padded[..driver.len()], &driver[..]);
+
+        let exact = rdb.load_filesystem_exact(f, &mut disk).unwrap();
+        assert_eq!(
+            exact.len(),
+            driver.len() - 1,
+            "the last byte is unrecoverable"
+        );
+        assert_eq!(exact, &driver[..driver.len() - 1]);
     }
 
     /// A driver that fills its last block exactly has nothing to trim:
