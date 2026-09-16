@@ -91,6 +91,25 @@ Everything the format can say, surfaced. Nothing here writes a byte.
       parser still *reads* them (the data is there and a recovery tool
       needs it); validation is how a consumer learns the layout is
       mutually destructive before either side scribbles on the other.
+- [x] **`Rdb::lseg_blocks` and `Rdb::load_filesystem_exact`**, added
+      after `amiga-tools`' `amirdb` CLI hit both gaps for real. `map`
+      (a block-map presentation, `tools/amirdb/src/commands/map.rs`)
+      needed a filesystem's `LSEG` chain LBAs and had no way to get them
+      except walking the chain itself, duplicating the private
+      chain-`Next` offset (16) as a local constant — `lseg_blocks`
+      reuses [`walk_chain`]'s own ID/checksum/cycle/off-disk discipline
+      (the same one `load_filesystem`/`validate_seg_lists` already go
+      through) rather than exposing that offset. `fsget` needed the
+      driver's *exact* byte length — `load_filesystem` returns it
+      padded to a whole block by design (see its doc comment), so a
+      26 340-byte driver came back as 26 568 bytes, four longwords of
+      trailing slack — and `load_filesystem_exact` is the
+      amitools-`fsget`-compatible alternative: every block but the
+      chain's last contributes its whole payload, the last only
+      `(SummedLongs - 5) * 4` bytes of it (clamped to the block's
+      capacity), matching the rule `lseg_summed_longs_match_rdbtool_0_8_1`
+      already pins. Not a breaking change to `load_filesystem` — both
+      stay, each honest about what it returns.
 
 ## Milestone 2 — create from scratch
 

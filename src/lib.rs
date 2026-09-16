@@ -1962,6 +1962,124 @@ impl Rdb {
         Ok(out)
     }
 
+    /// The amitools-compatible alternative to
+    /// [`load_filesystem`](Self::load_filesystem): trims the returned
+    /// binary to the byte length the chain's own `SummedLongs` fields
+    /// encode, rather than padding it out to a whole block.
+    ///
+    /// `load_filesystem`'s length has block granularity because `LSEG`
+    /// records no explicit byte count anywhere — see its doc comment.
+    /// Each block's `SummedLongs` (longword count actually summed: five
+    /// header longwords plus the payload's whole longwords, *floored* —
+    /// see `lseg_summed_longs_match_rdbtool_0_8_1`) recovers the final
+    /// block's length to the nearest longword, and amitools' `rdbtool
+    /// fsget` recovers a driver's byte length exactly this way. This
+    /// method does the same: every block but the last contributes its
+    /// whole payload, and the last contributes only `(SummedLongs - 5) *
+    /// 4` bytes of it, clamped to the block's payload capacity.
+    ///
+    /// **This is byte-exact only when the original driver's length was
+    /// itself a multiple of four.** `SummedLongs` has no way to record a
+    /// trailing one to three bytes — `fill_lseg_fields`'s doc comment
+    /// is the other side of the same fact — so a driver of, say, 493
+    /// bytes round-trips as 492: the last byte was never recorded by
+    /// *any* writer that fills `SummedLongs` this way, this crate's own
+    /// included, and no reader can recover what the format never kept.
+    /// `load_filesystem` (block-granular, never lossy) is the method to
+    /// reach for when a driver's exact length matters and it might not
+    /// be a multiple of four.
+    ///
+    /// Only the *last* block's `SummedLongs` is trusted for a length —
+    /// an earlier block declaring fewer longwords than a full payload is
+    /// not a length signal (a real driver always fills every block but
+    /// the last), so it is ignored, exactly as
+    /// [`validate_seg_lists`](Self::validate_seg_lists) does not treat it
+    /// as damage either. A `SummedLongs` too small even for the header
+    /// clamps to zero trailing bytes rather than underflowing the
+    /// subtraction — the same never-panic discipline `checksum_ok`
+    /// follows.
+    ///
+    /// This is not a breaking change to `load_filesystem`: both methods
+    /// stay, each honest about what it returns — one the padded
+    /// block-granular reassembly, this one the amitools-compatible exact
+    /// byte length.
+    pub fn load_filesystem_exact<S: BlockSource>(
+        &self,
+        fshd: &FileSysHeader,
+        disk: &mut S,
+    ) -> Result<Vec<u8>, RdbError<S::Error>> {
+        let block_size = disk.block_size();
+        if block_size != self.block_bytes as usize {
+            return Err(RdbError::BlockBytesMismatch {
+                block_bytes: self.block_bytes,
+                block_size,
+            });
+        }
+        let payload_len = block_size - lseg::LOAD_DATA;
+        let mut buf = alloc::vec![0u8; block_size];
+        let mut out = Vec::new();
+        let mut last_summed_longs = 0u32;
+        walk_chain(disk, fshd.seg_list_blocks, id::LSEG, &mut buf, |b, _lba| {
+            out.extend_from_slice(&b[lseg::LOAD_DATA..]);
+            last_summed_longs = be32(b, hdr::SUMMED_LONGS);
+            Ok(())
+        })?;
+        if out.is_empty() {
+            return Ok(out);
+        }
+        let payload_longs = last_summed_longs.saturating_sub(LSEG_HEADER_LONGS);
+        let exact_tail = ((payload_longs as usize) * 4).min(payload_len);
+        let trimmed_len = out.len() - payload_len + exact_tail;
+        out.truncate(trimmed_len);
+        Ok(out)
+    }
+
+    /// The chain of `LSEG` block LBAs backing one filesystem's driver,
+    /// in on-disk order.
+    ///
+    /// Lazy for the same reason [`load_filesystem`](Self::load_filesystem)
+    /// is — the chain is never held in memory after
+    /// [`parse`](Self::parse) — but a caller sometimes wants the blocks
+    /// themselves rather than the reassembled binary: presenting a
+    /// block map (which LBAs belong to which filesystem) does not need
+    /// the payload bytes at all, and walking the chain a second time by
+    /// hand to get them would duplicate the exact discipline the same
+    /// private chain walker already provides (ID, checksum, cycle,
+    /// off-disk checks) — this method reuses it rather than
+    /// re-exposing it.
+    ///
+    /// Fails only the way [`load_filesystem`](Self::load_filesystem) and
+    /// [`validate_seg_lists`](Self::validate_seg_lists) do: a broken
+    /// chain (wrong ID, bad checksum, cycle, off-disk pointer) is a
+    /// parse error here too, not a partial result — a caller wanting the
+    /// blocks despite damage should already know
+    /// [`validate_seg_lists`](Self::validate_seg_lists) reports the same
+    /// failures as issues, not this method, which does not weaken the
+    /// chain-walking guarantee to provide a "best effort" list.
+    ///
+    /// An FSHD with no chain ([`CHAIN_END`]) yields an empty `Vec`, not
+    /// an error, matching `load_filesystem`.
+    pub fn lseg_blocks<S: BlockSource>(
+        &self,
+        fshd: &FileSysHeader,
+        disk: &mut S,
+    ) -> Result<Vec<u64>, RdbError<S::Error>> {
+        let block_size = disk.block_size();
+        if block_size != self.block_bytes as usize {
+            return Err(RdbError::BlockBytesMismatch {
+                block_bytes: self.block_bytes,
+                block_size,
+            });
+        }
+        let mut buf = alloc::vec![0u8; block_size];
+        let mut lbas = Vec::new();
+        walk_chain(disk, fshd.seg_list_blocks, id::LSEG, &mut buf, |_b, lba| {
+            lbas.push(lba);
+            Ok(())
+        })?;
+        Ok(lbas)
+    }
+
     /// Check the *layout* for blocks with two owners.
     ///
     /// Separate from [`parse`](Self::parse) on purpose, and returning a
@@ -9814,6 +9932,213 @@ mod tests {
         assert_eq!(f.seg_list_blocks, CHAIN_END);
         assert_eq!(f.patch_flags & fshd_patch::SEG_LIST, 0);
         assert!(rdb.load_filesystem(f, &mut disk).unwrap().is_empty());
+    }
+
+    /// `lseg_blocks` returns exactly the chain the builder committed —
+    /// the LBAs `RdbLayout::seg_list_blocks..+lseg_block_count` names,
+    /// in on-disk order — for a driver whose last block is partial.
+    #[test]
+    fn lseg_blocks_returns_the_committed_chain() {
+        let driver = fake_driver(1000);
+        let (mut disk, layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_size(4 * 1024 * 1024).dos_type(0x444F_5307))
+                .filesystem(FileSystemSpec::new(0x444F_5307, driver)),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        let placed = &layout.filesystems[0];
+        let want: Vec<u64> = (0..placed.lseg_block_count as u64)
+            .map(|i| placed.seg_list_blocks as u64 + i)
+            .collect();
+
+        let f = &rdb.filesystems[0];
+        assert_eq!(rdb.lseg_blocks(f, &mut disk).unwrap(), want);
+    }
+
+    /// A filesystem with no binary ([`CHAIN_END`]) has no `LSEG` blocks
+    /// either — matching `load_filesystem`'s own empty-`Vec` case.
+    #[test]
+    fn lseg_blocks_is_empty_when_there_is_no_seglist() {
+        let (mut disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .filesystem(FileSystemSpec::new(0x444F_5307, Vec::new())),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        let f = &rdb.filesystems[0];
+        assert_eq!(f.seg_list_blocks, CHAIN_END);
+        assert!(rdb.lseg_blocks(f, &mut disk).unwrap().is_empty());
+    }
+
+    /// `lseg_blocks` fails exactly the way `load_filesystem` and
+    /// `validate_seg_lists` do on a broken chain — a cycle here — since
+    /// all three walk the same chain through the same `walk_chain`.
+    #[test]
+    fn lseg_blocks_chain_cycle_is_an_error_not_a_hang() {
+        let (mut img, _) = fs_image();
+        put32(
+            &mut img,
+            512,
+            LSEG_BLOCK + 1,
+            chain::NEXT,
+            LSEG_BLOCK as u32,
+        );
+        seal(&mut img, 512, LSEG_BLOCK + 1, 128);
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(
+            rdb.lseg_blocks(&rdb.filesystems[0], &mut disk).unwrap_err(),
+            RdbError::ChainCycle {
+                lba: LSEG_BLOCK as u64
+            }
+        );
+    }
+
+    /// `load_filesystem_exact` trims to the byte length the final
+    /// block's own `SummedLongs` encodes — the amitools `fsget` case —
+    /// while `load_filesystem` keeps padding it to a whole block, and
+    /// `lseg_blocks` names the same chain both walked.
+    #[test]
+    fn load_filesystem_exact_round_trips_the_original_binary() {
+        // 1000 bytes over a 492-byte payload is three blocks, the last
+        // of them holding only 1000 - 2 * 492 = 16 real bytes.
+        let driver = fake_driver(1000);
+        let (mut disk, layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_size(4 * 1024 * 1024).dos_type(0x444F_5307))
+                .filesystem(FileSystemSpec::new(0x444F_5307, driver.clone())),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        let f = &rdb.filesystems[0];
+
+        let padded = rdb.load_filesystem(f, &mut disk).unwrap();
+        assert_eq!(padded.len(), 3 * LSEG_PAYLOAD);
+        assert_eq!(&padded[..driver.len()], &driver[..]);
+
+        let exact = rdb.load_filesystem_exact(f, &mut disk).unwrap();
+        assert_eq!(exact, driver);
+
+        assert_eq!(
+            rdb.lseg_blocks(f, &mut disk).unwrap().len(),
+            layout.filesystems[0].lseg_block_count as usize
+        );
+    }
+
+    /// The documented limit of [`Rdb::load_filesystem_exact`]: a driver
+    /// whose length is not a multiple of four loses its trailing one to
+    /// three bytes, because `SummedLongs` never recorded them —
+    /// `fill_lseg_fields` floors `data.len() / 4` on write, so no reader
+    /// can recover what the format never kept. `load_filesystem` (block
+    /// granular) still has every byte.
+    #[test]
+    fn load_filesystem_exact_loses_a_driver_length_not_a_multiple_of_four() {
+        // 1001 bytes over a 492-byte payload is three blocks, the last
+        // holding 1001 - 2 * 492 = 17 real bytes — SummedLongs floors
+        // that to 4 longwords (16 bytes), one short.
+        let driver = fake_driver(1001);
+        let (mut disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_size(4 * 1024 * 1024).dos_type(0x444F_5307))
+                .filesystem(FileSystemSpec::new(0x444F_5307, driver.clone())),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        let f = &rdb.filesystems[0];
+
+        let padded = rdb.load_filesystem(f, &mut disk).unwrap();
+        assert_eq!(&padded[..driver.len()], &driver[..]);
+
+        let exact = rdb.load_filesystem_exact(f, &mut disk).unwrap();
+        assert_eq!(
+            exact.len(),
+            driver.len() - 1,
+            "the last byte is unrecoverable"
+        );
+        assert_eq!(exact, &driver[..driver.len() - 1]);
+    }
+
+    /// A driver that fills its last block exactly has nothing to trim:
+    /// `load_filesystem_exact` agrees with `load_filesystem` byte for
+    /// byte, since the last block's `SummedLongs` is the block's full
+    /// longword count either way.
+    #[test]
+    fn load_filesystem_exact_agrees_with_padded_when_nothing_fills_a_partial_block() {
+        let driver = fake_driver(2 * LSEG_PAYLOAD);
+        let (mut disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .partition(PartitionSpec::by_size(4 * 1024 * 1024).dos_type(0x444F_5307))
+                .filesystem(FileSystemSpec::new(0x444F_5307, driver.clone())),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        let f = &rdb.filesystems[0];
+        let padded = rdb.load_filesystem(f, &mut disk).unwrap();
+        let exact = rdb.load_filesystem_exact(f, &mut disk).unwrap();
+        assert_eq!(exact, padded);
+        assert_eq!(exact, driver);
+    }
+
+    /// A filesystem with no binary at all round-trips to an empty `Vec`
+    /// through the exact loader too.
+    #[test]
+    fn load_filesystem_exact_is_empty_when_there_is_no_seglist() {
+        let (mut disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 512)
+                .unwrap()
+                .filesystem(FileSystemSpec::new(0x444F_5307, Vec::new())),
+            TEN_MIB_BLOCKS,
+            512,
+        );
+        let f = &rdb.filesystems[0];
+        assert!(rdb.load_filesystem_exact(f, &mut disk).unwrap().is_empty());
+    }
+
+    /// 4 KB device blocks: `load_filesystem_exact` trims against the
+    /// same `block_size - 20` payload and `SummedLongs` rule there too.
+    #[test]
+    fn load_filesystem_exact_at_4k_blocks() {
+        let driver = fake_driver(9000);
+        let (mut disk, _layout, rdb) = build_on(
+            RdbBuilder::for_size(TEN_MIB, 4096)
+                .unwrap()
+                .partition(PartitionSpec::by_size(4 * 1024 * 1024).dos_type(0x444F_5307))
+                .filesystem(FileSystemSpec::new(0x444F_5307, driver.clone())),
+            (TEN_MIB / 4096) as usize,
+            4096,
+        );
+        let f = &rdb.filesystems[0];
+        assert_eq!(rdb.load_filesystem_exact(f, &mut disk).unwrap(), driver);
+    }
+
+    /// `load_filesystem_exact` fails exactly the way `load_filesystem`
+    /// does on a broken chain.
+    #[test]
+    fn load_filesystem_exact_chain_cycle_is_an_error_not_a_hang() {
+        let (mut img, _) = fs_image();
+        put32(
+            &mut img,
+            512,
+            LSEG_BLOCK + 1,
+            chain::NEXT,
+            LSEG_BLOCK as u32,
+        );
+        seal(&mut img, 512, LSEG_BLOCK + 1, 128);
+        let mut disk = MemDisk::new(img);
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert_eq!(
+            rdb.load_filesystem_exact(&rdb.filesystems[0], &mut disk)
+                .unwrap_err(),
+            RdbError::ChainCycle {
+                lba: LSEG_BLOCK as u64
+            }
+        );
     }
 
     /// 4 KB device blocks: the payload per `LSEG` block is `block_size -
