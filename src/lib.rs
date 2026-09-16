@@ -4318,6 +4318,22 @@ pub enum EditError {
         /// `start_lba` and `block_len` would both have to divide evenly.
         cylinder_blocks: u64,
     },
+    /// [`RdbEditor::remap_geometry`]'s new cylinder size, rounded up to
+    /// clear the RDB area (the same floor [`RdbBuilder::layout`] would
+    /// compute — see [`BuildError::PartitionOverlapsRdbArea`]), lands
+    /// past the new geometry's last cylinder.
+    ///
+    /// [`Rdb::validate`] has no check for `rdb_LoCylinder >
+    /// rdb_HiCylinder`, so nothing downstream would catch this if it
+    /// were written: refused here instead, on the same terms a create
+    /// would refuse the equivalent layout.
+    RemapNoRoomForPartitions {
+        /// The RDB-area floor in the new geometry's cylinders.
+        lo_cylinder: u32,
+        /// The new geometry's last cylinder — below `lo_cylinder`, which
+        /// is the issue.
+        hi_cylinder: u32,
+    },
 }
 
 impl core::fmt::Display for EditError {
@@ -4445,6 +4461,14 @@ impl core::fmt::Display for EditError {
                 "partition {index} ({name:?}) runs from block {start_lba} for {block_len} \
                  blocks, which is not a whole number of {cylinder_blocks}-block cylinders in \
                  the new geometry"
+            ),
+            EditError::RemapNoRoomForPartitions {
+                lo_cylinder,
+                hi_cylinder,
+            } => write!(
+                f,
+                "the RDB area needs cylinders up to {lo_cylinder} in the new geometry, \
+                 past the disk's last cylinder {hi_cylinder}"
             ),
         }
     }
@@ -5711,6 +5735,12 @@ impl RdbEditor {
         // owns.
         let new_lo_cylinder = self.first_partition_cylinder(new_cyl_blocks);
         let hi_cylinder = geometry.cylinders.saturating_sub(1);
+        if new_lo_cylinder > hi_cylinder {
+            return Err(EditError::RemapNoRoomForPartitions {
+                lo_cylinder: new_lo_cylinder,
+                hi_cylinder,
+            });
+        }
 
         put_be32(&mut self.rdsk, rdsk::CYLINDERS, geometry.cylinders);
         put_be32(&mut self.rdsk, rdsk::HEADS, geometry.heads);
@@ -11801,6 +11831,46 @@ mod tests {
                 disk_blocks: 160,
             }
         );
+    }
+
+    /// A geometry can pass every per-partition and whole-disk check
+    /// (there being no partitions to misalign, and the disk being large
+    /// enough) while still rounding the RDB area's floor, in the new
+    /// geometry's cylinders, past the new last cylinder. Nothing else
+    /// would catch this — [`Rdb::validate`] has no
+    /// `rdb_LoCylinder <= rdb_HiCylinder` check — so `remap_geometry`
+    /// must refuse it itself rather than write an inverted range.
+    #[test]
+    fn remap_geometry_refuses_when_the_rdb_area_swallows_every_cylinder() {
+        let mut disk = blank_disk(128 * 32, 512);
+        RdbBuilder::new(Geometry {
+            cylinders: 128,
+            heads: 1,
+            sectors: 32,
+            block_size: 512,
+        })
+        .build(&mut disk)
+        .expect("build");
+
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        let err = editor
+            .remap_geometry(Geometry {
+                cylinders: 2,
+                heads: 1,
+                sectors: 20,
+                block_size: 512,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, EditError::RemapNoRoomForPartitions { .. }),
+            "expected RemapNoRoomForPartitions, got {err:?}"
+        );
+
+        // Refused before anything was written: the geometry on disk is
+        // untouched.
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        assert_eq!(editor.rdb().cylinders, 128);
+        assert!(editor.rdb().lo_cylinder <= editor.rdb().hi_cylinder);
     }
 
     /// [`Geometry::block_size`] has to match this editor's own — every
