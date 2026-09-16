@@ -1127,6 +1127,48 @@ truncation tests, and AmiPart running as a second differential oracle.
       AMIGA_RDB_AMIPART=1 AMIGA_RDB_AMIPART_BIN=$PWD/AmiPart/host/amipart \
           cargo test amipart
       ```
+- [x] **`RdbEditor::remap_geometry`** — the `remap` half of
+      [#6](https://github.com/sidick/amiga-rdb-rs/issues/6), pulled back
+      out of "niche enough to defer" once a real caller showed up:
+      `amirdb`'s `remap` command (`sidick/amiga-tools`,
+      `tools/amirdb/src/commands/remap.rs`) needed to change
+      `rdb_Heads`/`rdb_Sectors` on a populated RDB and, until now, could
+      only refuse. `set_geometry_cylinders` keeps heads/sectors fixed on
+      purpose; this is the other lever, and the one every partition's
+      stored `de_LowCyl..=de_HighCyl` makes dangerous to pull carelessly
+      — the same cylinder number means a different block once the
+      cylinder size changes.
+
+      **The invariant, stated once and checked, not just documented:**
+      every partition's byte range (`start_lba..start_lba + block_len`,
+      in device blocks) is identical before and after. For every
+      partition whose extent is not already inverted, both `start_lba`
+      and `block_len` must divide evenly by the new geometry's
+      `cylinder_blocks()`; if either does not,
+      `EditError::RemapMisaligned` names the partition and refuses
+      before writing anything, exactly the "no silent moving" discipline
+      `set_extent`/`resize_partition` already hold structural edits to.
+      A partition that passes has its `de_Surfaces`, `de_BlocksPerTrack`,
+      `de_LowCyl` and `de_HighCyl` all rewritten from its *unchanged*
+      byte range divided by the new cylinder size — a different
+      `de_LowCyl..=de_HighCyl` describing the exact same blocks.
+      `rdb_LoCylinder` is re-derived the way `RdbBuilder` derives it for
+      a fresh image (the old floor, translated into the new cylinder size
+      and rounded up, never down); `rdb_RDBBlocksLo`/`Hi` are untouched,
+      since the RDB area is already stated in device blocks that do not
+      move with the cylinder size.
+
+      **Delegates to `set_geometry_cylinders` outright** when the new
+      geometry's heads/sectors match what is already stored, rather than
+      re-deriving the same arithmetic — so a remap that only changes the
+      cylinder count is guaranteed to agree with it exactly, not merely
+      tested against it. `EditError::RemapBlockSizeMismatch` guards the
+      new `Geometry`'s block size against this editor's own, since every
+      stored LBA and cylinder is already expressed in that unit.
+
+      `adjust auto` — the other half of #6 — is still deferred; it is a
+      convenience over `expand_rdb_area`/`set_lo_cylinder`; nothing about
+      landing `remap` bears on it.
 
 ## Cross-cutting
 

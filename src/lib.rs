@@ -4414,6 +4414,60 @@ pub enum EditError {
         /// `rdb_Cylinders * rdb_Heads * rdb_Sectors`.
         disk_blocks: u64,
     },
+    /// [`RdbEditor::remap_geometry`]'s [`Geometry::block_size`] does not
+    /// match this editor's — the block size the source was opened with,
+    /// and the unit every stored `de_LowCyl`/`de_HighCyl` and LBA is
+    /// already expressed in. A remap never touches a partition's bytes,
+    /// only what cylinder they are said to lie in, so a different block
+    /// size would silently redefine what a "byte" is partway through the
+    /// same edit.
+    RemapBlockSizeMismatch {
+        /// [`Geometry::block_size`] as asked for.
+        geometry: usize,
+        /// This editor's block size, from the [`BlockSource`]
+        /// [`RdbEditor::open`] read.
+        editor: usize,
+    },
+    /// [`RdbEditor::remap_geometry`] refused rather than move a
+    /// partition's bytes.
+    ///
+    /// The new geometry's cylinder size does not divide this partition's
+    /// existing byte range evenly — its first block, or its block count,
+    /// is not a whole number of the new cylinder size — so there is no
+    /// `de_LowCyl..=de_HighCyl` in the new geometry that describes
+    /// exactly the same bytes. Refused outright: silently rounding would
+    /// move the partition's data (or lose some of it) without moving a
+    /// single byte on disk, which is the one thing a geometry remap must
+    /// never do.
+    RemapMisaligned {
+        /// Index of the partition that does not divide evenly.
+        index: usize,
+        /// Its `pb_DriveName`.
+        name: String,
+        /// Its first device block, in the *old* geometry.
+        start_lba: u64,
+        /// Its length in device blocks, in the *old* geometry.
+        block_len: u64,
+        /// The new geometry's device blocks per cylinder — what
+        /// `start_lba` and `block_len` would both have to divide evenly.
+        cylinder_blocks: u64,
+    },
+    /// [`RdbEditor::remap_geometry`]'s new cylinder size, rounded up to
+    /// clear the RDB area (the same floor `RdbBuilder::layout` would
+    /// compute — see [`BuildError::PartitionOverlapsRdbArea`]), lands
+    /// past the new geometry's last cylinder.
+    ///
+    /// [`Rdb::validate`] has no check for `rdb_LoCylinder >
+    /// rdb_HiCylinder`, so nothing downstream would catch this if it
+    /// were written: refused here instead, on the same terms a create
+    /// would refuse the equivalent layout.
+    RemapNoRoomForPartitions {
+        /// The RDB-area floor in the new geometry's cylinders.
+        lo_cylinder: u32,
+        /// The new geometry's last cylinder — below `lo_cylinder`, which
+        /// is the issue.
+        hi_cylinder: u32,
+    },
 }
 
 impl core::fmt::Display for EditError {
@@ -4525,6 +4579,30 @@ impl core::fmt::Display for EditError {
             } => write!(
                 f,
                 "block {last_block} is past the end of a disk of {disk_blocks} blocks"
+            ),
+            EditError::RemapBlockSizeMismatch { geometry, editor } => write!(
+                f,
+                "the geometry's block size {geometry} does not match this editor's {editor}"
+            ),
+            EditError::RemapMisaligned {
+                index,
+                name,
+                start_lba,
+                block_len,
+                cylinder_blocks,
+            } => write!(
+                f,
+                "partition {index} ({name:?}) runs from block {start_lba} for {block_len} \
+                 blocks, which is not a whole number of {cylinder_blocks}-block cylinders in \
+                 the new geometry"
+            ),
+            EditError::RemapNoRoomForPartitions {
+                lo_cylinder,
+                hi_cylinder,
+            } => write!(
+                f,
+                "the RDB area needs cylinders up to {lo_cylinder} in the new geometry, \
+                 past the disk's last cylinder {hi_cylinder}"
             ),
         }
     }
@@ -5678,6 +5756,204 @@ impl RdbEditor {
         put_be32(&mut self.rdsk, rdsk::HI_CYLINDER, hi_cylinder);
         self.rdb.cylinders = cylinders;
         self.rdb.hi_cylinder = hi_cylinder;
+        Ok(())
+    }
+
+    /// Change `rdb_Heads`/`rdb_Sectors` (and `rdb_Cylinders` with them)
+    /// — amitools' `rdbtool remap`, the case
+    /// [`set_geometry_cylinders`](Self::set_geometry_cylinders) cannot
+    /// reach.
+    ///
+    /// # Why this exists, and what it must never do
+    ///
+    /// Every partition's extent is stored as `de_LowCyl..=de_HighCyl` in
+    /// *cylinders* — there is no on-disk field for a partition's byte
+    /// range. Changing `rdb_Heads`/`rdb_Sectors` alone, the way
+    /// [`set_geometry_cylinders`](Self::set_geometry_cylinders)
+    /// deliberately leaves them, would silently move every partition's
+    /// bytes: the same `de_LowCyl` now means a different block, because
+    /// the cylinder it names is a different size. This method exists to
+    /// do the opposite — change what the drive claims about itself
+    /// without moving a single byte anyone already put on it.
+    ///
+    /// # The invariant
+    ///
+    /// **Every partition's byte range — `start_lba..start_lba +
+    /// block_len`, in device blocks — is identical before and after.**
+    /// Not approximately: identical. This is checked, not merely
+    /// intended: for every partition whose extent is not already inverted
+    /// (`block_len != 0` — an inverted one describes no bytes to
+    /// preserve and is left exactly as found, like every other edit
+    /// here), both `start_lba` and `block_len` must divide evenly by the
+    /// *new* geometry's `cylinder_blocks()`. If either does not, this is
+    /// [`EditError::RemapMisaligned`], naming the partition, its old
+    /// range, and the new cylinder size that does not divide it — and
+    /// nothing is written. There is no rounding option: a caller who
+    /// wants a geometry that fits must choose one that does, the same
+    /// discipline [`GeometryError::TooLarge`] applies against wrapping a
+    /// disk that is not there.
+    ///
+    /// A partition that survives the check has its `de_Surfaces`,
+    /// `de_BlocksPerTrack`, `de_LowCyl` and `de_HighCyl` all rewritten —
+    /// surfaces and blocks-per-track to the new geometry's `heads` and
+    /// `sectors` (the same fields [`add_partition`](Self::add_partition)
+    /// fills a new `PART` block with from the drive's own, and what
+    /// every partition this crate has ever written already carries), low
+    /// and high cylinder recomputed from the *unchanged* `start_lba`/
+    /// `block_len` divided by the new `cylinder_blocks()`. The result is
+    /// a different `de_LowCyl..=de_HighCyl` describing the exact same
+    /// blocks — which is the whole operation.
+    ///
+    /// `rdb_LoCylinder` is recomputed the same way
+    /// [`RdbBuilder`] derives it for a fresh image — the first cylinder
+    /// at or above the old floor (`rdb_LoCylinder`, or the block after
+    /// `rdb_RDBBlocksHi` when that is higher), translated into the new
+    /// cylinder size and rounded up, never down, so it cannot end up
+    /// claiming a block a partition already owns. `rdb_HiCylinder`
+    /// becomes `cylinders - 1`, as in
+    /// [`set_geometry_cylinders`](Self::set_geometry_cylinders).
+    /// `rdb_RDBBlocksLo`/`Hi` are **not** touched: the RDB area is
+    /// already stated in device blocks, which do not move.
+    ///
+    /// # A remap that does not change heads/sectors
+    ///
+    /// Delegates to
+    /// [`set_geometry_cylinders`](Self::set_geometry_cylinders) outright
+    /// when `geometry.heads`/`geometry.sectors` equal what is already
+    /// stored — the same call, not parallel arithmetic that could drift
+    /// from it — so the two are guaranteed to agree rather than merely
+    /// tested to.
+    ///
+    /// # Other refusals
+    ///
+    /// [`EditError::RemapBlockSizeMismatch`] when `geometry.block_size`
+    /// is not this editor's own: every stored LBA and cylinder is
+    /// already in that unit, and a different one would silently redefine
+    /// what a "byte" is partway through the edit.
+    /// [`EditError::UnusableGeometry`] for a cylinder holding no blocks,
+    /// or holding so many `de_Surfaces * de_BlocksPerTrack` does not fit
+    /// the 32-bit `rdb_CylBlocks` field.
+    /// [`EditError::ClaimsBlocksPastEndOfDisk`] when the new geometry's
+    /// total is not enough to cover the RDB area, any partition's
+    /// existing extent, or — when the source reported one — the medium's
+    /// own block count, on the same terms
+    /// [`set_geometry_cylinders`](Self::set_geometry_cylinders) checks.
+    pub fn remap_geometry(&mut self, geometry: Geometry) -> Result<(), EditError> {
+        if geometry.block_size != self.block_size {
+            return Err(EditError::RemapBlockSizeMismatch {
+                geometry: geometry.block_size,
+                editor: self.block_size,
+            });
+        }
+
+        // Heads/sectors unchanged: this is exactly
+        // `set_geometry_cylinders`, and delegating rather than
+        // re-deriving the same arithmetic is what makes the two agree
+        // by construction.
+        if geometry.heads == self.rdb.heads && geometry.sectors == self.rdb.sectors {
+            return self.set_geometry_cylinders(geometry.cylinders);
+        }
+
+        let new_cyl_blocks = geometry.cylinder_blocks();
+        if new_cyl_blocks == 0 || new_cyl_blocks > u32::MAX as u64 {
+            return Err(EditError::UnusableGeometry {
+                heads: geometry.heads,
+                sectors: geometry.sectors,
+            });
+        }
+        let total_blocks = geometry.total_blocks();
+
+        // The area is inside the new disk or the disk is not the disk —
+        // the same predicate `set_geometry_cylinders` checks, which also
+        // disposes of a `cylinders` too small to hold even the area.
+        if total_blocks <= self.rdb.rdb_blocks_hi as u64 {
+            return Err(EditError::ClaimsBlocksPastEndOfDisk {
+                last_block: self.rdb.rdb_blocks_hi as u64,
+                disk_blocks: total_blocks,
+            });
+        }
+        if let Some(disk_blocks) = self.disk_blocks {
+            if total_blocks > disk_blocks {
+                return Err(EditError::ClaimsBlocksPastEndOfDisk {
+                    last_block: total_blocks - 1,
+                    disk_blocks,
+                });
+            }
+        }
+
+        // Check every partition before writing any of it: a refused
+        // remap must be as atomic as every other edit here.
+        let mut new_extents: Vec<Option<(u32, u32)>> =
+            Vec::with_capacity(self.rdb.partitions.len());
+        for (index, p) in self.rdb.partitions.iter().enumerate() {
+            if p.block_len == 0 {
+                new_extents.push(None);
+                continue;
+            }
+            if p.start_lba % new_cyl_blocks != 0 || p.block_len % new_cyl_blocks != 0 {
+                return Err(EditError::RemapMisaligned {
+                    index,
+                    name: p.name.clone(),
+                    start_lba: p.start_lba,
+                    block_len: p.block_len,
+                    cylinder_blocks: new_cyl_blocks,
+                });
+            }
+            let end = p.start_lba + p.block_len;
+            if end > total_blocks {
+                return Err(EditError::ClaimsBlocksPastEndOfDisk {
+                    last_block: end - 1,
+                    disk_blocks: total_blocks,
+                });
+            }
+            let low = (p.start_lba / new_cyl_blocks).min(u32::MAX as u64) as u32;
+            let count = p.block_len / new_cyl_blocks;
+            let high = (low as u64 + count - 1).min(u32::MAX as u64) as u32;
+            new_extents.push(Some((low, high)));
+        }
+
+        // The floor `RdbBuilder` would derive, translated into the new
+        // cylinder size and rounded up — never down, so it cannot claim
+        // a block a partition (checked above) or the RDB area already
+        // owns.
+        let new_lo_cylinder = self.first_partition_cylinder(new_cyl_blocks);
+        let hi_cylinder = geometry.cylinders.saturating_sub(1);
+        if new_lo_cylinder > hi_cylinder {
+            return Err(EditError::RemapNoRoomForPartitions {
+                lo_cylinder: new_lo_cylinder,
+                hi_cylinder,
+            });
+        }
+
+        put_be32(&mut self.rdsk, rdsk::CYLINDERS, geometry.cylinders);
+        put_be32(&mut self.rdsk, rdsk::HEADS, geometry.heads);
+        put_be32(&mut self.rdsk, rdsk::SECTORS, geometry.sectors);
+        put_be32(&mut self.rdsk, rdsk::HI_CYLINDER, hi_cylinder);
+        put_be32(&mut self.rdsk, rdsk::LO_CYLINDER, new_lo_cylinder);
+        put_be32(&mut self.rdsk, rdsk::CYL_BLOCKS, new_cyl_blocks as u32);
+        self.rdb.cylinders = geometry.cylinders;
+        self.rdb.heads = geometry.heads;
+        self.rdb.sectors = geometry.sectors;
+        self.rdb.hi_cylinder = hi_cylinder;
+        self.rdb.lo_cylinder = new_lo_cylinder;
+        self.rdb.cyl_blocks = new_cyl_blocks as u32;
+
+        for (index, extent) in new_extents.into_iter().enumerate() {
+            if let Some((low, high)) = extent {
+                let bytes = &mut self.parts[index].bytes;
+                put_be32(bytes, part::ENVIRONMENT + de::SURFACES * 4, geometry.heads);
+                put_be32(
+                    bytes,
+                    part::ENVIRONMENT + de::BLOCKS_PER_TRACK * 4,
+                    geometry.sectors,
+                );
+                put_be32(bytes, part::ENVIRONMENT + de::LOW_CYL * 4, low);
+                put_be32(bytes, part::ENVIRONMENT + de::HIGH_CYL * 4, high);
+                self.rdb.partitions[index] =
+                    parse_part(&self.parts[index].bytes, self.parts[index].lba);
+            }
+        }
+
         Ok(())
     }
 
@@ -11781,6 +12057,383 @@ mod tests {
         assert_eq!(rdb.partitions.len(), 3);
         assert_eq!(rdb.partitions[2].name, "NEW");
         assert!(rdb.validate().is_empty());
+    }
+
+    // ---- remap_geometry --------------------------------------------
+
+    /// A disk of 128 cylinders, 1 head, 32 sectors (32-block cylinders,
+    /// 4096 blocks total) carrying two partitions whose extents both
+    /// start and end on a multiple of 4 cylinders — so they stay aligned
+    /// after remapping to either 64 blocks/cylinder (2 heads) or 128
+    /// (2 heads, 64 sectors), which is what the tests below remap to.
+    /// Each partition's blocks are stamped with a marker byte so a test
+    /// can tell whether anything moved.
+    fn remap_fixture() -> MemDisk {
+        let mut disk = blank_disk(128 * 32, 512);
+        RdbBuilder::new(Geometry {
+            cylinders: 128,
+            heads: 1,
+            sectors: 32,
+            block_size: 512,
+        })
+        .partition(PartitionSpec::by_cylinders(4, 59).named("DH0"))
+        .partition(PartitionSpec::by_cylinders(64, 119).named("DH1"))
+        .build(&mut disk)
+        .expect("build");
+
+        // Stamp each partition's blocks with a marker so a byte-moved
+        // bug would show up as a changed byte rather than just a changed
+        // field.
+        for (marker, low, high) in [(0xAAu8, 4u64, 59), (0xBBu8, 64, 119)] {
+            let start = low * 32 * 512;
+            let end = (high + 1) * 32 * 512;
+            disk.data[start as usize..end as usize].fill(marker);
+        }
+        disk
+    }
+
+    /// The invariant this method exists for: every partition's byte
+    /// range is identical before and after, whether the new cylinder
+    /// size is the same as the old one (64 blocks, twice the heads) or
+    /// larger still (128 blocks, twice the heads *and* the sectors).
+    #[test]
+    fn remap_geometry_preserves_every_partition_byte_range() {
+        for new_geometry in [
+            Geometry {
+                cylinders: 64,
+                heads: 2,
+                sectors: 32,
+                block_size: 512,
+            },
+            Geometry {
+                cylinders: 32,
+                heads: 2,
+                sectors: 64,
+                block_size: 512,
+            },
+        ] {
+            let before = remap_fixture();
+            let mut disk = MemDisk::new(before.data.clone());
+            let mut editor = RdbEditor::open(&mut disk).unwrap();
+
+            let old_extents: Vec<(u64, u64)> = editor
+                .partitions()
+                .iter()
+                .map(|p| (p.start_lba, p.block_len))
+                .collect();
+
+            editor.remap_geometry(new_geometry).unwrap();
+
+            let new_extents: Vec<(u64, u64)> = editor
+                .partitions()
+                .iter()
+                .map(|p| (p.start_lba, p.block_len))
+                .collect();
+            assert_eq!(
+                old_extents, new_extents,
+                "remapping to {new_geometry:?} moved a partition's bytes"
+            );
+            // The drive fields actually changed, or this would be
+            // testing nothing.
+            assert_eq!(editor.rdb().heads, new_geometry.heads);
+            assert_eq!(editor.rdb().sectors, new_geometry.sectors);
+            assert_eq!(editor.rdb().cylinders, new_geometry.cylinders);
+            assert_eq!(editor.rdb().hi_cylinder, new_geometry.cylinders - 1);
+
+            editor.commit(&mut disk).unwrap();
+            let rdb = Rdb::parse(&mut disk).unwrap();
+            assert!(rdb.validate().is_empty());
+            assert_eq!(rdb.heads, new_geometry.heads);
+            assert_eq!(rdb.sectors, new_geometry.sectors);
+            assert_eq!(rdb.cylinders, new_geometry.cylinders);
+            assert_eq!(
+                (rdb.partitions[0].start_lba, rdb.partitions[0].block_len),
+                old_extents[0]
+            );
+            assert_eq!(
+                (rdb.partitions[1].start_lba, rdb.partitions[1].block_len),
+                old_extents[1]
+            );
+            // Not one byte of *partition content* moved — the RDSK and
+            // PART blocks themselves are expected to differ, since
+            // changing what they say is the whole point.
+            for (start, len) in &old_extents {
+                let s = (*start as usize) * 512;
+                let e = s + (*len as usize) * 512;
+                assert_eq!(
+                    disk.data[s..e],
+                    before.data[s..e],
+                    "partition content at blocks {start}..{} moved for {new_geometry:?}",
+                    start + len
+                );
+            }
+        }
+    }
+
+    /// The degenerate case — heads and sectors unchanged, only the
+    /// cylinder count moves — has to agree with
+    /// [`RdbEditor::set_geometry_cylinders`] exactly, both on success and
+    /// on every refusal, because [`RdbEditor::remap_geometry`] delegates
+    /// to it rather than re-deriving the same arithmetic.
+    #[test]
+    fn remap_geometry_agrees_with_set_geometry_cylinders_when_heads_and_sectors_are_unchanged() {
+        let same_heads_sectors = Geometry {
+            cylinders: 100,
+            heads: 1,
+            sectors: 32,
+            block_size: 512,
+        };
+
+        // Too few cylinders for DH1 (ends at cylinder 119): the same
+        // refusal, field for field.
+        let mut disk_a = MemDisk::new(remap_fixture().data);
+        let mut editor_a = RdbEditor::open(&mut disk_a).unwrap();
+        let mut disk_b = MemDisk::new(remap_fixture().data);
+        let mut editor_b = RdbEditor::open(&mut disk_b).unwrap();
+        assert_eq!(
+            editor_a.remap_geometry(same_heads_sectors).unwrap_err(),
+            editor_b
+                .set_geometry_cylinders(same_heads_sectors.cylinders)
+                .unwrap_err(),
+        );
+
+        // Enough cylinders, and enough disk to hold them: both succeed
+        // and land on the same fields, with no partition envec field
+        // touched by either.
+        let mut grown_data = remap_fixture().data;
+        grown_data.resize(300 * 32 * 512, 0);
+        let mut disk_a = MemDisk::new(grown_data.clone());
+        let mut editor_a = RdbEditor::open(&mut disk_a).unwrap();
+        let mut disk_b = MemDisk::new(grown_data);
+        let mut editor_b = RdbEditor::open(&mut disk_b).unwrap();
+
+        let grown = Geometry {
+            cylinders: 200,
+            ..same_heads_sectors
+        };
+        editor_a.remap_geometry(grown).unwrap();
+        editor_b.set_geometry_cylinders(grown.cylinders).unwrap();
+        assert_eq!(editor_a.rdb(), editor_b.rdb());
+
+        editor_a.commit(&mut disk_a).unwrap();
+        editor_b.commit(&mut disk_b).unwrap();
+        assert_eq!(disk_a.data, disk_b.data);
+    }
+
+    /// A remap that cannot express every partition's existing byte range
+    /// in whole cylinders of the new size is refused, precisely, rather
+    /// than moving or rounding anything.
+    #[test]
+    fn remap_geometry_refuses_a_misaligned_partition() {
+        let mut disk = MemDisk::new(remap_fixture().data);
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        let before = disk.data.clone();
+
+        // 48-block cylinders: DH0 starts at block 128, which is not a
+        // multiple of 48. Large enough a cylinder count that the area
+        // and disk-size checks pass first, so this is really exercising
+        // the alignment check.
+        let misaligned = Geometry {
+            cylinders: 85,
+            heads: 1,
+            sectors: 48,
+            block_size: 512,
+        };
+        assert_eq!(
+            editor.remap_geometry(misaligned).unwrap_err(),
+            EditError::RemapMisaligned {
+                index: 0,
+                name: String::from("DH0"),
+                start_lba: 4 * 32,
+                block_len: 56 * 32,
+                cylinder_blocks: 48,
+            }
+        );
+        editor.commit(&mut disk).unwrap();
+        assert_eq!(disk.data, before, "a refused remap changes nothing");
+    }
+
+    /// A geometry too small to cover the RDB area, or too small to
+    /// cover a partition's existing extent, is refused rather than
+    /// truncating anything.
+    #[test]
+    fn remap_geometry_refuses_a_geometry_too_small() {
+        let mut disk = MemDisk::new(remap_fixture().data);
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        let area_hi = editor.rdb().rdb_blocks_hi as u64;
+
+        // Zero cylinders: the area itself no longer fits.
+        assert_eq!(
+            editor
+                .remap_geometry(Geometry {
+                    cylinders: 0,
+                    heads: 2,
+                    sectors: 32,
+                    block_size: 512,
+                })
+                .unwrap_err(),
+            EditError::ClaimsBlocksPastEndOfDisk {
+                last_block: area_hi,
+                disk_blocks: 0,
+            }
+        );
+
+        // The area fits (10 cylinders of 16 blocks = 160 blocks), but
+        // DH0 (blocks 128..1920 in the old geometry) does not.
+        assert_eq!(
+            editor
+                .remap_geometry(Geometry {
+                    cylinders: 10,
+                    heads: 1,
+                    sectors: 16,
+                    block_size: 512,
+                })
+                .unwrap_err(),
+            EditError::ClaimsBlocksPastEndOfDisk {
+                last_block: 4 * 32 + 56 * 32 - 1,
+                disk_blocks: 160,
+            }
+        );
+    }
+
+    /// A geometry can pass every per-partition and whole-disk check
+    /// (there being no partitions to misalign, and the disk being large
+    /// enough) while still rounding the RDB area's floor, in the new
+    /// geometry's cylinders, past the new last cylinder. Nothing else
+    /// would catch this — [`Rdb::validate`] has no
+    /// `rdb_LoCylinder <= rdb_HiCylinder` check — so `remap_geometry`
+    /// must refuse it itself rather than write an inverted range.
+    #[test]
+    fn remap_geometry_refuses_when_the_rdb_area_swallows_every_cylinder() {
+        let mut disk = blank_disk(128 * 32, 512);
+        RdbBuilder::new(Geometry {
+            cylinders: 128,
+            heads: 1,
+            sectors: 32,
+            block_size: 512,
+        })
+        .build(&mut disk)
+        .expect("build");
+
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        let err = editor
+            .remap_geometry(Geometry {
+                cylinders: 2,
+                heads: 1,
+                sectors: 20,
+                block_size: 512,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, EditError::RemapNoRoomForPartitions { .. }),
+            "expected RemapNoRoomForPartitions, got {err:?}"
+        );
+
+        // Refused before anything was written: the geometry on disk is
+        // untouched.
+        let editor = RdbEditor::open(&mut disk).unwrap();
+        assert_eq!(editor.rdb().cylinders, 128);
+        assert!(editor.rdb().lo_cylinder <= editor.rdb().hi_cylinder);
+    }
+
+    /// [`Geometry::block_size`] has to match this editor's own — every
+    /// stored LBA and cylinder is already expressed in that unit.
+    #[test]
+    fn remap_geometry_refuses_a_block_size_mismatch() {
+        let mut disk = MemDisk::new(remap_fixture().data);
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+        assert_eq!(
+            editor
+                .remap_geometry(Geometry {
+                    cylinders: 64,
+                    heads: 2,
+                    sectors: 32,
+                    block_size: 4096,
+                })
+                .unwrap_err(),
+            EditError::RemapBlockSizeMismatch {
+                geometry: 4096,
+                editor: 512,
+            }
+        );
+    }
+
+    /// Crash shape over a `remap_geometry` commit — the same truncation
+    /// discipline every structural edit is held to in this crate. It
+    /// only rewrites `RDSK` and the `PART` blocks in place (no pointer
+    /// changes, so no relocation), so every prefix should already parse
+    /// as the old table or the new one.
+    #[test]
+    fn a_remap_commit_truncated_at_every_write_leaves_a_readable_rdb() {
+        struct FlakySink {
+            data: Vec<u8>,
+            writes: usize,
+            fail_after: usize,
+        }
+        impl BlockSink for FlakySink {
+            type Error = ();
+            fn block_size(&self) -> usize {
+                512
+            }
+            fn write_block(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
+                if self.writes >= self.fail_after {
+                    return Err(());
+                }
+                self.writes += 1;
+                let off = lba as usize * 512;
+                self.data[off..off + 512].copy_from_slice(buf);
+                Ok(())
+            }
+            fn block_count(&self) -> Option<u64> {
+                Some((self.data.len() / 512) as u64)
+            }
+        }
+
+        let before = remap_fixture();
+        let new_geometry = Geometry {
+            cylinders: 64,
+            heads: 2,
+            sectors: 32,
+            block_size: 512,
+        };
+
+        // Find out how many writes a full commit takes.
+        let total_writes = {
+            let mut disk = MemDisk::new(before.data.clone());
+            let mut editor = RdbEditor::open(&mut disk).unwrap();
+            editor.remap_geometry(new_geometry).unwrap();
+            let mut probe = FlakySink {
+                data: before.data.clone(),
+                writes: 0,
+                fail_after: usize::MAX,
+            };
+            editor.commit(&mut probe).unwrap();
+            probe.writes
+        };
+
+        for cutoff in 0..=total_writes {
+            let mut disk = MemDisk::new(before.data.clone());
+            let mut editor = RdbEditor::open(&mut disk).unwrap();
+            editor.remap_geometry(new_geometry).unwrap();
+            let mut sink = FlakySink {
+                data: before.data.clone(),
+                writes: 0,
+                fail_after: cutoff,
+            };
+            let _ = editor.commit(&mut sink);
+
+            let mut readback = MemDisk::new(sink.data);
+            let rdb = Rdb::parse(&mut readback).expect("every prefix should parse");
+            assert!(rdb.validate().is_empty());
+            // Either the old geometry or the new one, never a mixture,
+            // and either way both partitions' byte ranges are exactly
+            // what they always were.
+            assert!(rdb.heads == 1 || rdb.heads == new_geometry.heads);
+            assert_eq!(rdb.partitions[0].start_lba, 4 * 32);
+            assert_eq!(rdb.partitions[0].block_len, 56 * 32);
+            assert_eq!(rdb.partitions[1].start_lba, 64 * 32);
+            assert_eq!(rdb.partitions[1].block_len, 56 * 32);
+        }
     }
 
     /// Crash shape over an *expanding* commit — the truncation test
