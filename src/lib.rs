@@ -4975,6 +4975,32 @@ impl RdbEditor {
         Ok(())
     }
 
+    /// Patch filesystem `index`'s `FSHD` block and bring the model back
+    /// in step with it — [`edit_part`](Self::edit_part)'s counterpart
+    /// for the `FSHD` chain.
+    ///
+    /// Re-parses rather than updating [`FileSysHeader`] field by field,
+    /// for the same reason `edit_part` does: whatever a commit would
+    /// write is what [`rdb`](Self::rdb) reports. The `LSEG` chain itself
+    /// is never touched here, and since a patch never changes `index`'s
+    /// block or its `fhb_SegListBlocks` pointer, [`plan`](Self::plan)'s
+    /// chain-shape rule sees no pointer change either — the whole chain
+    /// stays exactly where it was.
+    fn edit_fshd<F>(&mut self, index: usize, patch: F) -> Result<(), EditError>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        if index >= self.fshds.len() {
+            return Err(EditError::NoSuchFileSystem {
+                index,
+                count: self.fshds.len(),
+            });
+        }
+        patch(&mut self.fshds[index].bytes);
+        self.rdb.filesystems[index] = parse_fshd(&self.fshds[index].bytes, self.fshds[index].lba);
+        Ok(())
+    }
+
     /// Set one `DosEnvec` longword, extending `de_TableSize` if the
     /// field lies past it.
     ///
@@ -5156,6 +5182,29 @@ impl RdbEditor {
     /// Set `de_BootBlocks`, extending `de_TableSize` to 19 if needed.
     pub fn set_boot_blocks(&mut self, index: usize, blocks: u32) -> Result<(), EditError> {
         self.set_envec(index, de::BOOT_BLOCKS, blocks)
+    }
+
+    /// Set `fhb_PatchFlags` on the filesystem at `index` directly —
+    /// `RdbEditor`'s counterpart to `rdbtool`'s `fsflags`.
+    ///
+    /// Only the mask longword changes. Every patched field behind it
+    /// (`fhb_Type` through `fhb_GlobalVec`) is left exactly as it was,
+    /// so turning a bit on exposes whatever value that longword already
+    /// held rather than a freshly-zeroed one, and turning a bit off does
+    /// not erase the value underneath — the same distinction
+    /// [`FileSysHeader`]'s `Option` fields draw on the read side, now
+    /// held on the write side too. `fhb_SegListBlocks` and the `LSEG`
+    /// chain it heads are untouched: this is a pure metadata edit.
+    ///
+    /// Before this, the only way to change one flag was
+    /// [`replace_filesystem`](Self::replace_filesystem), which needs a
+    /// whole [`FileSystemSpec`] — including the driver binary, recovered
+    /// with [`Rdb::load_filesystem`] — just to flip a bit, and rewrites
+    /// the entire `LSEG` chain to do it. [#4](https://github.com/sidick/amiga-rdb-rs/issues/4).
+    pub fn set_patch_flags(&mut self, index: usize, patch_flags: u32) -> Result<(), EditError> {
+        self.edit_fshd(index, |bytes| {
+            put_be32(bytes, fshd::PATCH_FLAGS, patch_flags);
+        })
     }
 
     /// Set `rdb_DiskVendor`/`Product`/`Revision` and turn
@@ -10583,6 +10632,71 @@ mod tests {
         expected.partitions[0].boot_pri = 7;
         expected.partitions[0].envec_raw[de::BOOT_PRI] = 7;
         assert_eq!(new, expected);
+    }
+
+    /// `set_patch_flags` ([#4](https://github.com/sidick/amiga-rdb-rs/issues/4)):
+    /// only the mask longword and its checksum may move — in particular
+    /// the `LSEG` chain, which `replace_filesystem` would have to
+    /// rewrite in full to flip the same bit.
+    #[test]
+    fn set_patch_flags_rewrites_only_the_mask() {
+        let before = foreign_image();
+        let mut disk = MemDisk::new(before.clone());
+        let mut editor = RdbEditor::open(&mut disk).unwrap();
+
+        assert_eq!(
+            editor.set_patch_flags(3, fshd_patch::GLOBAL_VEC),
+            Err(EditError::NoSuchFileSystem { index: 3, count: 1 })
+        );
+
+        // Turn TYPE on (was clear), leave GLOBAL_VEC and the unmodelled
+        // bit 20 alone, drop TASK/LOCK/STARTUP/SEG_LIST. SEG_LIST off
+        // does not touch the chain itself — the pointer longword and
+        // the blocks it names are untouched either way, only whether
+        // the bit says to patch it into the device node.
+        let new_flags = fshd_patch::TYPE | fshd_patch::GLOBAL_VEC | (1 << 20);
+        editor.set_patch_flags(0, new_flags).unwrap();
+        // TYPE's longword is exposed as whatever the fixture already
+        // held, not freshly zeroed — a mask edit, not a value edit.
+        assert_eq!(editor.rdb().filesystems[0].node_type, Some(0xAAAA_0000));
+        assert_eq!(editor.rdb().filesystems[0].task, None);
+        assert_eq!(editor.rdb().filesystems[0].lock, None);
+        assert_eq!(editor.rdb().filesystems[0].global_vec, Some(-1));
+
+        let report = editor.commit(&mut disk).unwrap();
+        assert!(report.blocks_zeroed.is_empty());
+
+        // Only two longwords of the FSHD block may differ: PatchFlags
+        // itself, and the ChkSum that covers it.
+        let patch_flags = F_FSHD * 512 + fshd::PATCH_FLAGS;
+        let chk_sum = F_FSHD * 512 + hdr::CHK_SUM;
+        for off in differing_offsets(&before, &disk.data) {
+            assert!(
+                (patch_flags..patch_flags + 4).contains(&off)
+                    || (chk_sum..chk_sum + 4).contains(&off),
+                "byte {off} changed, which set_patch_flags did not ask for"
+            );
+        }
+
+        let rdb = Rdb::parse(&mut disk).unwrap();
+        assert!(rdb.validate().is_empty());
+        assert!(rdb.validate_seg_lists(&mut disk).unwrap().is_empty());
+        let f = &rdb.filesystems[0];
+        assert_eq!(f.patch_flags, new_flags);
+        assert_eq!(f.node_type, Some(0xAAAA_0000));
+        assert_eq!(f.task, None);
+        assert_eq!(f.lock, None);
+        assert_eq!(f.global_vec, Some(-1));
+
+        // The driver binary reassembles to exactly what it was —
+        // the LSEG chain was never in scope of this edit.
+        let mut fresh = MemDisk::new(before);
+        let old = Rdb::parse(&mut fresh).unwrap();
+        let old_driver = old
+            .load_filesystem(&old.filesystems[0], &mut fresh)
+            .unwrap();
+        let new_driver = rdb.load_filesystem(f, &mut disk).unwrap();
+        assert_eq!(new_driver, old_driver);
     }
 
     /// Every metadata setter, applied at once and read back off the

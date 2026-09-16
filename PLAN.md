@@ -533,6 +533,22 @@ truncation tests, and AmiPart running as a second differential oracle.
       ([#6](https://github.com/sidick/amiga-rdb-rs/issues/6)). Pending
       work now lives in GitHub issues, not as open items in this
       file — PLAN.md stays the record of what landed and why.
+
+      **[#4] landed**: `RdbEditor::set_patch_flags(index, patch_flags)`
+      — the real caller `amirdb`'s `fsflags` command turned out to want
+      exactly the shape the issue guessed at, once it arrived: write
+      `fhb_PatchFlags` verbatim, leave every patched longword behind it
+      untouched (a mask edit, not a value edit — flipping a bit does not
+      zero or invent the field it gates), and never go near the `LSEG`
+      chain. It follows `edit_part`'s own pattern via a new `edit_fshd`
+      — patch the raw `FSHD` bytes, re-parse into the model — so the
+      commit-time chain-shape rule (`plan`'s fixed-point loop) sees no
+      pointer change and relocates nothing: the whole driver chain stays
+      exactly where it was, which is the property `replace_filesystem`
+      could not offer without rewriting the chain to relocate the `FSHD`
+      itself. Tested against the foreign-image fixture the same way
+      `editing_one_field_changes_only_that_field` is: every differing
+      byte on the whole disk lies in `fhb_PatchFlags` or its `ChkSum`.
 - [x] **AmiPart survey first**: before designing the edit API, read
       AmiPart (MIT, so readable closely — unlike xdftool, which stays a
       run-only GPL oracle) to enumerate the operation set and its edge
