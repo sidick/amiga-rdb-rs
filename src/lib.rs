@@ -4319,7 +4319,7 @@ pub enum EditError {
         cylinder_blocks: u64,
     },
     /// [`RdbEditor::remap_geometry`]'s new cylinder size, rounded up to
-    /// clear the RDB area (the same floor [`RdbBuilder::layout`] would
+    /// clear the RDB area (the same floor `RdbBuilder::layout` would
     /// compute — see [`BuildError::PartitionOverlapsRdbArea`]), lands
     /// past the new geometry's last cylinder.
     ///
