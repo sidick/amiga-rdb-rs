@@ -1967,7 +1967,7 @@ impl Rdb {
     ///
     /// **This is byte-exact only when the original driver's length was
     /// itself a multiple of four.** `SummedLongs` has no way to record a
-    /// trailing one to three bytes — [`fill_lseg_fields`]'s doc comment
+    /// trailing one to three bytes — `fill_lseg_fields`'s doc comment
     /// is the other side of the same fact — so a driver of, say, 493
     /// bytes round-trips as 492: the last byte was never recorded by
     /// *any* writer that fills `SummedLongs` this way, this crate's own
